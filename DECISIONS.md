@@ -18,3 +18,10 @@ Standard demo spec. Small, covers common features. Real specs (Stripe, etc.) com
 
 ## D6: oneOf/anyOf require discriminator in v0.1
 Hard error otherwise with clear message. Structural unions deferred.
+
+## D7: Dart name collision handling
+When a schema name collides with a Dart core type (Error, Type, Object,
+Function, Future, Stream, Iterable, List, Map, Set, String, int, double,
+bool, num, Symbol, Record, Pattern, RegExp, DateTime, Duration, Uri,
+Exception), append "Model" to the generated class name. Document the
+list explicitly. Allow override via `x-flap-name` extension.

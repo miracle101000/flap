@@ -26,6 +26,9 @@ dependencies = [
 [[package]]
 name = "flap-emit-dart"
 version = "0.1.0"
+dependencies = [
+ "flap-ir",
+]
 
 [[package]]
 name = "flap-ir"
