@@ -1,6 +1,13 @@
+[workspace]
+members = [".", "crates/*"]
+resolver = "2"
+
 [package]
 name = "flap"
-version = "0.1.0"
-edition = "2024"
+version = "0.0.1"
+edition = "2021"
 
 [dependencies]
+flap-spec = { path = "crates/flap-spec" }
+flap-ir = { path = "crates/flap-ir" }
+flap-emit-dart = { path = "crates/flap-emit-dart" }
