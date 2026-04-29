@@ -25,3 +25,13 @@ Function, Future, Stream, Iterable, List, Map, Set, String, int, double,
 bool, num, Symbol, Record, Pattern, RegExp, DateTime, Duration, Uri,
 Exception), append "Model" to the generated class name. Document the
 list explicitly. Allow override via `x-flap-name` extension.
+
+## D8: Method bodies stubbed before IR is complete
+Emit `UnimplementedError(<operationId>)` for v0.1 method bodies until the IR
+models parameters, request bodies, and responses. Lets us ship a complete
+client *shape* that compiles, while the substantive emitter work happens
+incrementally on a stable interface.
+
+## D9: Client class name derived from info.title
+`SwaggerPetstoreClient` from "Swagger Petstore". Suffix is always "Client".
+Future override via `x-flap-client-name` extension if user feedback warrants.

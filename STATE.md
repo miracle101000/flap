@@ -7,21 +7,30 @@ SDKs. No Java required. Output uses Freezed + Dio.
 ## Where we are
 - ✅ Workspace scaffolded
 - ✅ PetStore spec parses cleanly
-- ✅ IR types in flap-ir
+- ✅ IR types: Api, Operation, Schema, Field, TypeRef
 - ✅ flap-spec produces fully-populated Api
-- ✅ Dart emitter: emits Freezed models for object schemas
-       → Pet generates correctly with required/optional fields
-       → Arrays emit as typedefs (Pets = List<Pet>)
-       → Output is idiomatic, modern, null-safe Dart
-- ⬜ Name collision handling (Error → ErrorModel etc.) — see DECISIONS D7
-- ⬜ Dart emitter: Dio client class with method per operation
+- ✅ Dart emitter — models:
+       → Freezed classes for object schemas
+       → typedef for array schemas
+       → null-safe required/optional fields
+- ✅ D7 name collision handling (Error → ErrorModel)
+- ✅ Dart emitter — client stub:
+       → class name derived from info.title
+       → Dio constructor wired up
+       → method per operation with summary doc-comment
+       → method bodies are UnimplementedError() placeholders
+- ⬜ IR: extend Operation with parameters / request body / responses
+- ⬜ Dart emitter: real method bodies (path/query params, request body, response parsing)
 - ⬜ CLI: `flap generate --spec X --out Y` (writes files to disk)
+- ⬜ End-to-end test: generate, drop into a Flutter project, hit a real API
 
 ## Known issues
-- "Error" schema generates `class Error` which collides with dart:core.
-  Will be fixed by D7 (suffix-on-collision) before next emitter milestone.
+- Method signatures all return `Future<void>` and take no arguments — by design
+  while the IR doesn't model parameters/responses yet.
 
 ## Next session goal
-Implement D7 (name collision suffix), then start the Dio client emitter.
-First just emit a stub class `class PetstoreClient { final Dio _dio; ... }`
-with placeholder methods. Real method bodies the session after.
+Extend the IR to model operation parameters. Add `Parameter { name, location,
+type_ref, required }` and `Operation.parameters: Vec<Parameter>`. Update
+flap-spec to populate these from `parameters:` in the YAML. Print them
+alongside the operation listing. Don't update the emitter yet — get the IR
+solid first.
