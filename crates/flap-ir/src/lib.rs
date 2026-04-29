@@ -57,6 +57,8 @@ pub struct Operation {
     /// Query, path, header, and cookie parameters for this operation.
     /// Ordered as they appear in the spec — no re-sorting applied.
     pub parameters: Vec<Parameter>,
+    /// The request body, if this operation accepts one.
+    pub request_body: Option<RequestBody>,
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
@@ -88,6 +90,23 @@ pub struct Parameter {
     pub type_ref: TypeRef,
     /// Path parameters are always required (OpenAPI §4.7.12).
     /// Query/header/cookie parameters use the value from the spec.
+    pub required: bool,
+}
+
+// ── Request body ─────────────────────────────────────────────────────────────
+
+/// The body sent with a POST / PUT / PATCH request.
+///
+/// Only the first (preferred) content type is modelled — typically
+/// `application/json`. Multi-body operations are a post-v0.1 concern.
+#[derive(Debug)]
+pub struct RequestBody {
+    /// The MIME type of the body, e.g. `"application/json"`.
+    pub content_type: String,
+    /// The schema of the body payload.
+    pub schema_ref: TypeRef,
+    /// Whether the caller must supply this body. OpenAPI defaults to false,
+    /// but `required: true` is strongly encouraged and common in real specs.
     pub required: bool,
 }
 

@@ -15,7 +15,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flap_ir::{
-    Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, Schema, SchemaKind, TypeRef,
+    Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody, Schema,
+    SchemaKind, TypeRef,
 };
 use serde::Deserialize;
 
@@ -102,9 +103,10 @@ struct RawOperation {
     #[serde(rename = "operationId")]
     operation_id: Option<String>,
     summary: Option<String>,
-    /// Parameters for this operation. Absent means no parameters.
     #[serde(default)]
     parameters: Vec<RawParameter>,
+    #[serde(rename = "requestBody")]
+    request_body: Option<RawRequestBody>,
 }
 
 /// An individual query / path / header / cookie parameter.
@@ -123,6 +125,24 @@ struct RawParameter {
     ///
     /// NOTE: parameter-level `$ref` (referencing `components/parameters`) is
     /// not yet supported — v0.1 covers only inline schemas.
+    schema: Option<RawSchemaOrRef>,
+}
+
+/// The `requestBody` field of an operation.
+#[derive(Debug, Deserialize)]
+struct RawRequestBody {
+    /// Map of content-type → media type object.
+    /// We prefer `application/json`; fall back to the first entry.
+    content: BTreeMap<String, RawMediaType>,
+    /// Defaults to false per the OpenAPI spec.
+    #[serde(default)]
+    required: bool,
+}
+
+/// A single entry in `requestBody.content`.
+#[derive(Debug, Deserialize)]
+struct RawMediaType {
+    /// The schema of this media type. We bail if absent.
     schema: Option<RawSchemaOrRef>,
 }
 
@@ -196,12 +216,22 @@ fn lower_operations(paths: BTreeMap<String, RawPathItem>) -> Result<Vec<Operatio
                     })
                     .collect::<Result<Vec<_>>>()?;
 
+                // Option<Result<T>> → Result<Option<T>>
+                let request_body = raw_op
+                    .request_body
+                    .map(|rb| {
+                        lower_request_body(&path, method, rb)
+                            .with_context(|| format!("requestBody of {method} {path}"))
+                    })
+                    .transpose()?;
+
                 ops.push(Operation {
                     method,
                     path: path.clone(),
                     operation_id: raw_op.operation_id,
                     summary: raw_op.summary,
                     parameters,
+                    request_body,
                 });
             }
         }
@@ -245,6 +275,36 @@ fn lower_parameter(path: &str, raw: RawParameter) -> Result<Parameter> {
     })
 }
 
+fn lower_request_body(path: &str, method: HttpMethod, raw: RawRequestBody) -> Result<RequestBody> {
+    let mut content = raw.content;
+
+    // Prefer application/json; fall back to the first entry in BTreeMap order.
+    // Using if/else to avoid the borrow-then-move conflict on `content`.
+    let (content_type, media_type) = if let Some(mt) = content.remove("application/json") {
+        ("application/json".to_string(), mt)
+    } else {
+        content
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("requestBody of {method} {path} has no content entries"))?
+    };
+
+    let schema = media_type.schema.ok_or_else(|| {
+        anyhow!(
+            "content type `{content_type}` in requestBody of {method} {path} \
+             has no schema"
+        )
+    })?;
+
+    let schema_ref = lower_type_ref("<requestBody>", schema)?;
+
+    Ok(RequestBody {
+        content_type,
+        schema_ref,
+        required: raw.required,
+    })
+}
+
 fn lower_schemas(raw: BTreeMap<String, RawSchemaOrRef>) -> Result<Vec<Schema>> {
     // BTreeMap iteration is alphabetically sorted — deterministic.
     raw.into_iter()
@@ -260,7 +320,7 @@ fn lower_schema_kind(name: &str, sor: RawSchemaOrRef) -> Result<SchemaKind> {
     match sor {
         RawSchemaOrRef::Ref { reference } => Err(anyhow!(
             "top-level schema `{name}` is a bare $ref (`{reference}`); \
-                 aliases are not yet supported in v0.1"
+             aliases are not yet supported in v0.1"
         )),
         RawSchemaOrRef::Inline(raw) => lower_inline_schema(name, raw),
     }
@@ -398,9 +458,39 @@ mod tests {
     }
 
     #[test]
+    fn petstore_request_body() {
+        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
+        let api = load_str(yaml).expect("petstore should parse");
+
+        // GET /pets — no request body
+        assert!(
+            api.operations[0].request_body.is_none(),
+            "GET /pets should have no request body"
+        );
+
+        // POST /pets — application/json body referencing Pet
+        let create_pets = &api.operations[1];
+        let body = create_pets
+            .request_body
+            .as_ref()
+            .expect("POST /pets should have a request body");
+        assert_eq!(body.content_type, "application/json");
+        assert!(body.required, "POST /pets body should be required");
+        assert!(
+            matches!(&body.schema_ref, TypeRef::Named(n) if n == "Pet"),
+            "body schema should be Named(\"Pet\"), got {:?}",
+            body.schema_ref
+        );
+
+        // GET /pets/{petId} — no request body
+        assert!(
+            api.operations[2].request_body.is_none(),
+            "GET /pets/{{petId}} should have no request body"
+        );
+    }
+
+    #[test]
     fn path_parameter_always_required() {
-        // Spec authors sometimes forget required:true on path params.
-        // The lowering should enforce it regardless.
         let yaml = "
 openapi: 3.0.0
 info:

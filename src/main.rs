@@ -37,6 +37,13 @@ fn main() -> ExitCode {
                 param.type_ref
             );
         }
+        if let Some(body) = &op.request_body {
+            let req = if body.required { "*" } else { "?" };
+            println!(
+                "    {}  body     {}: {}",
+                req, body.content_type, body.schema_ref
+            );
+        }
     }
     println!();
 
