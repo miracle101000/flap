@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use flap_ir::{Api, Field, HttpMethod, Operation, Schema, SchemaKind, TypeRef};
+use flap_ir::{
+    Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, Schema, SchemaKind, TypeRef,
+};
 use serde::Deserialize;
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -100,6 +102,28 @@ struct RawOperation {
     #[serde(rename = "operationId")]
     operation_id: Option<String>,
     summary: Option<String>,
+    /// Parameters for this operation. Absent means no parameters.
+    #[serde(default)]
+    parameters: Vec<RawParameter>,
+}
+
+/// An individual query / path / header / cookie parameter.
+#[derive(Debug, Deserialize)]
+struct RawParameter {
+    name: String,
+    /// The OpenAPI `in` field — "query", "path", "header", or "cookie".
+    #[serde(rename = "in")]
+    location: String,
+    /// Defaults to false per the OpenAPI spec; path params are always required
+    /// regardless and we enforce that in `lower_parameter`.
+    #[serde(default)]
+    required: bool,
+    /// The schema describing the parameter's type. We bail if it is absent,
+    /// since we cannot emit anything meaningful without a type.
+    ///
+    /// NOTE: parameter-level `$ref` (referencing `components/parameters`) is
+    /// not yet supported — v0.1 covers only inline schemas.
+    schema: Option<RawSchemaOrRef>,
 }
 
 /// A schema entry in `components.schemas` or in a field's `properties` map.
@@ -162,16 +186,63 @@ fn lower_operations(paths: BTreeMap<String, RawPathItem>) -> Result<Vec<Operatio
         ];
         for (method, maybe_op) in pairs {
             if let Some(raw_op) = maybe_op {
+                let parameters = raw_op
+                    .parameters
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        lower_parameter(&path, p)
+                            .with_context(|| format!("parameter[{i}] of {method} {path}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
                 ops.push(Operation {
                     method,
                     path: path.clone(),
                     operation_id: raw_op.operation_id,
                     summary: raw_op.summary,
+                    parameters,
                 });
             }
         }
     }
     Ok(ops)
+}
+
+fn lower_parameter(path: &str, raw: RawParameter) -> Result<Parameter> {
+    let location = match raw.location.as_str() {
+        "query" => ParameterLocation::Query,
+        "path" => ParameterLocation::Path,
+        "header" => ParameterLocation::Header,
+        "cookie" => ParameterLocation::Cookie,
+        other => bail!(
+            "unsupported parameter location `{other}` \
+             (expected query | path | header | cookie)"
+        ),
+    };
+
+    // OpenAPI 3.0 §4.7.12: path parameters MUST be required=true.
+    // We enforce this regardless of what the spec says to avoid silently
+    // generating broken code.
+    let required = location == ParameterLocation::Path || raw.required;
+
+    let schema = raw.schema.ok_or_else(|| {
+        anyhow!(
+            "parameter `{}` in {path} has no `schema` — \
+             cannot determine its type",
+            raw.name
+        )
+    })?;
+
+    let type_ref = lower_type_ref(&raw.name, schema)
+        .with_context(|| format!("schema of parameter `{}`", raw.name))?;
+
+    Ok(Parameter {
+        name: raw.name,
+        location,
+        type_ref,
+        required,
+    })
 }
 
 fn lower_schemas(raw: BTreeMap<String, RawSchemaOrRef>) -> Result<Vec<Schema>> {
@@ -187,14 +258,10 @@ fn lower_schemas(raw: BTreeMap<String, RawSchemaOrRef>) -> Result<Vec<Schema>> {
 
 fn lower_schema_kind(name: &str, sor: RawSchemaOrRef) -> Result<SchemaKind> {
     match sor {
-        RawSchemaOrRef::Ref { reference } => {
-            // A top-level schema that is itself just a $ref is unusual in
-            // PetStore, but we handle it as a single-field wrapper for now.
-            Err(anyhow!(
-                "top-level schema `{name}` is a bare $ref (`{reference}`); \
+        RawSchemaOrRef::Ref { reference } => Err(anyhow!(
+            "top-level schema `{name}` is a bare $ref (`{reference}`); \
                  aliases are not yet supported in v0.1"
-            ))
-        }
+        )),
         RawSchemaOrRef::Inline(raw) => lower_inline_schema(name, raw),
     }
 }
@@ -232,14 +299,10 @@ fn lower_inline_schema(name: &str, raw: RawSchema) -> Result<SchemaKind> {
             Ok(SchemaKind::Array { item })
         }
 
-        Some(other) => {
-            // Primitive at schema level (uncommon but valid). Wrap as single-field
-            // object? For now, reject with a helpful message.
-            Err(anyhow!(
-                "schema `{name}` has type `{other}` with no properties — \
-                 primitive root schemas are not yet supported in v0.1"
-            ))
-        }
+        Some(other) => Err(anyhow!(
+            "schema `{name}` has type `{other}` with no properties — \
+             primitive root schemas are not yet supported in v0.1"
+        )),
 
         None => Err(anyhow!(
             "schema `{name}` has no `type` and no `properties` — \
@@ -302,10 +365,73 @@ mod tests {
     }
 
     #[test]
+    fn petstore_parameters() {
+        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
+        let api = load_str(yaml).expect("petstore should parse");
+
+        // GET /pets — one optional query parameter
+        let list_pets = &api.operations[0];
+        assert_eq!(list_pets.parameters.len(), 1);
+        let limit = &list_pets.parameters[0];
+        assert_eq!(limit.name, "limit");
+        assert_eq!(limit.location, ParameterLocation::Query);
+        assert!(!limit.required, "limit should be optional");
+        assert!(
+            matches!(limit.type_ref, TypeRef::Integer { .. }),
+            "limit should be integer"
+        );
+
+        // POST /pets — no parameters (has requestBody, not modelled yet)
+        assert_eq!(api.operations[1].parameters.len(), 0);
+
+        // GET /pets/{petId} — one required path parameter
+        let show_pet = &api.operations[2];
+        assert_eq!(show_pet.parameters.len(), 1);
+        let pet_id = &show_pet.parameters[0];
+        assert_eq!(pet_id.name, "petId");
+        assert_eq!(pet_id.location, ParameterLocation::Path);
+        assert!(pet_id.required, "path params must be required");
+        assert!(
+            matches!(pet_id.type_ref, TypeRef::String),
+            "petId should be string"
+        );
+    }
+
+    #[test]
+    fn path_parameter_always_required() {
+        // Spec authors sometimes forget required:true on path params.
+        // The lowering should enforce it regardless.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /items/{id}:
+    get:
+      operationId: getItem
+      parameters:
+        - name: id
+          in: path
+          required: false   # wrong — lowering must override this
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ok
+";
+        let api = load_str(yaml).expect("should parse");
+        let param = &api.operations[0].parameters[0];
+        assert!(
+            param.required,
+            "path param must be required even if spec says false"
+        );
+    }
+
+    #[test]
     fn petstore_schemas() {
         let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
         let api = load_str(yaml).expect("petstore should parse");
-        // BTreeMap → alphabetical: Error, Pet, Pets
         assert_eq!(api.schemas.len(), 3);
         assert_eq!(api.schemas[0].name, "Error");
         assert_eq!(api.schemas[1].name, "Pet");
@@ -313,9 +439,8 @@ mod tests {
         let SchemaKind::Object { fields } = &api.schemas[1].kind else {
             panic!("Pet should be an object");
         };
-        // BTreeMap properties → alphabetical: id, name, tag
         assert_eq!(fields[0].name, "id");
-        assert!(fields[0].required, "id should be required");
+        assert!(fields[0].required);
         assert_eq!(fields[1].name, "name");
         assert!(!fields[2].required, "tag should be optional");
 

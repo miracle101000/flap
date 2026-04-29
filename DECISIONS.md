@@ -35,3 +35,10 @@ incrementally on a stable interface.
 ## D9: Client class name derived from info.title
 `SwaggerPetstoreClient` from "Swagger Petstore". Suffix is always "Client".
 Future override via `x-flap-client-name` extension if user feedback warrants.
+
+## D10: Parameter binding in generated Dart methods
+- Path, query, and header parameters each become individual named arguments.
+- Request body becomes a single named argument called `body`.
+- Required parameters use Dart's `required` keyword; optionals are nullable.
+- If two parameters in the same operation share a name across locations,
+  emit a hard error during generation. Rare in real specs.

@@ -7,30 +7,25 @@ SDKs. No Java required. Output uses Freezed + Dio.
 ## Where we are
 - ✅ Workspace scaffolded
 - ✅ PetStore spec parses cleanly
-- ✅ IR types: Api, Operation, Schema, Field, TypeRef
+- ✅ IR types: Api, Operation, Schema, Field, TypeRef, Parameter
 - ✅ flap-spec produces fully-populated Api
-- ✅ Dart emitter — models:
-       → Freezed classes for object schemas
-       → typedef for array schemas
-       → null-safe required/optional fields
-- ✅ D7 name collision handling (Error → ErrorModel)
-- ✅ Dart emitter — client stub:
-       → class name derived from info.title
-       → Dio constructor wired up
-       → method per operation with summary doc-comment
-       → method bodies are UnimplementedError() placeholders
-- ⬜ IR: extend Operation with parameters / request body / responses
-- ⬜ Dart emitter: real method bodies (path/query params, request body, response parsing)
+- ✅ Dart emitter — models (Freezed + typedef)
+- ✅ Dart emitter — client stub (class + Dio + UnimplementedError stubs)
+- ✅ D7 name collision handling
+- ✅ IR: Operation.parameters with location (path/query/header), type, required
+- ⬜ IR: Operation.request_body
+- ⬜ IR: Operation.responses (status code → schema)
+- ⬜ Dart emitter: real method signatures using parameter info
+- ⬜ Dart emitter: real method bodies (URL templating, query map, response parsing)
 - ⬜ CLI: `flap generate --spec X --out Y` (writes files to disk)
-- ⬜ End-to-end test: generate, drop into a Flutter project, hit a real API
+- ⬜ End-to-end test: drop into a Flutter project, hit a real API
 
 ## Known issues
-- Method signatures all return `Future<void>` and take no arguments — by design
-  while the IR doesn't model parameters/responses yet.
+- Method signatures still all `Future<void>` with no args — emitter not yet
+  using the parameter IR.
 
 ## Next session goal
-Extend the IR to model operation parameters. Add `Parameter { name, location,
-type_ref, required }` and `Operation.parameters: Vec<Parameter>`. Update
-flap-spec to populate these from `parameters:` in the YAML. Print them
-alongside the operation listing. Don't update the emitter yet — get the IR
-solid first.
+Extend IR with `Operation.request_body: Option<RequestBody>` and populate it
+from flap-spec. RequestBody has content_type + schema_ref. PetStore's
+`POST /pets` references the `Pet` schema. Print it under the operation in
+the listing, similar to how parameters are shown.

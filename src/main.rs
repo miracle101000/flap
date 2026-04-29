@@ -1,6 +1,8 @@
 use std::env;
 use std::process::ExitCode;
 
+use flap_ir::SchemaKind;
+
 fn main() -> ExitCode {
     let Some(spec_path) = env::args().nth(1) else {
         eprintln!("usage: flap <spec.yaml>");
@@ -15,21 +17,43 @@ fn main() -> ExitCode {
         }
     };
 
-    // Emit Dart model files and print each to stdout so we can eyeball them.
-    // Sorted by filename for stable, readable output.
-    let mut files: Vec<(String, String)> = flap_emit_dart::emit_models(&api).into_iter().collect();
+    println!("# {}", api.title);
+    if let Some(url) = &api.base_url {
+        println!("# base: {url}");
+    }
+    println!();
 
-    let (client_file, client_src) = flap_emit_dart::emit_client(&api);
-    files.push((client_file, client_src));
+    println!("Operations ({}):", api.operations.len());
+    for op in &api.operations {
+        let id = op.operation_id.as_deref().unwrap_or("—");
+        println!("  {:<7} {:<22} ({})", op.method.to_string(), op.path, id);
+        for param in &op.parameters {
+            let req = if param.required { "*" } else { "?" };
+            println!(
+                "    {}  {:<8} {}: {}",
+                req,
+                param.location.to_string(),
+                param.name,
+                param.type_ref
+            );
+        }
+    }
+    println!();
 
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (filename, source) in &files {
-        println!(
-            "// ── {filename} {}",
-            "─".repeat(60usize.saturating_sub(filename.len()))
-        );
-        println!("{source}");
+    println!("Schemas ({}):", api.schemas.len());
+    for schema in &api.schemas {
+        match &schema.kind {
+            SchemaKind::Object { fields } => {
+                println!("  {} (object)", schema.name);
+                for f in fields {
+                    let req = if f.required { "*" } else { "?" };
+                    println!("    {} {}: {}", req, f.name, f.type_ref);
+                }
+            }
+            SchemaKind::Array { item } => {
+                println!("  {} (array of {})", schema.name, item);
+            }
+        }
     }
 
     ExitCode::SUCCESS

@@ -54,6 +54,41 @@ pub struct Operation {
     pub path: String,
     pub operation_id: Option<String>,
     pub summary: Option<String>,
+    /// Query, path, header, and cookie parameters for this operation.
+    /// Ordered as they appear in the spec — no re-sorting applied.
+    pub parameters: Vec<Parameter>,
+}
+
+// ── Parameters ────────────────────────────────────────────────────────────────
+
+/// Where a parameter is transmitted in the HTTP request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterLocation {
+    Cookie,
+    Header,
+    Path,
+    Query,
+}
+
+impl fmt::Display for ParameterLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParameterLocation::Cookie => f.write_str("cookie"),
+            ParameterLocation::Header => f.write_str("header"),
+            ParameterLocation::Path => f.write_str("path"),
+            ParameterLocation::Query => f.write_str("query"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Parameter {
+    pub name: String,
+    pub location: ParameterLocation,
+    pub type_ref: TypeRef,
+    /// Path parameters are always required (OpenAPI §4.7.12).
+    /// Query/header/cookie parameters use the value from the spec.
+    pub required: bool,
 }
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
@@ -98,13 +133,9 @@ impl fmt::Display for TypeRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypeRef::String => f.write_str("string"),
-            TypeRef::Integer {
-                format: Some(fmt_str),
-            } => write!(f, "integer({fmt_str})"),
+            TypeRef::Integer { format: Some(s) } => write!(f, "integer({s})"),
             TypeRef::Integer { format: None } => f.write_str("integer"),
-            TypeRef::Number {
-                format: Some(fmt_str),
-            } => write!(f, "number({fmt_str})"),
+            TypeRef::Number { format: Some(s) } => write!(f, "number({s})"),
             TypeRef::Number { format: None } => f.write_str("number"),
             TypeRef::Boolean => f.write_str("boolean"),
             TypeRef::Named(n) => write!(f, "{n}"),
