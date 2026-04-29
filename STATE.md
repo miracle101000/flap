@@ -7,14 +7,19 @@ SDKs. No Java required. Output uses Freezed + Dio.
 ## Where we are
 - ✅ Workspace scaffolded (flap, flap-spec, flap-ir, flap-emit-dart crates)
 - ✅ PetStore spec downloaded to tests/fixtures/petstore.yaml
-- ✅ Parser: loads PetStore YAML, counts operations + schemas
-       → "Found 3 operations and 3 schemas." ✓
-- ⬜ IR: minimal types (Api, Operation, Schema, Field) — currently just counts
-- ⬜ Dart emitter: produce Freezed models + Dio client for PetStore
-- ⬜ CLI: `flap generate --spec X --out Y`
+- ✅ Parser: loads PetStore YAML
+- ✅ IR: Api, Operation, Schema, Field types in flap-ir
+- ✅ flap-spec produces fully-populated Api from PetStore
+       → operations with method/path/operationId
+       → schemas with name/kind/fields/required-flag/format
+       → array element types resolved through $ref
+- ⬜ Dart emitter: produce Freezed models for each schema
+- ⬜ Dart emitter: produce Dio client class with one method per operation
+- ⬜ CLI: `flap generate --spec X --out Y` (writes files to disk)
 
 ## Next session goal
-Replace the count with real data extraction. Build the IR types in
-`flap-ir` (Api, Operation, Schema, Field), then have `flap-spec` produce a
-fully-populated `Api` value. Print each operation's method + path and each
-schema's name + field list. Still no code generation yet.
+Start the Dart emitter. In flap-emit-dart, write a function
+`emit_models(api: &Api) -> HashMap<String, String>` that returns one
+Dart file per schema, each as a Freezed class. Don't write to disk yet —
+print the generated source to stdout so we can eyeball it. Just models;
+the Dio client comes after.
