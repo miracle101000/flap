@@ -10,11 +10,20 @@
 //!   lets `$ref` pointers be resolved from anywhere — schemas, parameters,
 //!   request bodies — uniformly via `LoweringContext::resolve_schema`.
 //!
-//! The `visiting` set inside `LoweringContext` tracks which top-level schemas
-//! are currently mid-lowering. Today it short-circuits self-referential `$ref`s
-//! (so `Node.next: $ref Node` returns `TypeRef::Named` instead of looping).
-//! Phase 2's `allOf` merging will use the same set when it actually walks into
-//! referenced schemas to inline their fields.
+//! Phase 2 additions:
+//! - `lower_type_ref` recognises three new shapes:
+//!   - `enum: [...]` → `TypeRef::Enum`
+//!   - `additionalProperties: { ... }` → `TypeRef::Map`
+//!   - `type: string, format: date-time` → `TypeRef::DateTime`
+//! - `lower_inline_schema` handles `allOf`. The new `collect_object_fields`
+//!   helper walks `allOf` members (ref or inline), flattens them, then
+//!   appends the schema's own properties. Duplicate field names dedupe with
+//!   later-wins, but `required` ORs across all occurrences.
+//! - The `visiting` set inside `LoweringContext` now serves two distinct
+//!   roles. For ordinary `$ref` lookups via `resolve_schema` it short-circuits
+//!   self-recursion to a `TypeRef::Named` (Phase 1 behaviour, unchanged).
+//!   For `allOf` flattening, it is a true cycle guard: composing a schema
+//!   into itself is meaningless and must error rather than be papered over.
 //!
 //! Design notes:
 //! - `Raw*` types mirror the OpenAPI YAML structure and are only used for parsing.
@@ -187,6 +196,38 @@ struct RawSchema {
     #[serde(default)]
     properties: BTreeMap<String, RawSchemaOrRef>,
     items: Option<Box<RawSchemaOrRef>>,
+    /// Phase 2: closed value set. v0.1 only supports string enums; non-string
+    /// entries (integers, nulls, booleans) are rejected during lowering with
+    /// a clear message rather than silently coerced.
+    #[serde(default, rename = "enum")]
+    enum_values: Vec<serde_yaml::Value>,
+    /// Phase 2: typed dictionary. The boolean form (`true`/`false`) parses but
+    /// does not produce a `Map` — we treat it as a no-op since Dart objects
+    /// already permit unknown keys.
+    #[serde(rename = "additionalProperties")]
+    additional_properties: Option<RawAdditionalProperties>,
+    /// Phase 2: composition. Each entry is either a `$ref` to an object schema
+    /// or an inline object. Lowering flattens them into a single object
+    /// schema by concatenating their fields (see `collect_object_fields`).
+    #[serde(default, rename = "allOf")]
+    all_of: Vec<RawSchemaOrRef>,
+}
+
+/// `additionalProperties` in OpenAPI is either a boolean (allow / forbid extra
+/// fields with no type constraint) or a schema (typed map). We only generate
+/// `TypeRef::Map` for the schema form; the boolean form is silently ignored
+/// in v0.1 because Dart `Map<String, dynamic>` would be a poor default and
+/// the right answer depends on framework conventions.
+///
+/// `Bool` is listed first so serde's untagged deserializer matches `true` /
+/// `false` before falling through to `Schema`, where the inner
+/// `RawSchemaOrRef` itself runs its own untagged dispatch.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawAdditionalProperties {
+    #[allow(dead_code)]
+    Bool(bool),
+    Schema(Box<RawSchemaOrRef>),
 }
 
 // ── Lowering context (shared during pass 2) ──────────────────────────────────
@@ -195,12 +236,14 @@ struct RawSchema {
 ///
 /// - `components` is the global registry of all top-level definitions, used to
 ///   resolve `$ref` pointers from anywhere in the document.
-/// - `visiting` records the set of top-level schemas currently mid-lowering,
-///   so that recursive references terminate instead of looping. Resolvers
-///   consult this set and emit a `TypeRef::Named` pointer without traversing
-///   further. Phase 1 never traverses through a `$ref` anyway, so this is
-///   currently a belt-and-braces guard; Phase 2's `allOf` merging will rely
-///   on it for real cycle protection.
+/// - `visiting` records the set of top-level schemas currently mid-lowering.
+///   It serves two roles:
+///   - For ordinary `$ref` field types resolved via `resolve_schema`: members
+///     of `visiting` short-circuit to `TypeRef::Named`, breaking self-recursion
+///     at code-gen time (e.g. `Node.next: $ref Node`).
+///   - For `allOf` flattening in `collect_member_fields`: members of `visiting`
+///     are a hard cycle and produce an error — composing a schema into itself
+///     has no meaning and cannot be represented as a flat field list.
 struct LoweringContext<'a> {
     components: &'a RawComponents,
     visiting: HashSet<String>,
@@ -444,25 +487,17 @@ fn lower_inline_schema(
     raw: &RawSchema,
     ctx: &mut LoweringContext,
 ) -> Result<SchemaKind> {
+    // Phase 2: composition. `allOf` takes precedence over the schema's `type`,
+    // because real-world specs frequently omit `type: object` on composed
+    // schemas. Any own `properties` are appended after the inherited ones.
+    if !raw.all_of.is_empty() {
+        let fields = collect_object_fields(raw, ctx)?;
+        return Ok(SchemaKind::Object { fields });
+    }
+
     match raw.ty.as_deref() {
         Some("object") | None if !raw.properties.is_empty() => {
-            let required: HashSet<&str> = raw.required.iter().map(String::as_str).collect();
-
-            let fields = raw
-                .properties
-                .iter()
-                .map(|(field_name, sor)| {
-                    let type_ref = lower_type_ref(field_name, sor, ctx)
-                        .with_context(|| format!("field `{field_name}`"))?;
-                    let is_required = required.contains(field_name.as_str());
-                    Ok(Field {
-                        name: field_name.clone(),
-                        type_ref,
-                        required: is_required,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
+            let fields = collect_object_fields(raw, ctx)?;
             Ok(SchemaKind::Object { fields })
         }
 
@@ -488,6 +523,101 @@ fn lower_inline_schema(
     }
 }
 
+/// Builds the merged field list for an object schema, honouring `allOf` and
+/// the schema's own `properties` in order.
+///
+/// Walk order is deliberate:
+/// 1. Each `allOf` member is flattened first, in spec order, so "base class"
+///    fields appear before "subclass" fields in the resulting Vec.
+/// 2. The schema's own `properties` are appended next.
+/// 3. Duplicate field names are deduplicated — last occurrence wins on type
+///    (so a subclass override beats the base), but `required` ORs across all
+///    occurrences (so a base requiring a field keeps it required even if a
+///    subclass redeclares it without listing it in its own `required`).
+fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<Vec<Field>> {
+    let mut fields: Vec<Field> = Vec::new();
+
+    // Phase 2: every `allOf` member, recursively flattened.
+    for (i, member) in raw.all_of.iter().enumerate() {
+        let member_fields =
+            collect_member_fields(member, ctx).with_context(|| format!("allOf[{i}]"))?;
+        fields.extend(member_fields);
+    }
+
+    // Then this schema's own properties.
+    let own_required: HashSet<&str> = raw.required.iter().map(String::as_str).collect();
+    for (field_name, sor) in &raw.properties {
+        let type_ref = lower_type_ref(field_name, sor, ctx)
+            .with_context(|| format!("field `{field_name}`"))?;
+        let is_required = own_required.contains(field_name.as_str());
+        fields.push(Field {
+            name: field_name.clone(),
+            type_ref,
+            required: is_required,
+        });
+    }
+
+    // Deduplicate by field name — see doc comment for the chosen semantics.
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut deduped: Vec<Field> = Vec::with_capacity(fields.len());
+    for field in fields {
+        if let Some(&idx) = seen.get(&field.name) {
+            let merged_required = deduped[idx].required || field.required;
+            deduped[idx] = Field {
+                required: merged_required,
+                ..field
+            };
+        } else {
+            seen.insert(field.name.clone(), deduped.len());
+            deduped.push(field);
+        }
+    }
+
+    Ok(deduped)
+}
+
+/// Resolves a single `allOf` member into a flat list of fields.
+///
+/// Inline objects are flattened directly. `$ref` members are looked up in the
+/// component registry and recursively flattened — including any nested
+/// `allOf` they themselves contain. The `visiting` set is used as a true
+/// cycle guard here: merging a schema into itself is meaningless and must
+/// error rather than be papered over with `TypeRef::Named` (which is what
+/// `LoweringContext::resolve_schema` does for ordinary field references).
+fn collect_member_fields(sor: &RawSchemaOrRef, ctx: &mut LoweringContext) -> Result<Vec<Field>> {
+    match sor {
+        RawSchemaOrRef::Ref { reference } => {
+            let bare = parse_schema_ref_pointer(reference)?;
+            if ctx.visiting.contains(bare) {
+                bail!(
+                    "cycle in `allOf` chain via `{bare}` — \
+                     a schema cannot inherit from itself"
+                );
+            }
+            let target = ctx.components.schemas.get(bare).ok_or_else(|| {
+                anyhow!(
+                    "`allOf` $ref points to undefined schema `{bare}` \
+                     (not present in components.schemas)"
+                )
+            })?;
+            match target {
+                RawSchemaOrRef::Inline(target_raw) => {
+                    ctx.visiting.insert(bare.to_string());
+                    let result = collect_object_fields(target_raw, ctx)
+                        .with_context(|| format!("flattening `{bare}` for allOf"));
+                    ctx.visiting.remove(bare);
+                    result
+                }
+                RawSchemaOrRef::Ref { reference: inner } => Err(anyhow!(
+                    "`allOf` member `{bare}` is itself a $ref to `{inner}` — \
+                     ref chains are not supported in v0.1"
+                )),
+            }
+        }
+        RawSchemaOrRef::Inline(raw) => collect_object_fields(raw, ctx),
+    }
+}
+
 fn lower_type_ref(
     field_name: &str,
     sor: &RawSchemaOrRef,
@@ -499,23 +629,66 @@ fn lower_type_ref(
             let bare = parse_schema_ref_pointer(reference)?;
             ctx.resolve_schema(bare)
         }
-        RawSchemaOrRef::Inline(raw) => match raw.ty.as_deref() {
-            Some("string") => Ok(TypeRef::String),
-            Some("integer") => Ok(TypeRef::Integer {
-                format: raw.format.clone(),
-            }),
-            Some("number") => Ok(TypeRef::Number {
-                format: raw.format.clone(),
-            }),
-            Some("boolean") => Ok(TypeRef::Boolean),
-            Some(other) => Err(anyhow!(
-                "field `{field_name}` has unsupported inline type `{other}`"
-            )),
-            None => Err(anyhow!(
-                "field `{field_name}` has no `type` and is not a $ref"
-            )),
-        },
+        RawSchemaOrRef::Inline(raw) => {
+            // Phase 2 ── enum takes precedence over the underlying primitive
+            // type. OpenAPI typically writes `type: string` alongside `enum:`,
+            // but the value-set is what callers actually care about.
+            if !raw.enum_values.is_empty() {
+                let values = stringify_enum_values(field_name, &raw.enum_values)?;
+                return Ok(TypeRef::Enum(values));
+            }
+
+            // Phase 2 ── `additionalProperties` with a schema → typed map.
+            // Boolean variants degrade to ordinary handling (no Map produced).
+            if let Some(RawAdditionalProperties::Schema(inner)) = &raw.additional_properties {
+                let value = lower_type_ref("<additionalProperties>", inner, ctx)
+                    .with_context(|| format!("additionalProperties of `{field_name}`"))?;
+                return Ok(TypeRef::Map(Box::new(value)));
+            }
+
+            match raw.ty.as_deref() {
+                Some("string") => {
+                    // Phase 2 ── date-time format gets a dedicated variant.
+                    if raw.format.as_deref() == Some("date-time") {
+                        Ok(TypeRef::DateTime)
+                    } else {
+                        Ok(TypeRef::String)
+                    }
+                }
+                Some("integer") => Ok(TypeRef::Integer {
+                    format: raw.format.clone(),
+                }),
+                Some("number") => Ok(TypeRef::Number {
+                    format: raw.format.clone(),
+                }),
+                Some("boolean") => Ok(TypeRef::Boolean),
+                Some(other) => Err(anyhow!(
+                    "field `{field_name}` has unsupported inline type `{other}`"
+                )),
+                None => Err(anyhow!(
+                    "field `{field_name}` has no `type` and is not a $ref"
+                )),
+            }
+        }
     }
+}
+
+/// Converts the raw YAML enum entries into Rust `String`s.
+///
+/// v0.1 only models string-valued enums. Numbers and booleans appear in real
+/// specs (sparingly) but emitting them as Dart `enum` requires a different
+/// serialiser — out of scope for this phase. Reject them up front rather
+/// than silently coercing.
+fn stringify_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<Vec<String>> {
+    raw.iter()
+        .map(|v| match v {
+            serde_yaml::Value::String(s) => Ok(s.clone()),
+            other => Err(anyhow!(
+                "enum value `{other:?}` in field `{field_name}` is not a string \
+                 — v0.1 only supports string enums"
+            )),
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -788,5 +961,480 @@ components:
         };
         let owner = fields.iter().find(|f| f.name == "owner").unwrap();
         assert!(matches!(&owner.type_ref, TypeRef::Named(n) if n == "Owner"));
+    }
+
+    // ── Phase 2: enums ───────────────────────────────────────────────────────
+
+    #[test]
+    fn enum_field_lowers_to_typeref_enum() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [available, pending, sold]
+";
+        let api = load_str(yaml).expect("should parse");
+        let pet = &api.schemas[0];
+        let SchemaKind::Object { fields } = &pet.kind else {
+            panic!("Pet should be an object");
+        };
+        let status = fields.iter().find(|f| f.name == "status").unwrap();
+        let TypeRef::Enum(values) = &status.type_ref else {
+            panic!("status should be Enum, got {:?}", status.type_ref);
+        };
+        assert_eq!(
+            values,
+            &vec!["available".to_string(), "pending".into(), "sold".into()]
+        );
+        assert!(status.required, "status should still respect required list");
+    }
+
+    #[test]
+    fn rejects_non_string_enum_values() {
+        // Integer enums exist in OpenAPI but we explicitly punt on them in v0.1.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        priority:
+          type: integer
+          enum: [1, 2, 3]
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("string enums") || msg.contains("not a string"),
+            "expected string-enum-only error, got: {msg}"
+        );
+    }
+
+    // ── Phase 2: additionalProperties → Map ──────────────────────────────────
+
+    #[test]
+    fn additional_properties_lowers_to_map_of_string() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let pet = &api.schemas[0];
+        let SchemaKind::Object { fields } = &pet.kind else {
+            panic!("Pet should be an object");
+        };
+        let labels = fields.iter().find(|f| f.name == "labels").unwrap();
+        let TypeRef::Map(inner) = &labels.type_ref else {
+            panic!("labels should be Map, got {:?}", labels.type_ref);
+        };
+        assert!(
+            matches!(**inner, TypeRef::String),
+            "inner should be String, got {:?}",
+            inner
+        );
+    }
+
+    #[test]
+    fn additional_properties_lowers_to_map_of_named_ref() {
+        // Maps of complex types — common in real APIs (e.g. `extensions: { ... }`).
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Owner:
+      type: object
+      properties:
+        name:
+          type: string
+    Kennel:
+      type: object
+      properties:
+        owners:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/Owner'
+";
+        let api = load_str(yaml).expect("should parse");
+        let kennel = api.schemas.iter().find(|s| s.name == "Kennel").unwrap();
+        let SchemaKind::Object { fields } = &kennel.kind else {
+            panic!("Kennel should be an object");
+        };
+        let owners = fields.iter().find(|f| f.name == "owners").unwrap();
+        let TypeRef::Map(inner) = &owners.type_ref else {
+            panic!("owners should be Map, got {:?}", owners.type_ref);
+        };
+        assert!(
+            matches!(&**inner, TypeRef::Named(n) if n == "Owner"),
+            "inner should be Named(\"Owner\"), got {:?}",
+            inner
+        );
+    }
+
+    #[test]
+    fn additional_properties_boolean_does_not_become_map() {
+        // additionalProperties: true is a permissibility hint, not a typed map.
+        // The schema should lower as a regular object with only its declared
+        // properties.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Loose:
+      type: object
+      additionalProperties: true
+      required: [id]
+      properties:
+        id:
+          type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let loose = &api.schemas[0];
+        let SchemaKind::Object { fields } = &loose.kind else {
+            panic!("Loose should be an object");
+        };
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "id");
+        assert!(matches!(fields[0].type_ref, TypeRef::String));
+    }
+
+    // ── Phase 2: date-time ───────────────────────────────────────────────────
+
+    #[test]
+    fn date_time_lowers_to_datetime() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Event:
+      type: object
+      required: [createdAt]
+      properties:
+        createdAt:
+          type: string
+          format: date-time
+        name:
+          type: string
+        slug:
+          type: string
+          format: uuid
+";
+        let api = load_str(yaml).expect("should parse");
+        let event = &api.schemas[0];
+        let SchemaKind::Object { fields } = &event.kind else {
+            panic!("Event should be an object");
+        };
+        let created_at = fields.iter().find(|f| f.name == "createdAt").unwrap();
+        assert!(
+            matches!(created_at.type_ref, TypeRef::DateTime),
+            "createdAt should be DateTime, got {:?}",
+            created_at.type_ref
+        );
+        let name = fields.iter().find(|f| f.name == "name").unwrap();
+        assert!(
+            matches!(name.type_ref, TypeRef::String),
+            "plain string should remain String"
+        );
+        let slug = fields.iter().find(|f| f.name == "slug").unwrap();
+        assert!(
+            matches!(slug.type_ref, TypeRef::String),
+            "non-date-time formats should still be String (format ignored for now), got {:?}",
+            slug.type_ref
+        );
+    }
+
+    // ── Phase 2: allOf ───────────────────────────────────────────────────────
+
+    #[test]
+    fn all_of_merges_referenced_fields() {
+        // The canonical "subclass extends base" case.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    Dog:
+      allOf:
+        - $ref: '#/components/schemas/Pet'
+        - type: object
+          required: [breed]
+          properties:
+            breed:
+              type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let dog = api.schemas.iter().find(|s| s.name == "Dog").unwrap();
+        let SchemaKind::Object { fields } = &dog.kind else {
+            panic!("Dog should be an object after allOf flattening");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "name", "breed"],
+            "base fields first, then own"
+        );
+
+        let id = fields.iter().find(|f| f.name == "id").unwrap();
+        assert!(id.required, "id should be required (inherited from Pet)");
+        let breed = fields.iter().find(|f| f.name == "breed").unwrap();
+        assert!(breed.required, "breed should be required (own)");
+    }
+
+    #[test]
+    fn all_of_with_only_refs() {
+        // No own properties, just composing two refs (mixin pattern).
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Identifiable:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+    Timestamped:
+      type: object
+      required: [createdAt]
+      properties:
+        createdAt:
+          type: string
+          format: date-time
+    User:
+      allOf:
+        - $ref: '#/components/schemas/Identifiable'
+        - $ref: '#/components/schemas/Timestamped'
+";
+        let api = load_str(yaml).expect("should parse");
+        let user = api.schemas.iter().find(|s| s.name == "User").unwrap();
+        let SchemaKind::Object { fields } = &user.kind else {
+            panic!("User should be an object");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "createdAt"]);
+        // Sanity: the date-time mapping survives through allOf flattening.
+        let created_at = fields.iter().find(|f| f.name == "createdAt").unwrap();
+        assert!(matches!(created_at.type_ref, TypeRef::DateTime));
+    }
+
+    #[test]
+    fn all_of_subclass_override_keeps_inherited_required() {
+        // A base says `id` is required; the subclass redeclares `id` with a
+        // different type but doesn't list it in its own `required`.
+        // - The redeclared *type* should win (later occurrence overrides).
+        // - The required-ness from the base should be preserved (OR semantics).
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Base:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+    Refined:
+      allOf:
+        - $ref: '#/components/schemas/Base'
+        - type: object
+          properties:
+            id:
+              type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let refined = api.schemas.iter().find(|s| s.name == "Refined").unwrap();
+        let SchemaKind::Object { fields } = &refined.kind else {
+            panic!("Refined should be an object");
+        };
+        assert_eq!(fields.len(), 1, "duplicate `id` should dedupe");
+        let id = &fields[0];
+        assert!(
+            matches!(id.type_ref, TypeRef::String),
+            "subclass type should win, got {:?}",
+            id.type_ref
+        );
+        assert!(id.required, "required should be inherited from Base");
+    }
+
+    #[test]
+    fn all_of_combines_with_own_properties() {
+        // A schema with both `allOf` and its own `properties` — common in real
+        // APIs ("inherit the base, plus add these new fields").
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Animal:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    Dog:
+      allOf:
+        - $ref: '#/components/schemas/Animal'
+      required: [breed]
+      properties:
+        breed:
+          type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let dog = api.schemas.iter().find(|s| s.name == "Dog").unwrap();
+        let SchemaKind::Object { fields } = &dog.kind else {
+            panic!("Dog should be an object");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["name", "breed"]);
+        assert!(fields.iter().find(|f| f.name == "breed").unwrap().required);
+        assert!(fields.iter().find(|f| f.name == "name").unwrap().required);
+    }
+
+    #[test]
+    fn all_of_nested_refs_flatten_recursively() {
+        // C → B → A: composing a chain should walk through and produce the
+        // union of all leaf fields. This is the test that exercises the
+        // recursive call in `collect_member_fields`.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    A:
+      type: object
+      required: [a]
+      properties:
+        a:
+          type: string
+    B:
+      allOf:
+        - $ref: '#/components/schemas/A'
+      required: [b]
+      properties:
+        b:
+          type: string
+    C:
+      allOf:
+        - $ref: '#/components/schemas/B'
+      required: [c]
+      properties:
+        c:
+          type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let c = api.schemas.iter().find(|s| s.name == "C").unwrap();
+        let SchemaKind::Object { fields } = &c.kind else {
+            panic!("C should be an object");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"], "leaf inheritance order");
+    }
+
+    #[test]
+    fn rejects_all_of_cycle() {
+        // A composes B, B composes A — this can't be flattened.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    A:
+      allOf:
+        - $ref: '#/components/schemas/B'
+    B:
+      allOf:
+        - $ref: '#/components/schemas/A'
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "expected cycle error, got: {msg}");
+    }
+
+    #[test]
+    fn rejects_all_of_unresolved_ref() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Dog:
+      allOf:
+        - $ref: '#/components/schemas/DoesNotExist'
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("DoesNotExist"),
+            "expected unresolved-ref error, got: {msg}"
+        );
     }
 }

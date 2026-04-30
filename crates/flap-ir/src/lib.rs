@@ -134,6 +134,12 @@ pub struct Field {
 }
 
 /// A reference to a concrete type, either primitive or a named schema.
+///
+/// Phase 2 additions: `DateTime`, `Enum`, and `Map`. These extend the set
+/// of in-place types that may appear as a field type, parameter schema, or
+/// request-body schema. Top-level schemas continue to be either `Object`
+/// or `Array` (`SchemaKind`); a top-level enum or map is currently lowered
+/// as an inline `TypeRef` only when it appears nested inside a property.
 #[derive(Debug, Clone)]
 pub enum TypeRef {
     String,
@@ -144,6 +150,23 @@ pub enum TypeRef {
         format: Option<String>,
     },
     Boolean,
+    /// `type: string, format: date-time` — emitted as Dart `DateTime`.
+    /// Kept as its own variant rather than `String { format: "date-time" }`
+    /// because almost every emitter wants to special-case it (parsing,
+    /// `toIso8601String()`, JSON converters, etc.).
+    DateTime,
+    /// A closed set of allowed string values (`enum: [...]`).
+    /// Values are stored in spec order — emitters typically preserve that
+    /// order in the generated language-level enum so existing serialised
+    /// payloads keep working when new values are appended.
+    ///
+    /// v0.1 only models string enums; non-string enum entries are rejected
+    /// during lowering.
+    Enum(Vec<String>),
+    /// A homogeneous string-keyed dictionary, e.g. an object schema with
+    /// `additionalProperties: { type: string }`. The boxed inner `TypeRef`
+    /// is the value type; the key is always `String` per JSON semantics.
+    Map(Box<TypeRef>),
     /// Reference to a named component schema (the bare name, not the $ref path).
     Named(String),
 }
@@ -157,6 +180,18 @@ impl fmt::Display for TypeRef {
             TypeRef::Number { format: Some(s) } => write!(f, "number({s})"),
             TypeRef::Number { format: None } => f.write_str("number"),
             TypeRef::Boolean => f.write_str("boolean"),
+            TypeRef::DateTime => f.write_str("date-time"),
+            TypeRef::Enum(values) => {
+                f.write_str("enum[")?;
+                for (i, v) in values.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(v)?;
+                }
+                f.write_str("]")
+            }
+            TypeRef::Map(inner) => write!(f, "map<{inner}>"),
             TypeRef::Named(n) => write!(f, "{n}"),
         }
     }

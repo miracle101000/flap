@@ -253,6 +253,16 @@ fn to_dart_type(type_ref: &TypeRef) -> String {
         TypeRef::Boolean => "bool".into(),
         // Apply D7 renaming when resolving named schema references too.
         TypeRef::Named(name) => dart_class_name(name),
+        // Phase 2 placeholders — the IR carries these now, but the Dart
+        // emitter mappings (DateTime, sealed enum classes, Map<String, T>)
+        // are deferred to Phase 3 per the task scope. Hitting any of these
+        // arms in real codegen should be impossible until Phase 3 wires them
+        // up; until then the existing PetStore-shaped tests don't exercise
+        // them, and `todo!()` keeps the match exhaustive without changing
+        // observable emitter behaviour.
+        TypeRef::DateTime => todo!("Phase 3: emit Dart `DateTime` for TypeRef::DateTime"),
+        TypeRef::Enum(_) => todo!("Phase 3: emit sealed Dart enum class for TypeRef::Enum"),
+        TypeRef::Map(_) => todo!("Phase 3: emit `Map<String, T>` for TypeRef::Map"),
     }
 }
 
