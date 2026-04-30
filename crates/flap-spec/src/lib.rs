@@ -8,22 +8,28 @@
 //! - Pass 2 (lower): a `LoweringContext` borrows the parsed components as a
 //!   registry, and every `lower_*` function threads `&mut ctx` through. This
 //!   lets `$ref` pointers be resolved from anywhere — schemas, parameters,
-//!   request bodies — uniformly via `LoweringContext::resolve_schema`.
+//!   request bodies, responses — uniformly via `LoweringContext::resolve_schema`.
 //!
 //! Phase 2 additions:
 //! - `lower_type_ref` recognises three new shapes:
 //!   - `enum: [...]` → `TypeRef::Enum`
 //!   - `additionalProperties: { ... }` → `TypeRef::Map`
 //!   - `type: string, format: date-time` → `TypeRef::DateTime`
-//! - `lower_inline_schema` handles `allOf`. The new `collect_object_fields`
-//!   helper walks `allOf` members (ref or inline), flattens them, then
-//!   appends the schema's own properties. Duplicate field names dedupe with
-//!   later-wins, but `required` ORs across all occurrences.
-//! - The `visiting` set inside `LoweringContext` now serves two distinct
-//!   roles. For ordinary `$ref` lookups via `resolve_schema` it short-circuits
-//!   self-recursion to a `TypeRef::Named` (Phase 1 behaviour, unchanged).
-//!   For `allOf` flattening, it is a true cycle guard: composing a schema
-//!   into itself is meaningless and must error rather than be papered over.
+//! - `lower_inline_schema` handles `allOf` (see `collect_object_fields`).
+//!
+//! Phase 3 additions:
+//! - `lower_response` populates the new `Operation.responses` IR field. The
+//!   `responses` map is keyed by status code (or `"default"`); each entry's
+//!   schema is taken from `content[application/json].schema` if present,
+//!   otherwise the response is recorded with `schema_ref: None`. Response
+//!   ordering is deterministic: numeric codes sorted ascending first, then
+//!   `"default"` last, so the IR is stable across runs regardless of how
+//!   YAML mappings happen to iterate.
+//! - `lower_request_body` now accepts `multipart/form-data` as a fallback
+//!   when `application/json` is not present. The chosen content type is
+//!   reflected in `RequestBody.content_type`, and `is_multipart` is set
+//!   when `multipart/form-data` is selected so the Dart emitter can later
+//!   build a Dio `FormData` instead of a JSON body.
 //!
 //! Design notes:
 //! - `Raw*` types mirror the OpenAPI YAML structure and are only used for parsing.
@@ -32,15 +38,15 @@
 //! - Per DECISIONS D6, oneOf/anyOf without a discriminator will be a hard error
 //!   once the emitter needs to handle them; for now they're not in PetStore.
 //! - v0.1 only supports `#/components/schemas/*` `$ref` pointers. Pointers into
-//!   `components/parameters` or `components/responses` will be added when the
-//!   IR grows to model those (Phase 3).
+//!   `components/parameters` or `components/responses` are deferred — the IR
+//!   doesn't yet model those component groups.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flap_ir::{
-    Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody, Schema,
+    Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody, Response, Schema,
     SchemaKind, TypeRef,
 };
 use serde::Deserialize;
@@ -132,6 +138,11 @@ struct RawOperation {
     parameters: Vec<RawParameter>,
     #[serde(rename = "requestBody")]
     request_body: Option<RawRequestBody>,
+    /// Phase 3: the `responses` block. Keyed by status code (or `"default"`).
+    /// Default to an empty map if absent — OpenAPI requires at least one
+    /// response, but we don't enforce that at lowering time.
+    #[serde(default)]
+    responses: BTreeMap<String, RawResponse>,
 }
 
 /// An individual query / path / header / cookie parameter.
@@ -157,18 +168,38 @@ struct RawParameter {
 #[derive(Debug, Deserialize)]
 struct RawRequestBody {
     /// Map of content-type → media type object.
-    /// We prefer `application/json`; fall back to the first entry.
+    /// We prefer `application/json`, fall back to `multipart/form-data`,
+    /// then to the first entry.
     content: BTreeMap<String, RawMediaType>,
     /// Defaults to false per the OpenAPI spec.
     #[serde(default)]
     required: bool,
 }
 
-/// A single entry in `requestBody.content`.
+/// A single entry in either `requestBody.content` or `responses[*].content`.
 #[derive(Debug, Deserialize)]
 struct RawMediaType {
-    /// The schema of this media type. We bail if absent.
+    /// The schema of this media type. Bodies bail if absent; responses
+    /// merely omit the schema.
     schema: Option<RawSchemaOrRef>,
+}
+
+/// Phase 3: a single entry in the `responses` map, e.g. `"200"` or `"default"`.
+///
+/// OpenAPI permits the entire response to be a `$ref` into
+/// `components/responses`, but that component group is deferred to a future
+/// IR expansion. For v0.1 we accept inline response objects only.
+#[derive(Debug, Deserialize)]
+struct RawResponse {
+    /// `description` is required by the spec — we don't carry it into IR
+    /// but accept it during parsing so unknown-field warnings don't fire on
+    /// real specs. Marked `dead_code` since the emitter doesn't consume it.
+    #[allow(dead_code)]
+    description: Option<String>,
+    /// Map of content-type → media type object. Optional — many responses
+    /// (204, 201 created with no body) declare no content.
+    #[serde(default)]
+    content: BTreeMap<String, RawMediaType>,
 }
 
 /// A schema entry in `components.schemas` or in a field's `properties` map.
@@ -284,8 +315,8 @@ impl<'a> LoweringContext<'a> {
 /// the bare schema name as a borrowed slice of the input.
 ///
 /// v0.1 deliberately supports only schema references — pointers into
-/// `components/parameters` or `components/responses` will be added in Phase 3
-/// when the IR grows to model those.
+/// `components/parameters` or `components/responses` will be added when the
+/// IR grows to model those.
 fn parse_schema_ref_pointer(reference: &str) -> Result<&str> {
     let bare = reference
         .strip_prefix("#/components/schemas/")
@@ -359,6 +390,9 @@ fn lower_operations(
                     })
                     .transpose()?;
 
+                // Phase 3: lower responses, deterministically ordered.
+                let responses = lower_responses(path, method, &raw_op.responses, ctx)?;
+
                 ops.push(Operation {
                     method,
                     path: path.clone(),
@@ -366,6 +400,7 @@ fn lower_operations(
                     summary: raw_op.summary.clone(),
                     parameters,
                     request_body,
+                    responses,
                 });
             }
         }
@@ -409,23 +444,36 @@ fn lower_parameter(path: &str, raw: &RawParameter, ctx: &mut LoweringContext) ->
     })
 }
 
+/// Selects the preferred content type from a `requestBody.content` map.
+///
+/// Preference order:
+/// 1. `application/json` — the default for modern REST APIs.
+/// 2. `multipart/form-data` — file uploads, the common second case. We
+///    surface `is_multipart=true` so the emitter knows to build `FormData`.
+/// 3. The first entry in BTreeMap order — last-resort fallback for specs
+///    that only expose a single non-standard media type. `is_multipart`
+///    stays false; the emitter will treat it as JSON-ish until a future
+///    phase adds richer codec selection.
+fn pick_request_body_content<'a>(
+    content: &'a BTreeMap<String, RawMediaType>,
+) -> Option<(String, &'a RawMediaType, bool)> {
+    if let Some(mt) = content.get("application/json") {
+        return Some(("application/json".to_string(), mt, false));
+    }
+    if let Some(mt) = content.get("multipart/form-data") {
+        return Some(("multipart/form-data".to_string(), mt, true));
+    }
+    content.iter().next().map(|(k, v)| (k.clone(), v, false))
+}
+
 fn lower_request_body(
     path: &str,
     method: HttpMethod,
     raw: &RawRequestBody,
     ctx: &mut LoweringContext,
 ) -> Result<RequestBody> {
-    // Prefer application/json; fall back to the first entry in BTreeMap order.
-    let (content_type, media_type): (String, &RawMediaType) =
-        if let Some(mt) = raw.content.get("application/json") {
-            ("application/json".to_string(), mt)
-        } else {
-            let (k, v) =
-                raw.content.iter().next().ok_or_else(|| {
-                    anyhow!("requestBody of {method} {path} has no content entries")
-                })?;
-            (k.clone(), v)
-        };
+    let (content_type, media_type, is_multipart) = pick_request_body_content(&raw.content)
+        .ok_or_else(|| anyhow!("requestBody of {method} {path} has no content entries"))?;
 
     let schema = media_type.schema.as_ref().ok_or_else(|| {
         anyhow!(
@@ -440,6 +488,92 @@ fn lower_request_body(
         content_type,
         schema_ref,
         required: raw.required,
+        is_multipart,
+    })
+}
+
+// ── Phase 3: response lowering ───────────────────────────────────────────────
+
+/// Lowers an operation's `responses` map into a deterministic Vec.
+///
+/// Status codes are emitted in this order:
+/// 1. Numeric codes ascending (so "200" before "404" before "500").
+/// 2. The `"default"` sentinel last.
+/// 3. Anything else (extension keys, etc.) sorted lexicographically before
+///    `"default"`.
+///
+/// The status-code key is preserved verbatim in `Response.status_code` so
+/// emitters can reproduce it (e.g. for switch arms or doc comments) without
+/// having to pretty-print a numeric type back into a string.
+fn lower_responses(
+    path: &str,
+    method: HttpMethod,
+    raw: &BTreeMap<String, RawResponse>,
+    ctx: &mut LoweringContext,
+) -> Result<Vec<Response>> {
+    // Sort keys: numeric codes first (ascending by integer value), then
+    // non-numeric / non-default keys lexicographically, then "default" last.
+    let mut keys: Vec<&String> = raw.keys().collect();
+    keys.sort_by(|a, b| {
+        let key = |s: &str| -> (u8, i64, String) {
+            if s == "default" {
+                (2, 0, String::new())
+            } else if let Ok(n) = s.parse::<i64>() {
+                (0, n, String::new())
+            } else {
+                (1, 0, s.to_string())
+            }
+        };
+        key(a).cmp(&key(b))
+    });
+
+    let mut out = Vec::with_capacity(raw.len());
+    for status_code in keys {
+        let raw_resp = &raw[status_code];
+        let response = lower_response(status_code, raw_resp, ctx)
+            .with_context(|| format!("response `{status_code}` of {method} {path}"))?;
+        out.push(response);
+    }
+    Ok(out)
+}
+
+/// Lowers a single response entry.
+///
+/// Schema selection from `content`: prefer `application/json`; fall back to
+/// the first entry (BTreeMap-ordered, so deterministic). When `content` is
+/// absent or the chosen entry has no `schema`, `schema_ref` is `None` —
+/// callers like the Dart emitter will turn that into `Future<void>`-shaped
+/// returns.
+fn lower_response(
+    status_code: &str,
+    raw: &RawResponse,
+    ctx: &mut LoweringContext,
+) -> Result<Response> {
+    if raw.content.is_empty() {
+        return Ok(Response {
+            status_code: status_code.to_string(),
+            schema_ref: None,
+        });
+    }
+
+    let media_type = raw
+        .content
+        .get("application/json")
+        .or_else(|| raw.content.values().next())
+        // Unreachable given the is_empty guard above, but cheap defensiveness.
+        .ok_or_else(|| anyhow!("response `{status_code}` has empty content map"))?;
+
+    let schema_ref = match &media_type.schema {
+        Some(sor) => Some(
+            lower_type_ref("<response>", sor, ctx)
+                .with_context(|| format!("schema of response `{status_code}`"))?,
+        ),
+        None => None,
+    };
+
+    Ok(Response {
+        status_code: status_code.to_string(),
+        schema_ref,
     })
 }
 
@@ -662,6 +796,18 @@ fn lower_type_ref(
                     format: raw.format.clone(),
                 }),
                 Some("boolean") => Ok(TypeRef::Boolean),
+                Some("array") => {
+                    // Inline arrays — common in response schemas like
+                    // `application/json: { schema: { type: array, items: ... } }`.
+                    // We can't synthesise a top-level Schema here, so treat
+                    // the array as a Map-like-but-list... actually, no: the IR
+                    // doesn't yet model inline list TypeRefs. Reject with a
+                    // clear pointer to the workaround (declare a named schema).
+                    Err(anyhow!(
+                        "field `{field_name}` is an inline array — declare it \
+                         as a named schema in components.schemas and $ref to it"
+                    ))
+                }
                 Some(other) => Err(anyhow!(
                     "field `{field_name}` has unsupported inline type `{other}`"
                 )),
@@ -770,6 +916,7 @@ mod tests {
             .expect("POST /pets should have a request body");
         assert_eq!(body.content_type, "application/json");
         assert!(body.required, "POST /pets body should be required");
+        assert!(!body.is_multipart, "JSON body should not be multipart");
         assert!(
             matches!(&body.schema_ref, TypeRef::Named(n) if n == "Pet"),
             "body schema should be Named(\"Pet\"), got {:?}",
@@ -838,7 +985,6 @@ paths:
 
     #[test]
     fn rejects_unresolved_schema_ref() {
-        // The registry must catch refs to schemas that aren't defined.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -867,8 +1013,6 @@ paths:
 
     #[test]
     fn rejects_non_schema_ref_pointer() {
-        // v0.1 only supports #/components/schemas/* refs. Pointers into
-        // components/parameters etc. should fail with a clear message.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -886,18 +1030,11 @@ paths:
 ";
         let err = load_str(yaml).unwrap_err();
         let msg = format!("{err:#}");
-        // Either the parameter-level $ref is rejected at deserialization, or
-        // (if a future version supports it) the schema sub-ref is. Either way
-        // we expect the error to point at the spec's misuse.
         assert!(!msg.is_empty(), "expected an error, got empty");
     }
 
     #[test]
     fn handles_self_referential_schema() {
-        // A linked-list-style schema where Node.next is a $ref back to Node.
-        // This is the canonical case the `visiting` set is designed to handle:
-        // when we're partway through lowering Node and hit a ref to Node, the
-        // resolver short-circuits to TypeRef::Named without re-entering.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -930,8 +1067,6 @@ components:
 
     #[test]
     fn resolves_cross_schema_ref() {
-        // Sanity check: a ref to a sibling schema resolves correctly through
-        // the registry, even though that sibling isn't currently in `visiting`.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1001,7 +1136,6 @@ components:
 
     #[test]
     fn rejects_non_string_enum_values() {
-        // Integer enums exist in OpenAPI but we explicitly punt on them in v0.1.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1063,7 +1197,6 @@ components:
 
     #[test]
     fn additional_properties_lowers_to_map_of_named_ref() {
-        // Maps of complex types — common in real APIs (e.g. `extensions: { ... }`).
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1103,9 +1236,6 @@ components:
 
     #[test]
     fn additional_properties_boolean_does_not_become_map() {
-        // additionalProperties: true is a permissibility hint, not a typed map.
-        // The schema should lower as a regular object with only its declared
-        // properties.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1185,7 +1315,6 @@ components:
 
     #[test]
     fn all_of_merges_referenced_fields() {
-        // The canonical "subclass extends base" case.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1231,7 +1360,6 @@ components:
 
     #[test]
     fn all_of_with_only_refs() {
-        // No own properties, just composing two refs (mixin pattern).
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1265,17 +1393,12 @@ components:
         };
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["id", "createdAt"]);
-        // Sanity: the date-time mapping survives through allOf flattening.
         let created_at = fields.iter().find(|f| f.name == "createdAt").unwrap();
         assert!(matches!(created_at.type_ref, TypeRef::DateTime));
     }
 
     #[test]
     fn all_of_subclass_override_keeps_inherited_required() {
-        // A base says `id` is required; the subclass redeclares `id` with a
-        // different type but doesn't list it in its own `required`.
-        // - The redeclared *type* should win (later occurrence overrides).
-        // - The required-ness from the base should be preserved (OR semantics).
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1315,8 +1438,6 @@ components:
 
     #[test]
     fn all_of_combines_with_own_properties() {
-        // A schema with both `allOf` and its own `properties` — common in real
-        // APIs ("inherit the base, plus add these new fields").
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1352,9 +1473,6 @@ components:
 
     #[test]
     fn all_of_nested_refs_flatten_recursively() {
-        // C → B → A: composing a chain should walk through and produce the
-        // union of all leaf fields. This is the test that exercises the
-        // recursive call in `collect_member_fields`.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1395,7 +1513,6 @@ components:
 
     #[test]
     fn rejects_all_of_cycle() {
-        // A composes B, B composes A — this can't be flattened.
         let yaml = "
 openapi: 3.0.0
 info:
@@ -1436,5 +1553,352 @@ components:
             msg.contains("DoesNotExist"),
             "expected unresolved-ref error, got: {msg}"
         );
+    }
+
+    // ── Phase 3: responses ────────────────────────────────────────────────────
+
+    #[test]
+    fn petstore_responses_are_populated() {
+        // Every PetStore operation declares responses. Verify the IR
+        // captures them, schema refs resolve to the right named types, and
+        // bodyless responses (POST /pets → 201) come through with None.
+        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
+        let api = load_str(yaml).expect("petstore should parse");
+
+        // GET /pets → 200 (Pets), default (Error). Status order: 200, default.
+        let list_pets = &api.operations[0];
+        assert_eq!(list_pets.responses.len(), 2);
+        assert_eq!(list_pets.responses[0].status_code, "200");
+        assert!(
+            matches!(&list_pets.responses[0].schema_ref, Some(TypeRef::Named(n)) if n == "Pets"),
+            "GET /pets 200 should be Named(\"Pets\"), got {:?}",
+            list_pets.responses[0].schema_ref
+        );
+        assert_eq!(list_pets.responses[1].status_code, "default");
+        assert!(
+            matches!(&list_pets.responses[1].schema_ref, Some(TypeRef::Named(n)) if n == "Error"),
+            "GET /pets default should be Named(\"Error\"), got {:?}",
+            list_pets.responses[1].schema_ref
+        );
+
+        // POST /pets → 201 (no body), default (Error).
+        let create_pets = &api.operations[1];
+        assert_eq!(create_pets.responses.len(), 2);
+        assert_eq!(create_pets.responses[0].status_code, "201");
+        assert!(
+            create_pets.responses[0].schema_ref.is_none(),
+            "POST /pets 201 should have no schema, got {:?}",
+            create_pets.responses[0].schema_ref
+        );
+        assert_eq!(create_pets.responses[1].status_code, "default");
+        assert!(
+            matches!(&create_pets.responses[1].schema_ref, Some(TypeRef::Named(n)) if n == "Error")
+        );
+
+        // GET /pets/{petId} → 200 (Pet), default (Error).
+        let show_pet = &api.operations[2];
+        assert_eq!(show_pet.responses.len(), 2);
+        assert_eq!(show_pet.responses[0].status_code, "200");
+        assert!(
+            matches!(&show_pet.responses[0].schema_ref, Some(TypeRef::Named(n)) if n == "Pet"),
+            "GET /pets/{{petId}} 200 should be Named(\"Pet\"), got {:?}",
+            show_pet.responses[0].schema_ref
+        );
+        assert_eq!(show_pet.responses[1].status_code, "default");
+    }
+
+    #[test]
+    fn responses_are_ordered_numeric_then_default() {
+        // Mixed-order spec: ensure numeric codes come out ascending and
+        // `default` lands at the end regardless of YAML order.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /things:
+    get:
+      operationId: listThings
+      responses:
+        default:
+          description: error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Err'
+        '500':
+          description: server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Err'
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Thing'
+        '404':
+          description: missing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Err'
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        id:
+          type: string
+    Err:
+      type: object
+      properties:
+        message:
+          type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let op = &api.operations[0];
+        let codes: Vec<&str> = op
+            .responses
+            .iter()
+            .map(|r| r.status_code.as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["200", "404", "500", "default"],
+            "numeric ascending then default last"
+        );
+    }
+
+    #[test]
+    fn response_with_no_content_has_no_schema() {
+        // Common pattern: 204 No Content, or any response that omits content.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /things/{id}:
+    delete:
+      operationId: deleteThing
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: deleted
+";
+        let api = load_str(yaml).expect("should parse");
+        let op = &api.operations[0];
+        assert_eq!(op.responses.len(), 1);
+        assert_eq!(op.responses[0].status_code, "204");
+        assert!(
+            op.responses[0].schema_ref.is_none(),
+            "204 response with no content should have no schema"
+        );
+    }
+
+    #[test]
+    fn response_inline_object_schema() {
+        // Response with an inline object — not a $ref. The lowering path
+        // should produce an Object-shaped... wait, response schemas aren't
+        // lowered into a SchemaKind::Object — they live as a TypeRef. An
+        // inline object as a response is not currently supported, but a
+        // primitive-shaped inline schema like `type: string` should work.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /ping:
+    get:
+      operationId: ping
+      responses:
+        '200':
+          description: pong
+          content:
+            application/json:
+              schema:
+                type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let op = &api.operations[0];
+        assert_eq!(op.responses.len(), 1);
+        assert!(
+            matches!(op.responses[0].schema_ref, Some(TypeRef::String)),
+            "string response should lower to TypeRef::String, got {:?}",
+            op.responses[0].schema_ref
+        );
+    }
+
+    #[test]
+    fn response_resolves_unknown_ref_with_clear_error() {
+        // Ref pointing into the void should still error sensibly.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /ping:
+    get:
+      operationId: ping
+      responses:
+        '200':
+          description: pong
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Nope'
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Nope") && msg.contains("undefined"),
+            "expected unresolved-ref error mentioning the missing schema; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn response_falls_back_to_first_content_type() {
+        // No application/json; only application/xml. Pick the first entry
+        // (BTreeMap-sorted, deterministic).
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /things:
+    get:
+      operationId: listThings
+      responses:
+        '200':
+          description: ok
+          content:
+            application/xml:
+              schema:
+                type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let op = &api.operations[0];
+        assert!(matches!(op.responses[0].schema_ref, Some(TypeRef::String)));
+    }
+
+    // ── Phase 3: multipart/form-data ──────────────────────────────────────────
+
+    #[test]
+    fn multipart_request_body_sets_is_multipart() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /upload:
+    post:
+      operationId: upload
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Upload'
+      responses:
+        '204':
+          description: uploaded
+components:
+  schemas:
+    Upload:
+      type: object
+      required: [file]
+      properties:
+        file:
+          type: string
+          format: binary
+        caption:
+          type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let op = &api.operations[0];
+        let body = op.request_body.as_ref().expect("upload should have a body");
+        assert_eq!(body.content_type, "multipart/form-data");
+        assert!(body.is_multipart, "is_multipart should be set");
+        assert!(body.required);
+        assert!(matches!(&body.schema_ref, TypeRef::Named(n) if n == "Upload"));
+    }
+
+    #[test]
+    fn json_preferred_over_multipart_when_both_present() {
+        // If both content types are declared, JSON wins — multipart is only
+        // a fallback. Most specs that offer both have JSON as the canonical
+        // shape and multipart as a convenience for browser uploads.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /upload:
+    post:
+      operationId: upload
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Upload'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Upload'
+      responses:
+        '204':
+          description: uploaded
+components:
+  schemas:
+    Upload:
+      type: object
+      properties:
+        caption:
+          type: string
+";
+        let api = load_str(yaml).expect("should parse");
+        let body = api.operations[0].request_body.as_ref().unwrap();
+        assert_eq!(body.content_type, "application/json");
+        assert!(!body.is_multipart, "JSON should win and is_multipart false");
+    }
+
+    #[test]
+    fn non_json_non_multipart_falls_back_without_multipart_flag() {
+        // application/xml only — picked up via the first-entry fallback,
+        // is_multipart should remain false.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        content:
+          application/xml:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: created
+";
+        let api = load_str(yaml).expect("should parse");
+        let body = api.operations[0].request_body.as_ref().unwrap();
+        assert_eq!(body.content_type, "application/xml");
+        assert!(!body.is_multipart);
     }
 }

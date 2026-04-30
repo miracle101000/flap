@@ -59,6 +59,13 @@ pub struct Operation {
     pub parameters: Vec<Parameter>,
     /// The request body, if this operation accepts one.
     pub request_body: Option<RequestBody>,
+    /// All declared responses for this operation, keyed by status code.
+    ///
+    /// Ordered deterministically: numeric status codes ascending first,
+    /// then `default` last (so "200", "201", "404", "default"). Empty when
+    /// no responses are declared (rare — OpenAPI requires at least one,
+    /// but we don't enforce that here).
+    pub responses: Vec<Response>,
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
@@ -98,16 +105,42 @@ pub struct Parameter {
 /// The body sent with a POST / PUT / PATCH request.
 ///
 /// Only the first (preferred) content type is modelled — typically
-/// `application/json`. Multi-body operations are a post-v0.1 concern.
+/// `application/json`, with `multipart/form-data` accepted as a second
+/// preference for file-upload endpoints. Multi-body operations beyond
+/// the chosen pair are a post-v0.1 concern.
 #[derive(Debug)]
 pub struct RequestBody {
-    /// The MIME type of the body, e.g. `"application/json"`.
+    /// The MIME type of the body, e.g. `"application/json"` or
+    /// `"multipart/form-data"`.
     pub content_type: String,
     /// The schema of the body payload.
     pub schema_ref: TypeRef,
     /// Whether the caller must supply this body. OpenAPI defaults to false,
     /// but `required: true` is strongly encouraged and common in real specs.
     pub required: bool,
+    /// True when `content_type` is `multipart/form-data`. The Dart emitter
+    /// uses this to choose between sending a JSON-encoded body and building
+    /// a Dio `FormData` (which is also what enables file uploads).
+    pub is_multipart: bool,
+}
+
+// ── Responses ────────────────────────────────────────────────────────────────
+
+/// A single response entry of an operation, keyed by status code.
+///
+/// `status_code` is kept as a `String` so we can carry both numeric codes
+/// (`"200"`, `"404"`) and the OpenAPI sentinel `"default"` without adding
+/// an enum that the emitter would just have to map back to a string. The
+/// upstream parser is the authority on what counts as a valid key.
+///
+/// `schema_ref` is `None` when the response declares no body — for example
+/// `204 No Content`, or PetStore's `POST /pets` returning `201` with just a
+/// `description`. Emitters use this to decide between `Future<T>` and
+/// `Future<void>`-shaped return types.
+#[derive(Debug)]
+pub struct Response {
+    pub status_code: String,
+    pub schema_ref: Option<TypeRef>,
 }
 
 // ── Schemas ──────────────────────────────────────────────────────────────────

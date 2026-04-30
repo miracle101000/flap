@@ -39,10 +39,21 @@ fn main() -> ExitCode {
         }
         if let Some(body) = &op.request_body {
             let req = if body.required { "*" } else { "?" };
+            let kind = if body.is_multipart {
+                " [multipart]"
+            } else {
+                ""
+            };
             println!(
-                "    {}  body     {}: {}",
-                req, body.content_type, body.schema_ref
+                "    {}  body     {}{}: {}",
+                req, body.content_type, kind, body.schema_ref
             );
+        }
+        for resp in &op.responses {
+            match &resp.schema_ref {
+                Some(t) => println!("    →  {:<8} : {}", resp.status_code, t),
+                None => println!("    →  {:<8} : (no body)", resp.status_code),
+            }
         }
     }
     println!();

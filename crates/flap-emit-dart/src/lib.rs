@@ -358,6 +358,7 @@ mod tests {
                     summary: Some("List all pets".into()),
                     parameters: vec![],
                     request_body: None,
+                    responses: vec![],
                 },
                 Operation {
                     method: HttpMethod::Post,
@@ -366,6 +367,7 @@ mod tests {
                     summary: Some("Create a pet".into()),
                     parameters: vec![],
                     request_body: None,
+                    responses: vec![],
                 },
                 Operation {
                     method: HttpMethod::Get,
@@ -374,6 +376,7 @@ mod tests {
                     summary: Some("Info for a specific pet".into()),
                     parameters: vec![],
                     request_body: None,
+                    responses: vec![],
                 },
             ],
             schemas: vec![error_schema(), pet_schema(), pets_schema()],
