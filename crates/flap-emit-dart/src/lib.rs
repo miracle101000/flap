@@ -1,31 +1,69 @@
-//! Dart / Flutter code emitter.
+//! Dart / Flutter code emitter (Phase 4 — production output).
 //!
 //! Public API:
-//! - `emit_models` → one Dart source file per schema (Freezed classes / typedefs).
-//! - `emit_client` → a single Dio client stub file with one method per operation.
+//! - [`emit_models`] → one Dart source per top-level schema, plus one per
+//!   synthesised inline enum (`Pet.status` → `pet_status.dart`).
+//! - [`emit_client`] → a single Dio client file with one method per operation,
+//!   with real signatures (return types from the success response, named
+//!   arguments per parameter and body) and real bodies (path templating,
+//!   `queryParameters` map, request `data`, response deserialisation).
 //!
-//! Output conventions (DECISIONS D3 — Freezed + Dio):
-//! - Object schemas  → `@freezed` class with `fromJson` factory.
-//! - Array schemas   → `typedef Name = List<ItemType>;`
-//! - Operations      → stub methods on a Dio client class (bodies next session).
+//! ## Output conventions (DECISIONS D3 — Freezed + Dio)
+//! - Object schemas → `@freezed` class with `fromJson` factory.
+//! - Array schemas → `typedef Name = List<ItemType>;`
+//! - Inline `enum: [...]` → a separate Dart `enum` file annotated with
+//!   `@JsonValue('<original>')` on each case so the on-the-wire string
+//!   round-trips through json_serializable.
+//! - Operations → real Dio methods on a generated client class.
 //!
-//! Name collision (DECISIONS D7):
-//! - Schema names that clash with Dart core identifiers get a "Model" suffix.
-//! - Applies to both the generated class name and any `TypeRef::Named` reference
-//!   to that schema, so callers always see a consistent type name.
+//! ## Synthetic enum names
+//! `TypeRef::Enum` is a structural value with no name of its own, but Dart
+//! enums need names. Every inline enum is given a synthesised PascalCase name
+//! based on its containing context:
 //!
-//! TODO (post-PetStore): snake_case OpenAPI field names need to_camel_case()
-//! + `@JsonKey(name: '...')` annotation. PetStore fields are single words.
+//! | Where it appears                  | Synth name                          |
+//! |-----------------------------------|-------------------------------------|
+//! | `Pet.status` field                | `PetStatus`                         |
+//! | `listPets` op's `status` query    | `ListPetsStatus`                    |
+//!
+//! The name is consulted everywhere the enum's Dart type is needed —
+//! Freezed field declarations, parameter types, deserialisation expressions,
+//! and the `import 'pet_status.dart';` directives at the top of dependent
+//! files. Conflicts (two contexts producing the same name) are not expected
+//! in real specs, but if they occur the registry is last-write-wins with
+//! the `enums` BTreeMap keyed by synth name.
+//!
+//! ## Name collisions
+//!
+//! - **Class names that clash with Dart core identifiers** (DECISIONS D7):
+//!   `Error`, `Type`, etc. get a `Model` suffix. Applied at every usage —
+//!   class declaration, file name, named-ref types in fields/responses,
+//!   `*.fromJson(...)` deserialisation calls.
+//! - **Field names that aren't valid Dart camelCase**: the OpenAPI spec
+//!   often uses `snake_case` (e.g. `created_at`). Dart property names get
+//!   the camelCase form (`createdAt`) and the original key is preserved
+//!   on the wire via `@JsonKey(name: '<original>')`. Names already in
+//!   camelCase (the entire PetStore set: `id`, `name`, `tag`) emit no
+//!   annotation.
+//! - **Parameter names that collide with Dart reserved words** (DECISIONS
+//!   D10): a `Param` suffix is appended in the Dart signature. The original
+//!   name is preserved on the wire — path template uses the renamed
+//!   identifier in `${...}` interpolation, but query/header maps and the
+//!   `{...}` placeholders in the URL still use the original spec name.
+//! - **Two parameters in the same operation sharing a name across
+//!   locations** (DECISIONS D10): hard error during generation. We panic
+//!   rather than silently shadow.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use flap_ir::{Api, Field, Operation, Schema, SchemaKind, TypeRef};
+use flap_ir::{
+    Api, Field, Operation, ParameterLocation, RequestBody, Response, Schema, SchemaKind, TypeRef,
+};
 
-// ── D7: Dart core name collision list ────────────────────────────────────────
+// ── Identifier policy ────────────────────────────────────────────────────────
 
-/// Schema names that collide with Dart core identifiers.
+/// Schema names that collide with Dart core identifiers (DECISIONS D7).
 /// When a schema name is in this list, the emitted class gets a "Model" suffix.
-/// Source: DECISIONS D7.
 const DART_CORE_COLLISIONS: &[&str] = &[
     "bool",
     "DateTime",
@@ -52,8 +90,20 @@ const DART_CORE_COLLISIONS: &[&str] = &[
     "Uri",
 ];
 
-/// Returns the Dart class name for an OpenAPI schema name.
-/// Appends "Model" when the name collides with a Dart core identifier (D7).
+/// Dart reserved keywords that may not be used as identifiers (DECISIONS D10).
+/// Limited to entries that could plausibly appear as an OpenAPI parameter
+/// or field name. Built-in types like `int` are handled separately by D7.
+const DART_RESERVED_KEYWORDS: &[&str] = &[
+    "abstract", "as", "assert", "async", "await", "break", "case", "catch", "class", "const",
+    "continue", "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
+    "extends", "extension", "external", "factory", "false", "final", "finally", "for", "get",
+    "hide", "if", "implements", "import", "in", "interface", "is", "late", "library", "mixin",
+    "new", "null", "of", "on", "operator", "part", "required", "rethrow", "return", "set", "show",
+    "static", "super", "switch", "sync", "this", "throw", "true", "try", "typedef", "var", "void",
+    "while", "with", "yield",
+];
+
+/// Dart class name for an OpenAPI schema. Appends "Model" on collision (D7).
 fn dart_class_name(schema_name: &str) -> String {
     if DART_CORE_COLLISIONS.contains(&schema_name) {
         format!("{schema_name}Model")
@@ -62,97 +112,292 @@ fn dart_class_name(schema_name: &str) -> String {
     }
 }
 
-// ── Public entry points ───────────────────────────────────────────────────────
+/// Dart identifier safe to use as an argument or local variable name.
+/// Reserved words get a `Param` suffix; the wire-side name is unchanged.
+fn escape_dart_keyword(name: &str) -> String {
+    if DART_RESERVED_KEYWORDS.contains(&name) {
+        format!("{name}Param")
+    } else {
+        name.to_string()
+    }
+}
 
-/// Returns a map of `filename → Dart source` — one entry per schema.
-/// Filenames are derived from the (potentially collision-renamed) Dart class name.
+// ── Synthetic enum registry ──────────────────────────────────────────────────
+
+/// One inline `enum: [...]` discovered while walking the API.
+#[derive(Debug, Clone)]
+struct SynthEnum {
+    /// PascalCase synthesised type name (e.g. "PetStatus").
+    name: String,
+    /// String values in spec order. Preserved verbatim — the on-the-wire
+    /// representation lives on `@JsonValue` annotations, while the Dart
+    /// enum case names are derived separately.
+    values: Vec<String>,
+}
+
+/// Lookup tables for enum types and their location-derived names.
+#[derive(Debug, Default)]
+struct EnumRegistry {
+    /// (schema_name, field_name) → synth enum name.
+    field_enums: HashMap<(String, String), String>,
+    /// (operation_id, param_name) → synth enum name. Operations without
+    /// `operationId` are skipped — we have no stable way to name the enum.
+    param_enums: HashMap<(String, String), String>,
+    /// All synth enums, keyed by name. BTreeMap for deterministic iteration
+    /// (file emission order matters for golden-output testing).
+    enums: BTreeMap<String, SynthEnum>,
+}
+
+impl EnumRegistry {
+    fn build(api: &Api) -> Self {
+        let mut reg = Self::default();
+
+        // Schemas: object fields with TypeRef::Enum.
+        for schema in &api.schemas {
+            if let SchemaKind::Object { fields } = &schema.kind {
+                for field in fields {
+                    if let TypeRef::Enum(values) = &field.type_ref {
+                        let synth = format!("{}{}", schema.name, to_pascal_case(&field.name));
+                        reg.field_enums
+                            .insert((schema.name.clone(), field.name.clone()), synth.clone());
+                        reg.enums.insert(
+                            synth.clone(),
+                            SynthEnum {
+                                name: synth,
+                                values: values.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            // Top-level array schemas with an enum item are exotic; skip
+            // until a real spec exhibits the pattern.
+        }
+
+        // Operations: parameter schemas with TypeRef::Enum.
+        for op in &api.operations {
+            let Some(op_id) = &op.operation_id else {
+                continue;
+            };
+            let op_pascal = to_pascal_case(op_id);
+            for param in &op.parameters {
+                if let TypeRef::Enum(values) = &param.type_ref {
+                    let synth = format!("{}{}", op_pascal, to_pascal_case(&param.name));
+                    reg.param_enums
+                        .insert((op_id.clone(), param.name.clone()), synth.clone());
+                    reg.enums.insert(
+                        synth.clone(),
+                        SynthEnum {
+                            name: synth,
+                            values: values.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        reg
+    }
+
+    fn lookup_field(&self, schema: &str, field: &str) -> Option<&str> {
+        self.field_enums
+            .get(&(schema.to_string(), field.to_string()))
+            .map(String::as_str)
+    }
+
+    fn lookup_param(&self, op_id: &str, param: &str) -> Option<&str> {
+        self.param_enums
+            .get(&(op_id.to_string(), param.to_string()))
+            .map(String::as_str)
+    }
+}
+
+// ── Public entry point: models ────────────────────────────────────────────────
+
+/// Returns a map of `filename → Dart source`. One file per schema, plus one
+/// file per synthesised inline enum.
 pub fn emit_models(api: &Api) -> HashMap<String, String> {
-    api.schemas
-        .iter()
-        .map(|schema| {
-            let class_name = dart_class_name(&schema.name);
-            let filename = format!("{}.dart", to_snake_case(&class_name));
-            let source = emit_schema(schema, &class_name);
-            (filename, source)
-        })
-        .collect()
+    let registry = EnumRegistry::build(api);
+    let mut files = HashMap::new();
+
+    for schema in &api.schemas {
+        let class_name = dart_class_name(&schema.name);
+        let filename = format!("{}.dart", to_snake_case(&class_name));
+        let source = emit_schema(schema, &class_name, &registry);
+        files.insert(filename, source);
+    }
+
+    for synth in registry.enums.values() {
+        let filename = format!("{}.dart", to_snake_case(&synth.name));
+        let source = emit_synth_enum(synth);
+        files.insert(filename, source);
+    }
+
+    files
 }
 
-/// Returns `(filename, Dart source)` for the Dio client stub.
-pub fn emit_client(api: &Api) -> (String, String) {
-    let class_name = api_client_name(&api.title);
-    let filename = format!("{}.dart", to_snake_case(&class_name));
-    let source = emit_client_source(api, &class_name);
-    (filename, source)
-}
+// ── Schema-shape dispatch ─────────────────────────────────────────────────────
 
-// ── Per-schema dispatch ───────────────────────────────────────────────────────
-
-fn emit_schema(schema: &Schema, class_name: &str) -> String {
+fn emit_schema(schema: &Schema, class_name: &str, registry: &EnumRegistry) -> String {
     match &schema.kind {
-        SchemaKind::Object { fields } => emit_freezed_class(class_name, fields),
+        SchemaKind::Object { fields } => {
+            emit_freezed_class(class_name, &schema.name, fields, registry)
+        }
         SchemaKind::Array { item } => emit_array_typedef(class_name, item),
     }
 }
 
-// ── Object schemas → Freezed class ───────────────────────────────────────────
+// ── Object schemas → @freezed class ──────────────────────────────────────────
 
-fn emit_freezed_class(name: &str, fields: &[Field]) -> String {
-    let snake = to_snake_case(name);
+fn emit_freezed_class(
+    class_name: &str,
+    schema_name: &str,
+    fields: &[Field],
+    registry: &EnumRegistry,
+) -> String {
+    let snake = to_snake_case(class_name);
     let mut out = String::new();
 
+    // Freezed import.
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
+
+    // Cross-file imports: any synth enum referenced by a field, plus any
+    // named refs that resolve to schemas (so the tooling sees them, even
+    // if they're already part of the same generated package). We recurse
+    // through `TypeRef::Map` so `Map<String, Pet>` still imports `pet.dart`.
+    let mut imports: Vec<String> = Vec::new();
+    for field in fields {
+        collect_field_imports(
+            &field.type_ref,
+            &field.name,
+            schema_name,
+            class_name,
+            registry,
+            &mut imports,
+        );
+    }
+    imports.sort();
+    imports.dedup();
+    for line in &imports {
+        out.push_str(line);
+        out.push('\n');
+    }
     out.push('\n');
+
+    // Freezed `part` directives.
     out.push_str(&format!("part '{snake}.freezed.dart';\n"));
     out.push_str(&format!("part '{snake}.g.dart';\n"));
     out.push('\n');
 
     out.push_str("@freezed\n");
-    out.push_str(&format!("class {name} with _${name} {{\n"));
-
-    out.push_str(&format!("  const factory {name}({{\n"));
+    out.push_str(&format!("class {class_name} with _${class_name} {{\n"));
+    out.push_str(&format!("  const factory {class_name}({{\n"));
     for field in fields {
-        out.push_str(&emit_field(field));
+        out.push_str(&emit_field(field, schema_name, registry));
     }
-    out.push_str(&format!("  }}) = _{name};\n"));
+    out.push_str(&format!("  }}) = _{class_name};\n"));
     out.push('\n');
-
     out.push_str(&format!(
-        "  factory {name}.fromJson(Map<String, dynamic> json) =>\n"
+        "  factory {class_name}.fromJson(Map<String, dynamic> json) =>\n"
     ));
-    out.push_str(&format!("      _${name}FromJson(json);\n"));
-
+    out.push_str(&format!("      _${class_name}FromJson(json);\n"));
     out.push_str("}\n");
+
     out
 }
 
-fn emit_field(field: &Field) -> String {
-    let dart_type = to_dart_type(&field.type_ref);
-    // OpenAPI field names in PetStore are single lowercase words — already
-    // valid Dart camelCase. Multi-word snake_case names need to_camel_case()
-    // + @JsonKey(name: '...') — TODO post-PetStore.
-    let dart_name = &field.name;
-    if field.required {
-        format!("    required {dart_type} {dart_name},\n")
-    } else {
-        format!("    {dart_type}? {dart_name},\n")
+fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> String {
+    let synth = registry.lookup_field(schema_name, &field.name);
+    let dart_type = to_dart_type(&field.type_ref, synth);
+    let dart_name = to_camel_case(&field.name);
+
+    let mut line = String::from("    ");
+    if dart_name != field.name {
+        // snake_case wire name preserved via @JsonKey, camelCase property.
+        line.push_str(&format!("@JsonKey(name: '{}') ", field.name));
     }
+    if field.required {
+        line.push_str(&format!("required {dart_type} {dart_name},\n"));
+    } else {
+        line.push_str(&format!("{dart_type}? {dart_name},\n"));
+    }
+    line
 }
 
 // ── Array schemas → typedef ───────────────────────────────────────────────────
 
 fn emit_array_typedef(name: &str, item: &TypeRef) -> String {
-    let dart_item = to_dart_type(item);
+    let dart_item = to_dart_type(item, None);
     format!(
         "// Generated from OpenAPI array schema `{name}`.\n\
          typedef {name} = List<{dart_item}>;\n"
     )
 }
 
-// ── Dio client stub ───────────────────────────────────────────────────────────
+/// Walks a field's `TypeRef` and pushes any `import '...dart';` lines the
+/// generated source will need. Recurses through `Map` so nested named refs
+/// pull in their files too. Self-references (`class_name == cls`) are
+/// skipped — Freezed's `part` directives handle those without an import.
+fn collect_field_imports(
+    type_ref: &TypeRef,
+    field_name: &str,
+    schema_name: &str,
+    class_name: &str,
+    registry: &EnumRegistry,
+    imports: &mut Vec<String>,
+) {
+    match type_ref {
+        TypeRef::Enum(_) => {
+            if let Some(synth) = registry.lookup_field(schema_name, field_name) {
+                imports.push(format!("import '{}.dart';", to_snake_case(synth)));
+            }
+        }
+        TypeRef::Named(name) => {
+            let cls = dart_class_name(name);
+            if cls != class_name {
+                imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
+            }
+        }
+        TypeRef::Map(inner) => {
+            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
+        }
+        TypeRef::String
+        | TypeRef::Integer { .. }
+        | TypeRef::Number { .. }
+        | TypeRef::Boolean
+        | TypeRef::DateTime => {}
+    }
+}
 
-/// Converts an API title to a PascalCase Dart client class name.
-/// "Swagger Petstore" → "SwaggerPetstoreClient"
+// ── Synthesised enum file ─────────────────────────────────────────────────────
+
+fn emit_synth_enum(synth: &SynthEnum) -> String {
+    let mut out = String::new();
+    out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
+    out.push('\n');
+    out.push_str(&format!("enum {} {{\n", synth.name));
+    for (i, value) in synth.values.iter().enumerate() {
+        let case = to_dart_enum_case(value);
+        out.push_str(&format!("  @JsonValue('{value}')\n"));
+        let trailing = if i == synth.values.len() - 1 { ";" } else { "," };
+        out.push_str(&format!("  {case}{trailing}\n"));
+    }
+    out.push_str("}\n");
+    out
+}
+
+// ── Public entry point: client ────────────────────────────────────────────────
+
+/// Returns `(filename, Dart source)` for the Dio client file.
+pub fn emit_client(api: &Api) -> (String, String) {
+    let registry = EnumRegistry::build(api);
+    let class_name = api_client_name(&api.title);
+    let filename = format!("{}.dart", to_snake_case(&class_name));
+    let source = emit_client_source(api, &class_name, &registry);
+    (filename, source)
+}
+
+/// "Swagger Petstore" → "SwaggerPetstoreClient".
 fn api_client_name(title: &str) -> String {
     let pascal: String = title
         .split_whitespace()
@@ -161,68 +406,383 @@ fn api_client_name(title: &str) -> String {
             let mut chars = word.chars();
             match chars.next() {
                 None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
             }
         })
         .collect();
     format!("{pascal}Client")
 }
 
-fn emit_client_source(api: &Api, class_name: &str) -> String {
+fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> String {
     let mut out = String::new();
 
-    // Package import.
     out.push_str("import 'package:dio/dio.dart';\n");
     out.push('\n');
 
-    // Import each generated model file (sorted for determinism).
-    let mut model_imports: Vec<String> = api
-        .schemas
-        .iter()
-        .map(|s| {
-            let dart_name = dart_class_name(&s.name);
-            format!("import '{}.dart';", to_snake_case(&dart_name))
-        })
-        .collect();
-    model_imports.sort();
-    for import in &model_imports {
-        out.push_str(import);
+    // Import every model file plus every synth enum file. The client
+    // references most of them; importing the whole set keeps the file
+    // stable as operations evolve.
+    let mut imports: Vec<String> = Vec::new();
+    for schema in &api.schemas {
+        let cls = dart_class_name(&schema.name);
+        imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
+    }
+    for synth in registry.enums.values() {
+        imports.push(format!("import '{}.dart';", to_snake_case(&synth.name)));
+    }
+    imports.sort();
+    imports.dedup();
+    for line in &imports {
+        out.push_str(line);
         out.push('\n');
     }
     out.push('\n');
 
-    // Class declaration + constructor.
     out.push_str(&format!("class {class_name} {{\n"));
     out.push_str(&format!("  {class_name}({{required String baseUrl}})\n"));
     out.push_str("      : _dio = Dio(BaseOptions(baseUrl: baseUrl));\n");
     out.push('\n');
     out.push_str("  final Dio _dio;\n");
 
-    // One stub method per operation.
     for op in &api.operations {
         out.push('\n');
-        if let Some(summary) = &op.summary {
-            out.push_str(&format!("  /// {summary}\n"));
-        }
-        out.push_str(&format!("  // {} {}\n", op.method, op.path));
-        let method_name = op_method_name(op);
-        out.push_str(&format!("  Future<void> {method_name}() async {{\n"));
-        out.push_str(&format!("    throw UnimplementedError('{method_name}');\n"));
-        out.push_str("  }\n");
+        out.push_str(&emit_method(op, &api.schemas, registry));
     }
 
     out.push_str("}\n");
     out
 }
 
-/// Returns the Dart method name for an operation.
-/// Prefers `operationId`; falls back to a slug derived from method + path.
+// ── Method emission ───────────────────────────────────────────────────────────
+
+/// Bundle of per-parameter naming decisions, computed once and reused by
+/// signature, path templating, query / header construction, and any
+/// downstream call site.
+struct DartParam<'a> {
+    /// Original OpenAPI name (used as wire-side key in path / query / header).
+    spec_name: &'a str,
+    /// Dart identifier used in the signature and method body. May differ
+    /// from `spec_name` if the spec name was snake_case (camelCased) or
+    /// collided with a Dart reserved keyword (suffixed with `Param`).
+    dart_name: String,
+    location: ParameterLocation,
+    /// The non-nullable Dart type — e.g. `String`, `int`, `PetStatus`.
+    /// The signature emitter adds a `?` for optional params and uses the
+    /// bare form for required ones.
+    non_null_type: String,
+    required: bool,
+}
+
+fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> String {
+    let mut out = String::new();
+
+    if let Some(summary) = &op.summary {
+        out.push_str(&format!("  /// {summary}\n"));
+    }
+    out.push_str(&format!("  // {} {}\n", op.method, op.path));
+
+    let method_name = op_method_name(op);
+    let dart_params = build_dart_params(op, registry);
+    let return_type = success_return_type(&op.responses);
+
+    // Signature.
+    if dart_params.is_empty() && op.request_body.is_none() {
+        out.push_str(&format!(
+            "  Future<{return_type}> {method_name}() async {{\n"
+        ));
+    } else {
+        out.push_str(&format!("  Future<{return_type}> {method_name}({{\n"));
+
+        // Required params first, then body, then optional. Names sorted
+        // within each group for deterministic, low-diff output.
+        let mut required: Vec<&DartParam> = dart_params.iter().filter(|p| p.required).collect();
+        let mut optional: Vec<&DartParam> = dart_params.iter().filter(|p| !p.required).collect();
+        required.sort_by(|a, b| a.dart_name.cmp(&b.dart_name));
+        optional.sort_by(|a, b| a.dart_name.cmp(&b.dart_name));
+
+        for p in &required {
+            out.push_str(&format!(
+                "    required {} {},\n",
+                p.non_null_type, p.dart_name
+            ));
+        }
+        if let Some(body) = &op.request_body {
+            let body_type = to_dart_type(&body.schema_ref, None);
+            if body.required {
+                out.push_str(&format!("    required {body_type} body,\n"));
+            } else {
+                out.push_str(&format!("    {body_type}? body,\n"));
+            }
+        }
+        for p in &optional {
+            out.push_str(&format!("    {}? {},\n", p.non_null_type, p.dart_name));
+        }
+        out.push_str("  }) async {\n");
+    }
+
+    out.push_str(&emit_method_body(op, &dart_params, schemas, registry));
+    out.push_str("  }\n");
+    out
+}
+
+/// Builds the Dart-facing parameter list and enforces D10's cross-location
+/// uniqueness rule. Panics with a clear message if two parameters share a
+/// name across path/query/header — generation must fail loudly rather than
+/// emit a method that compiles but loses one of the values.
+fn build_dart_params<'a>(op: &'a Operation, registry: &EnumRegistry) -> Vec<DartParam<'a>> {
+    let op_id = op.operation_id.as_deref().unwrap_or("");
+    let mut out = Vec::with_capacity(op.parameters.len());
+    let mut seen: HashMap<&str, ParameterLocation> = HashMap::new();
+
+    for param in &op.parameters {
+        if let Some(prev) = seen.get(param.name.as_str()) {
+            panic!(
+                "DECISIONS D10: parameter `{}` of operation `{}` appears in both \
+                 `{}` and `{}` locations — cannot emit a Dart method without \
+                 losing one of them",
+                param.name, op_id, prev, param.location
+            );
+        }
+        seen.insert(&param.name, param.location);
+
+        let synth = registry.lookup_param(op_id, &param.name);
+        let non_null_type = to_dart_type(&param.type_ref, synth);
+        let dart_name = escape_dart_keyword(&to_camel_case(&param.name));
+
+        out.push(DartParam {
+            spec_name: &param.name,
+            dart_name,
+            location: param.location,
+            non_null_type,
+            required: param.required,
+        });
+    }
+
+    out
+}
+
+fn emit_method_body(
+    op: &Operation,
+    dart_params: &[DartParam],
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+) -> String {
+    let mut body = String::new();
+
+    // Path templating: replace each {spec_name} with ${dart_name}. Spec
+    // names that don't match a declared path parameter pass through
+    // untouched so a malformed input is still visibly malformed in the
+    // output rather than silently mangled.
+    let mut templated_path = op.path.clone();
+    for p in dart_params {
+        if p.location == ParameterLocation::Path {
+            let needle = format!("{{{}}}", p.spec_name);
+            let repl = format!("${{{}}}", p.dart_name);
+            templated_path = templated_path.replace(&needle, &repl);
+        }
+    }
+    let dart_path_literal = format!("'{templated_path}'");
+
+    // Query parameters: collect into a Map<String, dynamic>, with `if (…)`
+    // collection-if guarded entries for optional values so null query
+    // params are dropped at the Dio call site.
+    let query_params: Vec<&DartParam> = dart_params
+        .iter()
+        .filter(|p| p.location == ParameterLocation::Query)
+        .collect();
+    if !query_params.is_empty() {
+        body.push_str("    final queryParameters = <String, dynamic>{\n");
+        for p in &query_params {
+            if p.required {
+                body.push_str(&format!("      '{}': {},\n", p.spec_name, p.dart_name));
+            } else {
+                body.push_str(&format!(
+                    "      if ({} != null) '{}': {},\n",
+                    p.dart_name, p.spec_name, p.dart_name
+                ));
+            }
+        }
+        body.push_str("    };\n");
+    }
+
+    // Header parameters: same shape as queries, attached via Options(headers:).
+    let header_params: Vec<&DartParam> = dart_params
+        .iter()
+        .filter(|p| p.location == ParameterLocation::Header)
+        .collect();
+    if !header_params.is_empty() {
+        body.push_str("    final headers = <String, dynamic>{\n");
+        for p in &header_params {
+            if p.required {
+                body.push_str(&format!("      '{}': {},\n", p.spec_name, p.dart_name));
+            } else {
+                body.push_str(&format!(
+                    "      if ({} != null) '{}': {},\n",
+                    p.dart_name, p.spec_name, p.dart_name
+                ));
+            }
+        }
+        body.push_str("    };\n");
+    }
+
+    // Body data expression.
+    let data_expr = op.request_body.as_ref().map(body_data_expression);
+
+    // Return-type analysis decides whether to await-and-discard or
+    // capture-and-deserialise.
+    let success_schema = success_response_schema(&op.responses);
+    let needs_response_var = success_schema.is_some();
+
+    // Compose the Dio call.
+    let response_assign = if needs_response_var {
+        "    final response = "
+    } else {
+        "    "
+    };
+    body.push_str(response_assign);
+    body.push_str("await _dio.request<dynamic>(\n");
+    body.push_str(&format!("      {dart_path_literal},\n"));
+
+    // Options: method, plus headers if any. Build inline to keep the
+    // method body compact.
+    let method_str = op.method.to_string();
+    if header_params.is_empty() {
+        body.push_str(&format!(
+            "      options: Options(method: '{method_str}'),\n"
+        ));
+    } else {
+        body.push_str(&format!(
+            "      options: Options(method: '{method_str}', headers: headers),\n"
+        ));
+    }
+
+    if !query_params.is_empty() {
+        body.push_str("      queryParameters: queryParameters,\n");
+    }
+    if let Some(expr) = &data_expr {
+        body.push_str(&format!("      data: {expr},\n"));
+    }
+    body.push_str("    );\n");
+
+    // Deserialise the response body if there is a schema to honour.
+    if let Some(schema) = success_schema {
+        body.push_str("    final data = response.data;\n");
+        let expr = deserialize_expr(schema, schemas, registry, "data");
+        body.push_str(&format!("    return {expr};\n"));
+    }
+
+    body
+}
+
+/// Builds the right-hand side of `data: ...` for the Dio call.
+///
+/// - JSON object body → `body.toJson()`. Freezed classes implement `toJson`,
+///   so this round-trips cleanly through json_serializable.
+/// - JSON array body → `body` directly; Dart's `jsonEncode` walks lists and
+///   calls `.toJson()` on each element via its default `toEncodable`.
+/// - Multipart body → wrap in `FormData.fromMap` so Dio sends a multipart
+///   request. The IR's `is_multipart` flag is the single source of truth
+///   for this branch.
+/// - Primitive body (string, int, etc.) → pass through. Real specs rarely
+///   use a non-object request body, so this branch is mostly defensive.
+fn body_data_expression(body: &RequestBody) -> String {
+    if body.is_multipart {
+        return "FormData.fromMap(body.toJson())".into();
+    }
+    match &body.schema_ref {
+        TypeRef::Named(_) => "body.toJson()".into(),
+        _ => "body".into(),
+    }
+}
+
+/// Returns the chosen success response schema (preferring the lowest 2xx
+/// status code). `None` means "no body" or "no 2xx response".
+fn success_response_schema(responses: &[Response]) -> Option<&TypeRef> {
+    success_response(responses).and_then(|r| r.schema_ref.as_ref())
+}
+
+fn success_response(responses: &[Response]) -> Option<&Response> {
+    responses
+        .iter()
+        .find(|r| matches!(r.status_code.parse::<u16>(), Ok(c) if (200..300).contains(&c)))
+}
+
+/// Returns the Dart return type for an operation, derived from its
+/// chosen success response. Falls back to `void` when there is no 2xx
+/// response or the response declares no body.
+///
+/// Top-level enum responses are uncommon and we don't synthesise a name
+/// for them, so they degrade to `String` via `to_dart_type`'s fallback.
+/// If they become important, a separate per-operation-and-status registry
+/// can be added without disturbing the rest of the emitter.
+fn success_return_type(responses: &[Response]) -> String {
+    match success_response_schema(responses) {
+        Some(t) => to_dart_type(t, None),
+        None => "void".into(),
+    }
+}
+
+fn deserialize_expr(
+    type_ref: &TypeRef,
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+    data_var: &str,
+) -> String {
+    match type_ref {
+        TypeRef::String => format!("{data_var} as String"),
+        TypeRef::Integer { .. } => format!("({data_var} as num).toInt()"),
+        TypeRef::Number { format } => match format.as_deref() {
+            Some("float" | "double") => format!("({data_var} as num).toDouble()"),
+            _ => format!("{data_var} as num"),
+        },
+        TypeRef::Boolean => format!("{data_var} as bool"),
+        TypeRef::DateTime => format!("DateTime.parse({data_var} as String)"),
+        TypeRef::Map(inner) => {
+            let value_ty = to_dart_type(inner, None);
+            let inner_expr = deserialize_expr(inner, schemas, registry, "v");
+            format!(
+                "({data_var} as Map<String, dynamic>).map(\n      \
+                 (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()"
+            )
+        }
+        TypeRef::Enum(_) => {
+            // Top-level enum response — uncommon. The wire form is a string;
+            // downstream code can construct the synthesised enum case
+            // explicitly if a future caller needs it.
+            format!("{data_var} as String")
+        }
+        TypeRef::Named(name) => match named_schema_kind(name, schemas) {
+            Some(SchemaKind::Object { .. }) => {
+                let cls = dart_class_name(name);
+                format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
+            }
+            Some(SchemaKind::Array { item }) => {
+                let item_expr = deserialize_expr(item, schemas, registry, "e");
+                format!(
+                    "({data_var} as List<dynamic>)\n        .map((e) => {item_expr})\n        .toList()"
+                )
+            }
+            None => {
+                // Reference into a missing schema; lowering would have rejected
+                // this, so it's an internal-consistency failure if hit.
+                let cls = dart_class_name(name);
+                format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
+            }
+        },
+    }
+}
+
+fn named_schema_kind<'a>(name: &str, schemas: &'a [Schema]) -> Option<&'a SchemaKind> {
+    schemas.iter().find(|s| s.name == name).map(|s| &s.kind)
+}
+
+/// Operation method name. Prefers `operationId`; falls back to a slug
+/// derived from method + path. Real specs always set `operationId` for
+/// generated SDKs, so the fallback is mostly safety net.
 fn op_method_name(op: &Operation) -> String {
     if let Some(id) = &op.operation_id {
         return id.clone();
     }
-    // Fallback: "GET /pets/{petId}" → "getPetsPetId"
-    // Post-PetStore concern; all PetStore ops have operationIds.
     let path_slug: String = op
         .path
         .split('/')
@@ -240,36 +800,35 @@ fn op_method_name(op: &Operation) -> String {
 
 // ── Type mapping ──────────────────────────────────────────────────────────────
 
-fn to_dart_type(type_ref: &TypeRef) -> String {
+/// Maps an IR `TypeRef` to a Dart type expression.
+///
+/// `enum_synth_name` is the synthesised PascalCase name produced by the
+/// [`EnumRegistry`]. For inline enums in a context the registry knows about
+/// (object fields, operation parameters), the caller threads the name in;
+/// the function returns it directly. For nested or anonymous enums where
+/// no synth name is available, we fall back to `String` — the on-the-wire
+/// representation for v0.1's string-only enum support.
+fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
     match type_ref {
         TypeRef::String => "String".into(),
-        // Dart has one int regardless of int32/int64.
         TypeRef::Integer { .. } => "int".into(),
-        // Prefer double for float/double formats; num for unspecified.
         TypeRef::Number { format } => match format.as_deref() {
             Some("float" | "double") => "double".into(),
             _ => "num".into(),
         },
         TypeRef::Boolean => "bool".into(),
-        // Apply D7 renaming when resolving named schema references too.
+        TypeRef::DateTime => "DateTime".into(),
+        TypeRef::Enum(_) => enum_synth_name.map(str::to_string).unwrap_or_else(|| "String".into()),
+        TypeRef::Map(inner) => format!("Map<String, {}>", to_dart_type(inner, None)),
         TypeRef::Named(name) => dart_class_name(name),
-        // Phase 2 placeholders — the IR carries these now, but the Dart
-        // emitter mappings (DateTime, sealed enum classes, Map<String, T>)
-        // are deferred to Phase 3 per the task scope. Hitting any of these
-        // arms in real codegen should be impossible until Phase 3 wires them
-        // up; until then the existing PetStore-shaped tests don't exercise
-        // them, and `todo!()` keeps the match exhaustive without changing
-        // observable emitter behaviour.
-        TypeRef::DateTime => todo!("Phase 3: emit Dart `DateTime` for TypeRef::DateTime"),
-        TypeRef::Enum(_) => todo!("Phase 3: emit sealed Dart enum class for TypeRef::Enum"),
-        TypeRef::Map(_) => todo!("Phase 3: emit `Map<String, T>` for TypeRef::Map"),
     }
 }
 
-// ── Name utilities ────────────────────────────────────────────────────────────
+// ── Naming utilities ──────────────────────────────────────────────────────────
 
-/// Converts PascalCase or camelCase to snake_case.
-/// "Pet" → "pet", "ErrorModel" → "error_model", "listPets" → "list_pets".
+/// PascalCase or camelCase → snake_case.
+/// "Pet" → "pet", "ErrorModel" → "error_model", "listPets" → "list_pets",
+/// "PetStatus" → "pet_status".
 fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, ch) in s.chars().enumerate() {
@@ -281,12 +840,93 @@ fn to_snake_case(s: &str) -> String {
     out
 }
 
+/// snake_case / kebab-case / already-camelCase → camelCase.
+///
+/// Splits on `_` and `-` so OpenAPI's three common naming styles all
+/// converge: `created_at` → `createdAt`, `X-Auth` → `xAuth`,
+/// `content-type` → `contentType`, `petId` → `petId` (unchanged).
+fn to_camel_case(s: &str) -> String {
+    if !s.contains('_') && !s.contains('-') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut next_upper = false;
+    let mut started = false;
+    for ch in s.chars() {
+        if ch == '_' || ch == '-' {
+            if started {
+                next_upper = true;
+            }
+            continue;
+        }
+        if !started {
+            out.extend(ch.to_lowercase());
+            started = true;
+        } else if next_upper {
+            out.extend(ch.to_uppercase());
+            next_upper = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// snake_case or camelCase → PascalCase.
+/// "status" → "Status", "created_at" → "CreatedAt", "listPets" → "ListPets".
+fn to_pascal_case(s: &str) -> String {
+    let camel = to_camel_case(s);
+    let mut chars = camel.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Wire enum value → Dart enum case name.
+/// "available" → "available", "IN_STOCK" → "inStock", "in-stock" → "inStock",
+/// "123abc" → "v123abc". The `@JsonValue` annotation carries the original
+/// string, so the case name only needs to be a valid Dart identifier.
+fn to_dart_enum_case(value: &str) -> String {
+    // Replace any non-alphanumeric run with an underscore so we can split
+    // cleanly on "_".
+    let cleaned: String = value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let parts: Vec<&str> = cleaned.split('_').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return "value".into();
+    }
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            out.push_str(&part.to_lowercase());
+        } else {
+            let mut chars = part.chars();
+            if let Some(c) = chars.next() {
+                out.extend(c.to_uppercase());
+            }
+            out.push_str(&chars.as_str().to_lowercase());
+        }
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out = format!("v{out}");
+    }
+    out
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flap_ir::{Api, Field, HttpMethod, Operation, Schema, SchemaKind, TypeRef};
+    use flap_ir::{
+        Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody, Response,
+        Schema, SchemaKind, TypeRef,
+    };
+
+    // ── Fixture: PetStore (matches what flap_spec produces) ──────────────────
 
     fn pet_schema() -> Schema {
         Schema {
@@ -356,9 +996,25 @@ mod tests {
                     path: "/pets".into(),
                     operation_id: Some("listPets".into()),
                     summary: Some("List all pets".into()),
-                    parameters: vec![],
+                    parameters: vec![Parameter {
+                        name: "limit".into(),
+                        location: ParameterLocation::Query,
+                        type_ref: TypeRef::Integer {
+                            format: Some("int32".into()),
+                        },
+                        required: false,
+                    }],
                     request_body: None,
-                    responses: vec![],
+                    responses: vec![
+                        Response {
+                            status_code: "200".into(),
+                            schema_ref: Some(TypeRef::Named("Pets".into())),
+                        },
+                        Response {
+                            status_code: "default".into(),
+                            schema_ref: Some(TypeRef::Named("Error".into())),
+                        },
+                    ],
                 },
                 Operation {
                     method: HttpMethod::Post,
@@ -366,24 +1022,97 @@ mod tests {
                     operation_id: Some("createPets".into()),
                     summary: Some("Create a pet".into()),
                     parameters: vec![],
-                    request_body: None,
-                    responses: vec![],
+                    request_body: Some(RequestBody {
+                        content_type: "application/json".into(),
+                        schema_ref: TypeRef::Named("Pet".into()),
+                        required: true,
+                        is_multipart: false,
+                    }),
+                    responses: vec![
+                        Response {
+                            status_code: "201".into(),
+                            schema_ref: None,
+                        },
+                        Response {
+                            status_code: "default".into(),
+                            schema_ref: Some(TypeRef::Named("Error".into())),
+                        },
+                    ],
                 },
                 Operation {
                     method: HttpMethod::Get,
                     path: "/pets/{petId}".into(),
                     operation_id: Some("showPetById".into()),
                     summary: Some("Info for a specific pet".into()),
-                    parameters: vec![],
+                    parameters: vec![Parameter {
+                        name: "petId".into(),
+                        location: ParameterLocation::Path,
+                        type_ref: TypeRef::String,
+                        required: true,
+                    }],
                     request_body: None,
-                    responses: vec![],
+                    responses: vec![
+                        Response {
+                            status_code: "200".into(),
+                            schema_ref: Some(TypeRef::Named("Pet".into())),
+                        },
+                        Response {
+                            status_code: "default".into(),
+                            schema_ref: Some(TypeRef::Named("Error".into())),
+                        },
+                    ],
                 },
             ],
             schemas: vec![error_schema(), pet_schema(), pets_schema()],
         }
     }
 
-    // ── D7 collision tests ────────────────────────────────────────────────────
+    // ── Naming utilities ─────────────────────────────────────────────────────
+
+    #[test]
+    fn snake_case_conversion() {
+        assert_eq!(to_snake_case("Pet"), "pet");
+        assert_eq!(to_snake_case("PetStore"), "pet_store");
+        assert_eq!(to_snake_case("listPets"), "list_pets");
+        assert_eq!(to_snake_case("ErrorModel"), "error_model");
+        assert_eq!(to_snake_case("PetStatus"), "pet_status");
+    }
+
+    #[test]
+    fn camel_case_conversion() {
+        assert_eq!(to_camel_case("id"), "id");
+        assert_eq!(to_camel_case("name"), "name");
+        assert_eq!(to_camel_case("created_at"), "createdAt");
+        assert_eq!(to_camel_case("first_name"), "firstName");
+        assert_eq!(to_camel_case("petId"), "petId");
+        assert_eq!(to_camel_case("API_KEY"), "apiKey");
+    }
+
+    #[test]
+    fn pascal_case_conversion() {
+        assert_eq!(to_pascal_case("status"), "Status");
+        assert_eq!(to_pascal_case("created_at"), "CreatedAt");
+        assert_eq!(to_pascal_case("listPets"), "ListPets");
+        assert_eq!(to_pascal_case("petId"), "PetId");
+    }
+
+    #[test]
+    fn dart_enum_case_conversion() {
+        assert_eq!(to_dart_enum_case("available"), "available");
+        assert_eq!(to_dart_enum_case("IN_STOCK"), "inStock");
+        assert_eq!(to_dart_enum_case("in-stock"), "inStock");
+        assert_eq!(to_dart_enum_case("123abc"), "v123abc");
+    }
+
+    #[test]
+    fn keyword_escape() {
+        assert_eq!(escape_dart_keyword("limit"), "limit");
+        assert_eq!(escape_dart_keyword("in"), "inParam");
+        assert_eq!(escape_dart_keyword("class"), "classParam");
+        assert_eq!(escape_dart_keyword("required"), "requiredParam");
+    }
+
+    // ── D7 collisions ────────────────────────────────────────────────────────
 
     #[test]
     fn d7_error_renamed() {
@@ -409,71 +1138,17 @@ mod tests {
     }
 
     #[test]
-    fn d7_error_schema_emits_error_model_dart() {
-        let api = Api {
-            title: "Test".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![error_schema()],
-        };
-        let files = emit_models(&api);
-
-        // File key uses the renamed class name.
-        assert!(
-            files.contains_key("error_model.dart"),
-            "key should be error_model.dart"
-        );
-        assert!(
-            !files.contains_key("error.dart"),
-            "should not emit error.dart"
-        );
-
-        let src = &files["error_model.dart"];
-        assert!(src.contains("class ErrorModel"), "missing class ErrorModel");
-        assert!(
-            src.contains("with _$ErrorModel"),
-            "missing mixin _$ErrorModel"
-        );
-        assert!(src.contains("} = _ErrorModel"), "missing = _ErrorModel");
-        assert!(
-            src.contains("_$ErrorModelFromJson"),
-            "missing renamed fromJson"
-        );
-        assert!(
-            src.contains("part 'error_model.freezed.dart'"),
-            "missing part directive"
-        );
-        assert!(
-            src.contains("part 'error_model.g.dart'"),
-            "missing part directive"
-        );
-        assert!(
-            !src.contains("class Error "),
-            "must not emit the colliding name"
-        );
-    }
-
-    #[test]
-    fn d7_named_ref_to_error_uses_renamed_type() {
-        // When a field has TypeRef::Named("Error"), to_dart_type should
-        // return "ErrorModel", not "Error".
-        let dart_type = to_dart_type(&TypeRef::Named("Error".into()));
+    fn d7_named_ref_uses_renamed_type() {
+        let dart_type = to_dart_type(&TypeRef::Named("Error".into()), None);
         assert_eq!(dart_type, "ErrorModel");
     }
 
-    // ── Existing model tests (unchanged behaviour) ────────────────────────────
-
-    #[test]
-    fn snake_case_conversion() {
-        assert_eq!(to_snake_case("Pet"), "pet");
-        assert_eq!(to_snake_case("PetStore"), "pet_store");
-        assert_eq!(to_snake_case("listPets"), "list_pets");
-        assert_eq!(to_snake_case("ErrorModel"), "error_model");
-    }
+    // ── Models: Pet (object) ─────────────────────────────────────────────────
 
     #[test]
     fn pet_emits_freezed_class() {
-        let src = emit_schema(&pet_schema(), "Pet");
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &registry);
         assert!(src.contains("@freezed"), "missing @freezed");
         assert!(
             src.contains("class Pet with _$Pet"),
@@ -495,14 +1170,79 @@ mod tests {
     }
 
     #[test]
+    fn pet_no_jsonkey_for_camelcase_fields() {
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &registry);
+        assert!(
+            !src.contains("@JsonKey"),
+            "PetStore single-word fields should not get @JsonKey, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn snake_case_fields_get_jsonkey_with_original_name() {
+        let schema = Schema {
+            name: "User".into(),
+            kind: SchemaKind::Object {
+                fields: vec![
+                    Field {
+                        name: "first_name".into(),
+                        type_ref: TypeRef::String,
+                        required: true,
+                    },
+                    Field {
+                        name: "id".into(),
+                        type_ref: TypeRef::String,
+                        required: true,
+                    },
+                ],
+            },
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("User", "User", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("@JsonKey(name: 'first_name') required String firstName"),
+            "missing camelCased property + JsonKey, got:\n{src}"
+        );
+        assert!(
+            src.contains("required String id,\n"),
+            "single-word field shouldn't have JsonKey, got:\n{src}"
+        );
+    }
+
+    // ── Models: arrays ───────────────────────────────────────────────────────
+
+    #[test]
     fn pets_emits_typedef() {
-        let src = emit_schema(&pets_schema(), "Pets");
+        let src = emit_array_typedef("Pets", &TypeRef::Named("Pet".into()));
         assert!(src.contains("typedef Pets = List<Pet>"), "missing typedef");
         assert!(!src.contains("@freezed"), "array must not emit @freezed");
     }
 
+    // ── Models: D7 + file naming ─────────────────────────────────────────────
+
     #[test]
-    fn emit_models_keys() {
+    fn d7_error_schema_emits_error_model_dart() {
+        let api = Api {
+            title: "Test".into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![error_schema()],
+        };
+        let files = emit_models(&api);
+        assert!(files.contains_key("error_model.dart"));
+        assert!(!files.contains_key("error.dart"));
+        let src = &files["error_model.dart"];
+        assert!(src.contains("class ErrorModel"));
+        assert!(src.contains("with _$ErrorModel"));
+        assert!(src.contains("} = _ErrorModel"));
+        assert!(src.contains("_$ErrorModelFromJson"));
+        assert!(src.contains("part 'error_model.freezed.dart'"));
+        assert!(src.contains("part 'error_model.g.dart'"));
+    }
+
+    #[test]
+    fn emit_models_keys_include_renamed_and_originals() {
         let api = Api {
             title: "Test".into(),
             base_url: None,
@@ -510,15 +1250,117 @@ mod tests {
             schemas: vec![error_schema(), pet_schema(), pets_schema()],
         };
         let files = emit_models(&api);
-        assert!(
-            files.contains_key("error_model.dart"),
-            "missing error_model.dart"
-        );
-        assert!(files.contains_key("pet.dart"), "missing pet.dart");
-        assert!(files.contains_key("pets.dart"), "missing pets.dart");
+        assert!(files.contains_key("error_model.dart"));
+        assert!(files.contains_key("pet.dart"));
+        assert!(files.contains_key("pets.dart"));
     }
 
-    // ── Client stub tests ────────────────────────────────────────────────────
+    // ── Models: enums (Phase 4) ──────────────────────────────────────────────
+
+    #[test]
+    fn enum_field_synthesises_dart_enum_file() {
+        let pet_with_status = Schema {
+            name: "Pet".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "status".into(),
+                    type_ref: TypeRef::Enum(vec![
+                        "available".into(),
+                        "pending".into(),
+                        "sold".into(),
+                    ]),
+                    required: false,
+                }],
+            },
+        };
+        let api = Api {
+            title: "Test".into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![pet_with_status],
+        };
+        let files = emit_models(&api);
+
+        // A separate file for the synth enum.
+        assert!(
+            files.contains_key("pet_status.dart"),
+            "missing pet_status.dart, got keys: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        let enum_src = &files["pet_status.dart"];
+        assert!(enum_src.contains("enum PetStatus {"), "missing enum decl");
+        assert!(
+            enum_src.contains("@JsonValue('available')"),
+            "missing JsonValue for available"
+        );
+        assert!(enum_src.contains("  available,"));
+        assert!(enum_src.contains("@JsonValue('sold')"));
+        assert!(enum_src.contains("  sold;"), "last case must end with `;`");
+
+        // Pet model imports the enum and uses it as the field type.
+        let pet_src = &files["pet.dart"];
+        assert!(
+            pet_src.contains("import 'pet_status.dart';"),
+            "missing enum import, got:\n{pet_src}"
+        );
+        assert!(
+            pet_src.contains("PetStatus? status"),
+            "missing PetStatus type, got:\n{pet_src}"
+        );
+    }
+
+    // ── Models: maps and dates (Phase 4) ─────────────────────────────────────
+
+    #[test]
+    fn map_field_lowers_to_dart_map() {
+        let schema = Schema {
+            name: "Item".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "labels".into(),
+                    type_ref: TypeRef::Map(Box::new(TypeRef::String)),
+                    required: false,
+                }],
+            },
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Item", "Item", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("Map<String, String>? labels"),
+            "missing Map type, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn map_of_named_lowers_correctly() {
+        let dart_type = to_dart_type(
+            &TypeRef::Map(Box::new(TypeRef::Named("Pet".into()))),
+            None,
+        );
+        assert_eq!(dart_type, "Map<String, Pet>");
+    }
+
+    #[test]
+    fn datetime_field_lowers_to_dart_datetime() {
+        let schema = Schema {
+            name: "Event".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "createdAt".into(),
+                    type_ref: TypeRef::DateTime,
+                    required: true,
+                }],
+            },
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Event", "Event", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("required DateTime createdAt"),
+            "missing DateTime, got:\n{src}"
+        );
+    }
+
+    // ── Client: signatures (Phase 4) ─────────────────────────────────────────
 
     #[test]
     fn api_client_name_from_title() {
@@ -527,52 +1369,310 @@ mod tests {
     }
 
     #[test]
-    fn client_stub_class_and_constructor() {
+    fn client_class_and_constructor() {
         let (filename, src) = emit_client(&petstore_api());
         assert_eq!(filename, "swagger_petstore_client.dart");
-        assert!(src.contains("class SwaggerPetstoreClient"), "missing class");
-        assert!(src.contains("final Dio _dio"), "missing _dio field");
+        assert!(src.contains("class SwaggerPetstoreClient"));
+        assert!(src.contains("final Dio _dio"));
+        assert!(src.contains("required String baseUrl"));
+        assert!(src.contains("BaseOptions(baseUrl: baseUrl)"));
+    }
+
+    #[test]
+    fn client_imports_models() {
+        let (_, src) = emit_client(&petstore_api());
+        assert!(src.contains("import 'package:dio/dio.dart';"));
+        // Error renamed → file is error_model.dart
+        assert!(src.contains("import 'error_model.dart';"));
+        assert!(src.contains("import 'pet.dart';"));
+        assert!(src.contains("import 'pets.dart';"));
+    }
+
+    #[test]
+    fn list_pets_signature() {
+        let (_, src) = emit_client(&petstore_api());
+        // Future<Pets> return, optional limit query param.
         assert!(
-            src.contains("required String baseUrl"),
-            "missing baseUrl param"
+            src.contains("Future<Pets> listPets({"),
+            "missing return type / signature, got:\n{src}"
         );
         assert!(
-            src.contains("BaseOptions(baseUrl: baseUrl)"),
-            "missing BaseOptions"
+            src.contains("int? limit,"),
+            "missing optional limit, got:\n{src}"
         );
     }
 
     #[test]
-    fn client_stub_methods() {
+    fn show_pet_by_id_signature() {
         let (_, src) = emit_client(&petstore_api());
-        assert!(src.contains("Future<void> listPets()"), "missing listPets");
         assert!(
-            src.contains("Future<void> createPets()"),
-            "missing createPets"
+            src.contains("Future<Pet> showPetById({"),
+            "missing signature, got:\n{src}"
         );
         assert!(
-            src.contains("Future<void> showPetById()"),
-            "missing showPetById"
-        );
-        assert!(
-            src.contains("UnimplementedError('listPets')"),
-            "missing placeholder body"
+            src.contains("required String petId,"),
+            "missing required path param, got:\n{src}"
         );
     }
 
     #[test]
-    fn client_stub_imports_renamed_model() {
+    fn create_pets_signature_has_required_body() {
         let (_, src) = emit_client(&petstore_api());
         assert!(
-            src.contains("import 'package:dio/dio.dart'"),
-            "missing dio import"
+            src.contains("Future<void> createPets({"),
+            "POST /pets has no 2xx schema → return Future<void>, got:\n{src}"
         );
-        // Error was renamed to ErrorModel → file is error_model.dart
         assert!(
-            src.contains("import 'error_model.dart'"),
-            "missing error_model import"
+            src.contains("required Pet body,"),
+            "missing required body argument, got:\n{src}"
         );
-        assert!(src.contains("import 'pet.dart'"), "missing pet import");
-        assert!(src.contains("import 'pets.dart'"), "missing pets import");
+    }
+
+    #[test]
+    fn reserved_keyword_param_renamed_in_signature() {
+        // Spec uses `in` as a query parameter name. Dart can't accept it
+        // verbatim — we rename to `inParam` in the signature but preserve
+        // `'in'` as the wire-side query map key.
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Get,
+                path: "/things".into(),
+                operation_id: Some("listThings".into()),
+                summary: None,
+                parameters: vec![Parameter {
+                    name: "in".into(),
+                    location: ParameterLocation::Query,
+                    type_ref: TypeRef::String,
+                    required: false,
+                }],
+                request_body: None,
+                responses: vec![],
+            }],
+            schemas: vec![],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("String? inParam,"),
+            "param `in` should be escaped to inParam, got:\n{src}"
+        );
+        assert!(
+            src.contains("if (inParam != null) 'in': inParam"),
+            "wire key should remain 'in', got:\n{src}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DECISIONS D10")]
+    fn cross_location_name_collision_is_hard_error() {
+        // Same name `id` in path and query — D10 says hard error.
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Get,
+                path: "/things/{id}".into(),
+                operation_id: Some("getThing".into()),
+                summary: None,
+                parameters: vec![
+                    Parameter {
+                        name: "id".into(),
+                        location: ParameterLocation::Path,
+                        type_ref: TypeRef::String,
+                        required: true,
+                    },
+                    Parameter {
+                        name: "id".into(),
+                        location: ParameterLocation::Query,
+                        type_ref: TypeRef::String,
+                        required: false,
+                    },
+                ],
+                request_body: None,
+                responses: vec![],
+            }],
+            schemas: vec![],
+        };
+        let _ = emit_client(&api);
+    }
+
+    // ── Client: bodies (Phase 4) ─────────────────────────────────────────────
+
+    #[test]
+    fn list_pets_body_has_query_map_and_list_deserialisation() {
+        let (_, src) = emit_client(&petstore_api());
+        // Query map.
+        assert!(
+            src.contains("final queryParameters = <String, dynamic>{"),
+            "missing query map, got:\n{src}"
+        );
+        assert!(
+            src.contains("if (limit != null) 'limit': limit,"),
+            "missing collection-if entry, got:\n{src}"
+        );
+        // Dio call.
+        assert!(src.contains("await _dio.request<dynamic>("));
+        assert!(src.contains("'/pets',"), "missing path literal");
+        assert!(src.contains("options: Options(method: 'GET'),"));
+        assert!(src.contains("queryParameters: queryParameters,"));
+        // List deserialisation.
+        assert!(
+            src.contains("(data as List<dynamic>)"),
+            "missing list cast, got:\n{src}"
+        );
+        assert!(
+            src.contains(".map((e) => Pet.fromJson(e as Map<String, dynamic>))"),
+            "missing element deserialisation, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn show_pet_body_has_path_templating_and_object_deserialisation() {
+        let (_, src) = emit_client(&petstore_api());
+        assert!(
+            src.contains("'/pets/${petId}',"),
+            "missing path templating, got:\n{src}"
+        );
+        assert!(
+            src.contains("return Pet.fromJson(data as Map<String, dynamic>);"),
+            "missing object deserialisation, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn create_pets_body_passes_tojson_data_and_no_return() {
+        let (_, src) = emit_client(&petstore_api());
+        // We expect:  await _dio.request<dynamic>(... data: body.toJson() ...)
+        // No `final response` because there's no schema to deserialise.
+        assert!(
+            src.contains("await _dio.request<dynamic>("),
+            "missing dio call, got:\n{src}"
+        );
+        assert!(
+            src.contains("data: body.toJson(),"),
+            "missing body data, got:\n{src}"
+        );
+        // No `final response` for void returns.
+        let create_section = src
+            .split("createPets")
+            .nth(1)
+            .expect("createPets should appear in output")
+            .split("Future<")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !create_section.contains("final response"),
+            "void return should not capture response, got:\n{create_section}"
+        );
+    }
+
+    #[test]
+    fn multipart_body_wraps_in_formdata() {
+        let api = Api {
+            title: "Upload".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Post,
+                path: "/upload".into(),
+                operation_id: Some("upload".into()),
+                summary: None,
+                parameters: vec![],
+                request_body: Some(RequestBody {
+                    content_type: "multipart/form-data".into(),
+                    schema_ref: TypeRef::Named("Upload".into()),
+                    required: true,
+                    is_multipart: true,
+                }),
+                responses: vec![Response {
+                    status_code: "204".into(),
+                    schema_ref: None,
+                }],
+            }],
+            schemas: vec![Schema {
+                name: "Upload".into(),
+                kind: SchemaKind::Object { fields: vec![] },
+            }],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("data: FormData.fromMap(body.toJson()),"),
+            "multipart body must wrap in FormData.fromMap, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn header_param_attached_via_options() {
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Get,
+                path: "/x".into(),
+                operation_id: Some("getX".into()),
+                summary: None,
+                parameters: vec![Parameter {
+                    name: "X-Auth".into(),
+                    location: ParameterLocation::Header,
+                    type_ref: TypeRef::String,
+                    required: true,
+                }],
+                request_body: None,
+                responses: vec![],
+            }],
+            schemas: vec![],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("'X-Auth': "),
+            "header should use original spec name as map key, got:\n{src}"
+        );
+        assert!(
+            src.contains("options: Options(method: 'GET', headers: headers),"),
+            "options should attach headers, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn no_2xx_response_returns_void() {
+        // Operation with only a `default` response → Future<void>.
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Delete,
+                path: "/x".into(),
+                operation_id: Some("deleteX".into()),
+                summary: None,
+                parameters: vec![],
+                request_body: None,
+                responses: vec![Response {
+                    status_code: "default".into(),
+                    schema_ref: Some(TypeRef::Named("Error".into())),
+                }],
+            }],
+            schemas: vec![error_schema()],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("Future<void> deleteX("),
+            "default-only response → void, got:\n{src}"
+        );
+    }
+
+    // ── Helper for tests ─────────────────────────────────────────────────────
+
+    fn fields_of(schema: &Schema) -> Vec<Field> {
+        match &schema.kind {
+            SchemaKind::Object { fields } => fields
+                .iter()
+                .map(|f| Field {
+                    name: f.name.clone(),
+                    type_ref: f.type_ref.clone(),
+                    required: f.required,
+                })
+                .collect(),
+            _ => panic!("expected object schema"),
+        }
     }
 }
