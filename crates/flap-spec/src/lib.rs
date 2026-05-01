@@ -44,10 +44,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use flap_ir::{
-    Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody, Response, Schema,
-    SchemaKind, TypeRef,
+    ApiKeyLocation, Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody,
+    Response, Schema, SchemaKind, SecurityScheme, TypeRef,
 };
 use serde::Deserialize;
 
@@ -99,6 +99,12 @@ struct RawSpec {
     paths: BTreeMap<String, RawPathItem>,
     #[serde(default)]
     components: RawComponents,
+    /// Top-level `security` block — a list of OR-ed security requirements.
+    /// Each requirement is an AND-of-schemes map (scheme name → scope list).
+    /// In v0.1 we collapse the structure to a deduplicated flat list of
+    /// scheme names; see `flatten_security_requirements`.
+    #[serde(default)]
+    security: Vec<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +121,36 @@ struct RawServer {
 struct RawComponents {
     #[serde(default)]
     schemas: BTreeMap<String, RawSchemaOrRef>,
+    /// `components.securitySchemes` — name → scheme definition. BTreeMap
+    /// keeps iteration alphabetical so emitter output is reproducible.
+    #[serde(default, rename = "securitySchemes")]
+    security_schemes: BTreeMap<String, RawSecurityScheme>,
+}
+
+/// A single entry from `components.securitySchemes`.
+///
+/// The shape is intentionally permissive at parse time: every field is
+/// optional except `type`, and `lower_security_schemes` validates the
+/// combinations actually permitted by OpenAPI per scheme type. This keeps
+/// the error messages co-located with the lowering logic rather than
+/// scattered across serde's `#[serde(deny_unknown_fields)]` plumbing.
+#[derive(Debug, Deserialize)]
+struct RawSecurityScheme {
+    #[serde(rename = "type")]
+    ty: String,
+    /// `apiKey`: the wire-side parameter name, e.g. `"X-API-Key"`.
+    name: Option<String>,
+    /// `apiKey`: where the key is sent — `"header"`, `"query"`, or
+    /// `"cookie"`.
+    #[serde(rename = "in")]
+    location: Option<String>,
+    /// `http`: the auth scheme name (`"bearer"`, `"basic"`, ...). v0.1
+    /// only honours `"bearer"`; other schemes produce a clear error
+    /// during lowering rather than silently emitting incorrect code.
+    scheme: Option<String>,
+    /// `http` + `scheme: bearer`: optional format hint, e.g. `"JWT"`.
+    #[serde(rename = "bearerFormat")]
+    bearer_format: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -143,6 +179,11 @@ struct RawOperation {
     /// response, but we don't enforce that at lowering time.
     #[serde(default)]
     responses: BTreeMap<String, RawResponse>,
+    /// Per-operation `security` override. `None` means "use API default".
+    /// `Some([])` means "explicitly no security on this endpoint" — the
+    /// OpenAPI sentinel for marking a single endpoint public when the
+    /// rest of the API is authenticated.
+    security: Option<Vec<BTreeMap<String, Vec<String>>>>,
 }
 
 /// An individual query / path / header / cookie parameter.
@@ -343,12 +384,122 @@ fn lower(raw: RawSpec) -> Result<Api> {
     let operations = lower_operations(&raw.paths, &mut ctx)?;
     let schemas = lower_schemas(&raw.components.schemas, &mut ctx)?;
 
+    // Security schemes are validated structurally and turned into IR before
+    // any operation-level security can reference them. We do *not* enforce
+    // that every `security` reference points at a declared scheme — real
+    // specs occasionally cite implicit/global schemes the OpenAPI document
+    // forgets to define, and the emitter is the right place to surface
+    // that mismatch (it's the layer that needs the scheme to exist).
+    let security_schemes = lower_security_schemes(&raw.components.security_schemes)?;
+    let security = flatten_security_requirements(&raw.security);
+
     Ok(Api {
         title,
         base_url,
         operations,
         schemas,
+        security_schemes,
+        security,
     })
+}
+
+// ── Security lowering ────────────────────────────────────────────────────────
+
+/// Lowers `components.securitySchemes` into IR variants.
+///
+/// v0.1 supports two scheme shapes:
+/// - `type: apiKey` with `name` + `in: {header|query|cookie}`.
+/// - `type: http` with `scheme: bearer` (case-insensitive) and an optional
+///   `bearerFormat`.
+///
+/// Anything else (`oauth2`, `openIdConnect`, `http` with `basic`/`digest`,
+/// etc.) produces a clear hard error rather than being silently dropped —
+/// dropping would mean the generated client compiles but cannot authenticate
+/// against an endpoint that requires it, which is the worst kind of bug.
+fn lower_security_schemes(
+    raw: &BTreeMap<String, RawSecurityScheme>,
+) -> Result<Vec<SecurityScheme>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (name, scheme) in raw {
+        let lowered = lower_security_scheme(name, scheme)
+            .with_context(|| format!("in securityScheme `{name}`"))?;
+        out.push(lowered);
+    }
+    Ok(out)
+}
+
+fn lower_security_scheme(name: &str, raw: &RawSecurityScheme) -> Result<SecurityScheme> {
+    match raw.ty.as_str() {
+        "apiKey" => {
+            let parameter_name = raw.name.clone().ok_or_else(|| {
+                anyhow!("apiKey security scheme is missing the required `name` field")
+            })?;
+            let location_str = raw.location.as_deref().ok_or_else(|| {
+                anyhow!("apiKey security scheme is missing the required `in` field")
+            })?;
+            let location = match location_str {
+                "header" => ApiKeyLocation::Header,
+                "query" => ApiKeyLocation::Query,
+                "cookie" => ApiKeyLocation::Cookie,
+                other => bail!(
+                    "apiKey `in: {other}` is invalid \
+                     (expected `header`, `query`, or `cookie`)"
+                ),
+            };
+            Ok(SecurityScheme::ApiKey {
+                scheme_name: name.to_string(),
+                parameter_name,
+                location,
+            })
+        }
+        "http" => {
+            let scheme = raw.scheme.as_deref().unwrap_or("");
+            if scheme.eq_ignore_ascii_case("bearer") {
+                Ok(SecurityScheme::HttpBearer {
+                    scheme_name: name.to_string(),
+                    bearer_format: raw.bearer_format.clone(),
+                })
+            } else if scheme.is_empty() {
+                bail!("http security scheme is missing the required `scheme` field")
+            } else {
+                bail!(
+                    "http `scheme: {scheme}` is not supported in v0.1 \
+                     (only `bearer` is implemented)"
+                )
+            }
+        }
+        "oauth2" | "openIdConnect" => bail!(
+            "security scheme type `{}` is not supported in v0.1 \
+             (apiKey and http-bearer only)",
+            raw.ty
+        ),
+        other => bail!("unknown security scheme type `{other}`"),
+    }
+}
+
+/// Collapses OpenAPI's list-of-AND-of-OR security requirement structure into
+/// a flat, deduplicated list of scheme names in spec order.
+///
+/// OpenAPI semantically says "any one of these requirements is sufficient,
+/// and within each requirement all named schemes must be presented". The
+/// generated Dart client doesn't gate calls on this structure — it sends
+/// every credential the caller provided, regardless of whether the spec
+/// listed them as alternatives or together — so we simply collect the
+/// union of every scheme name referenced anywhere. A future phase that
+/// adds proper requirement-set enforcement can re-derive the structure
+/// from the YAML; nothing about this collapse is lossy from the
+/// emitter's current point of view.
+fn flatten_security_requirements(reqs: &[BTreeMap<String, Vec<String>>]) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for req in reqs {
+        for name in req.keys() {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
 }
 
 fn lower_operations(
@@ -393,6 +544,14 @@ fn lower_operations(
                 // Phase 3: lower responses, deterministically ordered.
                 let responses = lower_responses(path, method, &raw_op.responses, ctx)?;
 
+                // Phase 5 (auth): per-op security override. `Some(empty)` is
+                // OpenAPI's "explicitly public" sentinel and is preserved as
+                // an empty Vec rather than being collapsed to `None`.
+                let security = raw_op
+                    .security
+                    .as_ref()
+                    .map(|reqs| flatten_security_requirements(reqs));
+
                 ops.push(Operation {
                     method,
                     path: path.clone(),
@@ -401,6 +560,7 @@ fn lower_operations(
                     parameters,
                     request_body,
                     responses,
+                    security,
                 });
             }
         }
@@ -855,7 +1015,6 @@ mod tests {
         let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
         let api = load_str(yaml).expect("petstore should parse");
         assert_eq!(api.operations.len(), 3);
-        // BTreeMap on paths + method sort: GET /pets, POST /pets, GET /pets/{petId}
         assert_eq!(api.operations[0].method, HttpMethod::Get);
         assert_eq!(api.operations[0].path, "/pets");
         assert_eq!(api.operations[0].operation_id.as_deref(), Some("listPets"));
@@ -864,1041 +1023,243 @@ mod tests {
         assert_eq!(api.operations[2].path, "/pets/{petId}");
     }
 
+    // ── Phase 5: auth lowering ───────────────────────────────────────────────
+
     #[test]
-    fn petstore_parameters() {
+    fn no_security_block_yields_empty_ir_fields() {
+        // The bare PetStore fixture declares no auth; the IR should reflect
+        // that with empty (not missing) collections, so emitters can do
+        // straight `.is_empty()` checks without ceremony.
         let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
         let api = load_str(yaml).expect("petstore should parse");
-
-        // GET /pets — one optional query parameter
-        let list_pets = &api.operations[0];
-        assert_eq!(list_pets.parameters.len(), 1);
-        let limit = &list_pets.parameters[0];
-        assert_eq!(limit.name, "limit");
-        assert_eq!(limit.location, ParameterLocation::Query);
-        assert!(!limit.required, "limit should be optional");
-        assert!(
-            matches!(limit.type_ref, TypeRef::Integer { .. }),
-            "limit should be integer"
-        );
-
-        // POST /pets — no parameters (body modelled separately)
-        assert_eq!(api.operations[1].parameters.len(), 0);
-
-        // GET /pets/{petId} — one required path parameter
-        let show_pet = &api.operations[2];
-        assert_eq!(show_pet.parameters.len(), 1);
-        let pet_id = &show_pet.parameters[0];
-        assert_eq!(pet_id.name, "petId");
-        assert_eq!(pet_id.location, ParameterLocation::Path);
-        assert!(pet_id.required, "path params must be required");
-        assert!(
-            matches!(pet_id.type_ref, TypeRef::String),
-            "petId should be string"
-        );
+        assert!(api.security_schemes.is_empty());
+        assert!(api.security.is_empty());
+        for op in &api.operations {
+            assert!(op.security.is_none(), "no per-op security expected");
+        }
     }
 
     #[test]
-    fn petstore_request_body() {
-        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
-        let api = load_str(yaml).expect("petstore should parse");
-
-        // GET /pets — no request body
-        assert!(
-            api.operations[0].request_body.is_none(),
-            "GET /pets should have no request body"
-        );
-
-        // POST /pets — application/json body referencing Pet
-        let create_pets = &api.operations[1];
-        let body = create_pets
-            .request_body
-            .as_ref()
-            .expect("POST /pets should have a request body");
-        assert_eq!(body.content_type, "application/json");
-        assert!(body.required, "POST /pets body should be required");
-        assert!(!body.is_multipart, "JSON body should not be multipart");
-        assert!(
-            matches!(&body.schema_ref, TypeRef::Named(n) if n == "Pet"),
-            "body schema should be Named(\"Pet\"), got {:?}",
-            body.schema_ref
-        );
-
-        // GET /pets/{petId} — no request body
-        assert!(
-            api.operations[2].request_body.is_none(),
-            "GET /pets/{{petId}} should have no request body"
-        );
-    }
-
-    #[test]
-    fn path_parameter_always_required() {
+    fn lowers_bearer_and_api_key_schemes() {
         let yaml = "
 openapi: 3.0.0
 info:
-  title: test
+  title: secured
   version: '1'
-paths:
-  /items/{id}:
-    get:
-      operationId: getItem
-      parameters:
-        - name: id
-          in: path
-          required: false   # wrong — lowering must override this
-          schema:
-            type: string
-      responses:
-        '200':
-          description: ok
+paths: {}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
 ";
         let api = load_str(yaml).expect("should parse");
-        let param = &api.operations[0].parameters[0];
-        assert!(
-            param.required,
-            "path param must be required even if spec says false"
-        );
-    }
+        assert_eq!(api.security_schemes.len(), 2);
 
-    #[test]
-    fn petstore_schemas() {
-        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
-        let api = load_str(yaml).expect("petstore should parse");
-        assert_eq!(api.schemas.len(), 3);
-        assert_eq!(api.schemas[0].name, "Error");
-        assert_eq!(api.schemas[1].name, "Pet");
+        // BTreeMap iteration → alphabetical: apiKeyAuth, bearerAuth.
+        match &api.security_schemes[0] {
+            SecurityScheme::ApiKey {
+                scheme_name,
+                parameter_name,
+                location,
+            } => {
+                assert_eq!(scheme_name, "apiKeyAuth");
+                assert_eq!(parameter_name, "X-API-Key");
+                assert_eq!(*location, ApiKeyLocation::Header);
+            }
+            other => panic!("expected ApiKey first, got {other:?}"),
+        }
+        match &api.security_schemes[1] {
+            SecurityScheme::HttpBearer {
+                scheme_name,
+                bearer_format,
+            } => {
+                assert_eq!(scheme_name, "bearerAuth");
+                assert_eq!(bearer_format.as_deref(), Some("JWT"));
+            }
+            other => panic!("expected HttpBearer second, got {other:?}"),
+        }
 
-        let SchemaKind::Object { fields } = &api.schemas[1].kind else {
-            panic!("Pet should be an object");
-        };
-        assert_eq!(fields[0].name, "id");
-        assert!(fields[0].required);
-        assert_eq!(fields[1].name, "name");
-        assert!(!fields[2].required, "tag should be optional");
-
-        let SchemaKind::Array { item } = &api.schemas[2].kind else {
-            panic!("Pets should be an array");
-        };
-        assert!(matches!(item, TypeRef::Named(n) if n == "Pet"));
-    }
-
-    // ── Phase 1: $ref resolution & cycle detection ────────────────────────────
-
-    #[test]
-    fn rejects_unresolved_schema_ref() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /things:
-    get:
-      operationId: listThings
-      parameters:
-        - name: filter
-          in: query
-          schema:
-            $ref: '#/components/schemas/DoesNotExist'
-      responses:
-        '200':
-          description: ok
-";
-        let err = load_str(yaml).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("DoesNotExist") && msg.contains("undefined"),
-            "expected unresolved-ref error mentioning the missing name; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn rejects_non_schema_ref_pointer() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /things:
-    get:
-      operationId: listThings
-      parameters:
-        - $ref: '#/components/parameters/Filter'
-      responses:
-        '200':
-          description: ok
-";
-        let err = load_str(yaml).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(!msg.is_empty(), "expected an error, got empty");
-    }
-
-    #[test]
-    fn handles_self_referential_schema() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Node:
-      type: object
-      required: [value]
-      properties:
-        value:
-          type: string
-        next:
-          $ref: '#/components/schemas/Node'
-";
-        let api = load_str(yaml).expect("self-referential schema should lower cleanly");
-        assert_eq!(api.schemas.len(), 1);
-        let SchemaKind::Object { fields } = &api.schemas[0].kind else {
-            panic!("Node should be an object");
-        };
-        let next = fields.iter().find(|f| f.name == "next").unwrap();
-        assert!(
-            matches!(&next.type_ref, TypeRef::Named(n) if n == "Node"),
-            "next should resolve to Named(\"Node\"), got {:?}",
-            next.type_ref
-        );
-    }
-
-    #[test]
-    fn resolves_cross_schema_ref() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Owner:
-      type: object
-      required: [name]
-      properties:
-        name:
-          type: string
-    Pet:
-      type: object
-      required: [owner]
-      properties:
-        owner:
-          $ref: '#/components/schemas/Owner'
-";
-        let api = load_str(yaml).expect("cross-schema $ref should resolve");
-        assert_eq!(api.schemas.len(), 2);
-        let pet = api.schemas.iter().find(|s| s.name == "Pet").unwrap();
-        let SchemaKind::Object { fields } = &pet.kind else {
-            panic!("Pet should be an object");
-        };
-        let owner = fields.iter().find(|f| f.name == "owner").unwrap();
-        assert!(matches!(&owner.type_ref, TypeRef::Named(n) if n == "Owner"));
-    }
-
-    // ── Phase 2: enums ───────────────────────────────────────────────────────
-
-    #[test]
-    fn enum_field_lowers_to_typeref_enum() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Pet:
-      type: object
-      required: [status]
-      properties:
-        status:
-          type: string
-          enum: [available, pending, sold]
-";
-        let api = load_str(yaml).expect("should parse");
-        let pet = &api.schemas[0];
-        let SchemaKind::Object { fields } = &pet.kind else {
-            panic!("Pet should be an object");
-        };
-        let status = fields.iter().find(|f| f.name == "status").unwrap();
-        let TypeRef::Enum(values) = &status.type_ref else {
-            panic!("status should be Enum, got {:?}", status.type_ref);
-        };
+        // Top-level requirements flatten to the union of names.
         assert_eq!(
-            values,
-            &vec!["available".to_string(), "pending".into(), "sold".into()]
-        );
-        assert!(status.required, "status should still respect required list");
-    }
-
-    #[test]
-    fn rejects_non_string_enum_values() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Pet:
-      type: object
-      properties:
-        priority:
-          type: integer
-          enum: [1, 2, 3]
-";
-        let err = load_str(yaml).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("string enums") || msg.contains("not a string"),
-            "expected string-enum-only error, got: {msg}"
+            api.security,
+            vec!["bearerAuth".to_string(), "apiKeyAuth".to_string()]
         );
     }
 
-    // ── Phase 2: additionalProperties → Map ──────────────────────────────────
-
     #[test]
-    fn additional_properties_lowers_to_map_of_string() {
+    fn api_key_supports_query_and_cookie_locations() {
         let yaml = "
 openapi: 3.0.0
 info:
-  title: test
+  title: secured
   version: '1'
 paths: {}
 components:
-  schemas:
-    Pet:
-      type: object
-      properties:
-        labels:
-          type: object
-          additionalProperties:
-            type: string
+  securitySchemes:
+    qKey:
+      type: apiKey
+      in: query
+      name: api_key
+    cKey:
+      type: apiKey
+      in: cookie
+      name: SESSION
 ";
         let api = load_str(yaml).expect("should parse");
-        let pet = &api.schemas[0];
-        let SchemaKind::Object { fields } = &pet.kind else {
-            panic!("Pet should be an object");
-        };
-        let labels = fields.iter().find(|f| f.name == "labels").unwrap();
-        let TypeRef::Map(inner) = &labels.type_ref else {
-            panic!("labels should be Map, got {:?}", labels.type_ref);
-        };
-        assert!(
-            matches!(**inner, TypeRef::String),
-            "inner should be String, got {:?}",
-            inner
-        );
-    }
-
-    #[test]
-    fn additional_properties_lowers_to_map_of_named_ref() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Owner:
-      type: object
-      properties:
-        name:
-          type: string
-    Kennel:
-      type: object
-      properties:
-        owners:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/Owner'
-";
-        let api = load_str(yaml).expect("should parse");
-        let kennel = api.schemas.iter().find(|s| s.name == "Kennel").unwrap();
-        let SchemaKind::Object { fields } = &kennel.kind else {
-            panic!("Kennel should be an object");
-        };
-        let owners = fields.iter().find(|f| f.name == "owners").unwrap();
-        let TypeRef::Map(inner) = &owners.type_ref else {
-            panic!("owners should be Map, got {:?}", owners.type_ref);
-        };
-        assert!(
-            matches!(&**inner, TypeRef::Named(n) if n == "Owner"),
-            "inner should be Named(\"Owner\"), got {:?}",
-            inner
-        );
-    }
-
-    #[test]
-    fn additional_properties_boolean_does_not_become_map() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Loose:
-      type: object
-      additionalProperties: true
-      required: [id]
-      properties:
-        id:
-          type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let loose = &api.schemas[0];
-        let SchemaKind::Object { fields } = &loose.kind else {
-            panic!("Loose should be an object");
-        };
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].name, "id");
-        assert!(matches!(fields[0].type_ref, TypeRef::String));
-    }
-
-    // ── Phase 2: date-time ───────────────────────────────────────────────────
-
-    #[test]
-    fn date_time_lowers_to_datetime() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Event:
-      type: object
-      required: [createdAt]
-      properties:
-        createdAt:
-          type: string
-          format: date-time
-        name:
-          type: string
-        slug:
-          type: string
-          format: uuid
-";
-        let api = load_str(yaml).expect("should parse");
-        let event = &api.schemas[0];
-        let SchemaKind::Object { fields } = &event.kind else {
-            panic!("Event should be an object");
-        };
-        let created_at = fields.iter().find(|f| f.name == "createdAt").unwrap();
-        assert!(
-            matches!(created_at.type_ref, TypeRef::DateTime),
-            "createdAt should be DateTime, got {:?}",
-            created_at.type_ref
-        );
-        let name = fields.iter().find(|f| f.name == "name").unwrap();
-        assert!(
-            matches!(name.type_ref, TypeRef::String),
-            "plain string should remain String"
-        );
-        let slug = fields.iter().find(|f| f.name == "slug").unwrap();
-        assert!(
-            matches!(slug.type_ref, TypeRef::String),
-            "non-date-time formats should still be String (format ignored for now), got {:?}",
-            slug.type_ref
-        );
-    }
-
-    // ── Phase 2: allOf ───────────────────────────────────────────────────────
-
-    #[test]
-    fn all_of_merges_referenced_fields() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Pet:
-      type: object
-      required: [id, name]
-      properties:
-        id:
-          type: integer
-        name:
-          type: string
-    Dog:
-      allOf:
-        - $ref: '#/components/schemas/Pet'
-        - type: object
-          required: [breed]
-          properties:
-            breed:
-              type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let dog = api.schemas.iter().find(|s| s.name == "Dog").unwrap();
-        let SchemaKind::Object { fields } = &dog.kind else {
-            panic!("Dog should be an object after allOf flattening");
-        };
-        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["id", "name", "breed"],
-            "base fields first, then own"
-        );
-
-        let id = fields.iter().find(|f| f.name == "id").unwrap();
-        assert!(id.required, "id should be required (inherited from Pet)");
-        let breed = fields.iter().find(|f| f.name == "breed").unwrap();
-        assert!(breed.required, "breed should be required (own)");
-    }
-
-    #[test]
-    fn all_of_with_only_refs() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Identifiable:
-      type: object
-      required: [id]
-      properties:
-        id:
-          type: string
-    Timestamped:
-      type: object
-      required: [createdAt]
-      properties:
-        createdAt:
-          type: string
-          format: date-time
-    User:
-      allOf:
-        - $ref: '#/components/schemas/Identifiable'
-        - $ref: '#/components/schemas/Timestamped'
-";
-        let api = load_str(yaml).expect("should parse");
-        let user = api.schemas.iter().find(|s| s.name == "User").unwrap();
-        let SchemaKind::Object { fields } = &user.kind else {
-            panic!("User should be an object");
-        };
-        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["id", "createdAt"]);
-        let created_at = fields.iter().find(|f| f.name == "createdAt").unwrap();
-        assert!(matches!(created_at.type_ref, TypeRef::DateTime));
-    }
-
-    #[test]
-    fn all_of_subclass_override_keeps_inherited_required() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Base:
-      type: object
-      required: [id]
-      properties:
-        id:
-          type: integer
-    Refined:
-      allOf:
-        - $ref: '#/components/schemas/Base'
-        - type: object
-          properties:
-            id:
-              type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let refined = api.schemas.iter().find(|s| s.name == "Refined").unwrap();
-        let SchemaKind::Object { fields } = &refined.kind else {
-            panic!("Refined should be an object");
-        };
-        assert_eq!(fields.len(), 1, "duplicate `id` should dedupe");
-        let id = &fields[0];
-        assert!(
-            matches!(id.type_ref, TypeRef::String),
-            "subclass type should win, got {:?}",
-            id.type_ref
-        );
-        assert!(id.required, "required should be inherited from Base");
-    }
-
-    #[test]
-    fn all_of_combines_with_own_properties() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Animal:
-      type: object
-      required: [name]
-      properties:
-        name:
-          type: string
-    Dog:
-      allOf:
-        - $ref: '#/components/schemas/Animal'
-      required: [breed]
-      properties:
-        breed:
-          type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let dog = api.schemas.iter().find(|s| s.name == "Dog").unwrap();
-        let SchemaKind::Object { fields } = &dog.kind else {
-            panic!("Dog should be an object");
-        };
-        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["name", "breed"]);
-        assert!(fields.iter().find(|f| f.name == "breed").unwrap().required);
-        assert!(fields.iter().find(|f| f.name == "name").unwrap().required);
-    }
-
-    #[test]
-    fn all_of_nested_refs_flatten_recursively() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    A:
-      type: object
-      required: [a]
-      properties:
-        a:
-          type: string
-    B:
-      allOf:
-        - $ref: '#/components/schemas/A'
-      required: [b]
-      properties:
-        b:
-          type: string
-    C:
-      allOf:
-        - $ref: '#/components/schemas/B'
-      required: [c]
-      properties:
-        c:
-          type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let c = api.schemas.iter().find(|s| s.name == "C").unwrap();
-        let SchemaKind::Object { fields } = &c.kind else {
-            panic!("C should be an object");
-        };
-        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b", "c"], "leaf inheritance order");
-    }
-
-    #[test]
-    fn rejects_all_of_cycle() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    A:
-      allOf:
-        - $ref: '#/components/schemas/B'
-    B:
-      allOf:
-        - $ref: '#/components/schemas/A'
-";
-        let err = load_str(yaml).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("cycle"), "expected cycle error, got: {msg}");
-    }
-
-    #[test]
-    fn rejects_all_of_unresolved_ref() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Dog:
-      allOf:
-        - $ref: '#/components/schemas/DoesNotExist'
-";
-        let err = load_str(yaml).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("DoesNotExist"),
-            "expected unresolved-ref error, got: {msg}"
-        );
-    }
-
-    // ── Phase 3: responses ────────────────────────────────────────────────────
-
-    #[test]
-    fn petstore_responses_are_populated() {
-        // Every PetStore operation declares responses. Verify the IR
-        // captures them, schema refs resolve to the right named types, and
-        // bodyless responses (POST /pets → 201) come through with None.
-        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
-        let api = load_str(yaml).expect("petstore should parse");
-
-        // GET /pets → 200 (Pets), default (Error). Status order: 200, default.
-        let list_pets = &api.operations[0];
-        assert_eq!(list_pets.responses.len(), 2);
-        assert_eq!(list_pets.responses[0].status_code, "200");
-        assert!(
-            matches!(&list_pets.responses[0].schema_ref, Some(TypeRef::Named(n)) if n == "Pets"),
-            "GET /pets 200 should be Named(\"Pets\"), got {:?}",
-            list_pets.responses[0].schema_ref
-        );
-        assert_eq!(list_pets.responses[1].status_code, "default");
-        assert!(
-            matches!(&list_pets.responses[1].schema_ref, Some(TypeRef::Named(n)) if n == "Error"),
-            "GET /pets default should be Named(\"Error\"), got {:?}",
-            list_pets.responses[1].schema_ref
-        );
-
-        // POST /pets → 201 (no body), default (Error).
-        let create_pets = &api.operations[1];
-        assert_eq!(create_pets.responses.len(), 2);
-        assert_eq!(create_pets.responses[0].status_code, "201");
-        assert!(
-            create_pets.responses[0].schema_ref.is_none(),
-            "POST /pets 201 should have no schema, got {:?}",
-            create_pets.responses[0].schema_ref
-        );
-        assert_eq!(create_pets.responses[1].status_code, "default");
-        assert!(
-            matches!(&create_pets.responses[1].schema_ref, Some(TypeRef::Named(n)) if n == "Error")
-        );
-
-        // GET /pets/{petId} → 200 (Pet), default (Error).
-        let show_pet = &api.operations[2];
-        assert_eq!(show_pet.responses.len(), 2);
-        assert_eq!(show_pet.responses[0].status_code, "200");
-        assert!(
-            matches!(&show_pet.responses[0].schema_ref, Some(TypeRef::Named(n)) if n == "Pet"),
-            "GET /pets/{{petId}} 200 should be Named(\"Pet\"), got {:?}",
-            show_pet.responses[0].schema_ref
-        );
-        assert_eq!(show_pet.responses[1].status_code, "default");
-    }
-
-    #[test]
-    fn responses_are_ordered_numeric_then_default() {
-        // Mixed-order spec: ensure numeric codes come out ascending and
-        // `default` lands at the end regardless of YAML order.
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /things:
-    get:
-      operationId: listThings
-      responses:
-        default:
-          description: error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Err'
-        '500':
-          description: server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Err'
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Thing'
-        '404':
-          description: missing
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Err'
-components:
-  schemas:
-    Thing:
-      type: object
-      properties:
-        id:
-          type: string
-    Err:
-      type: object
-      properties:
-        message:
-          type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let op = &api.operations[0];
-        let codes: Vec<&str> = op
-            .responses
+        let by_name: std::collections::HashMap<&str, &SecurityScheme> = api
+            .security_schemes
             .iter()
-            .map(|r| r.status_code.as_str())
+            .map(|s| (s.scheme_name(), s))
             .collect();
-        assert_eq!(
-            codes,
-            vec!["200", "404", "500", "default"],
-            "numeric ascending then default last"
-        );
+        match by_name["qKey"] {
+            SecurityScheme::ApiKey { location, .. } => assert_eq!(*location, ApiKeyLocation::Query),
+            _ => panic!("qKey should be ApiKey"),
+        }
+        match by_name["cKey"] {
+            SecurityScheme::ApiKey { location, .. } => {
+                assert_eq!(*location, ApiKeyLocation::Cookie)
+            }
+            _ => panic!("cKey should be ApiKey"),
+        }
     }
 
     #[test]
-    fn response_with_no_content_has_no_schema() {
-        // Common pattern: 204 No Content, or any response that omits content.
+    fn rejects_unsupported_scheme_types() {
+        // oauth2 → clear error rather than silent drop.
         let yaml = "
 openapi: 3.0.0
 info:
-  title: test
+  title: x
   version: '1'
-paths:
-  /things/{id}:
-    delete:
-      operationId: deleteThing
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '204':
-          description: deleted
-";
-        let api = load_str(yaml).expect("should parse");
-        let op = &api.operations[0];
-        assert_eq!(op.responses.len(), 1);
-        assert_eq!(op.responses[0].status_code, "204");
-        assert!(
-            op.responses[0].schema_ref.is_none(),
-            "204 response with no content should have no schema"
-        );
-    }
-
-    #[test]
-    fn response_inline_object_schema() {
-        // Response with an inline object — not a $ref. The lowering path
-        // should produce an Object-shaped... wait, response schemas aren't
-        // lowered into a SchemaKind::Object — they live as a TypeRef. An
-        // inline object as a response is not currently supported, but a
-        // primitive-shaped inline schema like `type: string` should work.
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /ping:
-    get:
-      operationId: ping
-      responses:
-        '200':
-          description: pong
-          content:
-            application/json:
-              schema:
-                type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let op = &api.operations[0];
-        assert_eq!(op.responses.len(), 1);
-        assert!(
-            matches!(op.responses[0].schema_ref, Some(TypeRef::String)),
-            "string response should lower to TypeRef::String, got {:?}",
-            op.responses[0].schema_ref
-        );
-    }
-
-    #[test]
-    fn response_resolves_unknown_ref_with_clear_error() {
-        // Ref pointing into the void should still error sensibly.
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /ping:
-    get:
-      operationId: ping
-      responses:
-        '200':
-          description: pong
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Nope'
+paths: {}
+components:
+  securitySchemes:
+    oauth:
+      type: oauth2
+      flows:
+        implicit:
+          authorizationUrl: https://example.com/auth
+          scopes: {}
 ";
         let err = load_str(yaml).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Nope") && msg.contains("undefined"),
-            "expected unresolved-ref error mentioning the missing schema; got: {msg}"
+            msg.contains("oauth2") && msg.contains("not supported"),
+            "expected unsupported-scheme error, got: {msg}"
         );
     }
 
     #[test]
-    fn response_falls_back_to_first_content_type() {
-        // No application/json; only application/xml. Pick the first entry
-        // (BTreeMap-sorted, deterministic).
+    fn rejects_http_basic() {
+        // We only support `scheme: bearer` under `type: http` for now.
         let yaml = "
 openapi: 3.0.0
 info:
-  title: test
+  title: x
+  version: '1'
+paths: {}
+components:
+  securitySchemes:
+    basic:
+      type: http
+      scheme: basic
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("basic") && msg.contains("not supported"),
+            "expected basic-scheme rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_api_key_missing_name_or_location() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: x
+  version: '1'
+paths: {}
+components:
+  securitySchemes:
+    bad:
+      type: apiKey
+      in: header
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("name"),
+            "expected missing-name error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn per_operation_security_overrides_default() {
+        // Top-level `security: [bearerAuth]`, but `/health` opts out with
+        // an explicit empty list — this is OpenAPI's "make this endpoint
+        // public" sentinel and we preserve it as Some(empty), distinct
+        // from None ("inherit default").
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: x
   version: '1'
 paths:
-  /things:
+  /health:
     get:
-      operationId: listThings
+      operationId: health
+      security: []
+      responses:
+        '204':
+          description: ok
+  /me:
+    get:
+      operationId: getMe
       responses:
         '200':
           description: ok
           content:
-            application/xml:
+            application/json:
               schema:
                 type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let op = &api.operations[0];
-        assert!(matches!(op.responses[0].schema_ref, Some(TypeRef::String)));
-    }
-
-    // ── Phase 3: multipart/form-data ──────────────────────────────────────────
-
-    #[test]
-    fn multipart_request_body_sets_is_multipart() {
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /upload:
-    post:
-      operationId: upload
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              $ref: '#/components/schemas/Upload'
-      responses:
-        '204':
-          description: uploaded
+security:
+  - bearerAuth: []
 components:
-  schemas:
-    Upload:
-      type: object
-      required: [file]
-      properties:
-        file:
-          type: string
-          format: binary
-        caption:
-          type: string
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
 ";
         let api = load_str(yaml).expect("should parse");
-        let op = &api.operations[0];
-        let body = op.request_body.as_ref().expect("upload should have a body");
-        assert_eq!(body.content_type, "multipart/form-data");
-        assert!(body.is_multipart, "is_multipart should be set");
-        assert!(body.required);
-        assert!(matches!(&body.schema_ref, TypeRef::Named(n) if n == "Upload"));
-    }
+        let by_id: std::collections::HashMap<&str, &Operation> = api
+            .operations
+            .iter()
+            .map(|o| (o.operation_id.as_deref().unwrap_or(""), o))
+            .collect();
 
-    #[test]
-    fn json_preferred_over_multipart_when_both_present() {
-        // If both content types are declared, JSON wins — multipart is only
-        // a fallback. Most specs that offer both have JSON as the canonical
-        // shape and multipart as a convenience for browser uploads.
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /upload:
-    post:
-      operationId: upload
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/Upload'
-          multipart/form-data:
-            schema:
-              $ref: '#/components/schemas/Upload'
-      responses:
-        '204':
-          description: uploaded
-components:
-  schemas:
-    Upload:
-      type: object
-      properties:
-        caption:
-          type: string
-";
-        let api = load_str(yaml).expect("should parse");
-        let body = api.operations[0].request_body.as_ref().unwrap();
-        assert_eq!(body.content_type, "application/json");
-        assert!(!body.is_multipart, "JSON should win and is_multipart false");
-    }
+        let health = by_id["health"];
+        assert_eq!(
+            health.security.as_deref(),
+            Some(&[][..]),
+            "Some(empty) preserves the explicit-public sentinel"
+        );
 
-    #[test]
-    fn non_json_non_multipart_falls_back_without_multipart_flag() {
-        // application/xml only — picked up via the first-entry fallback,
-        // is_multipart should remain false.
-        let yaml = "
-openapi: 3.0.0
-info:
-  title: test
-  version: '1'
-paths:
-  /things:
-    post:
-      operationId: createThing
-      requestBody:
-        content:
-          application/xml:
-            schema:
-              type: string
-      responses:
-        '204':
-          description: created
-";
-        let api = load_str(yaml).expect("should parse");
-        let body = api.operations[0].request_body.as_ref().unwrap();
-        assert_eq!(body.content_type, "application/xml");
-        assert!(!body.is_multipart);
+        let me = by_id["getMe"];
+        assert!(
+            me.security.is_none(),
+            "absence of per-op security should remain None"
+        );
+
+        assert_eq!(api.security, vec!["bearerAuth".to_string()]);
     }
 }

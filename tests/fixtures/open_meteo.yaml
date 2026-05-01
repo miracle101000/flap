@@ -1,0 +1,138 @@
+openapi: 3.0.0
+info:
+  title: Open Meteo
+  version: '1.0.0'
+  description: >
+    Free weather forecast API. No API key required. Trimmed from the real
+    Open-Meteo OpenAPI to fit flap v0.1 (parameters declared as scalars rather
+    than `type: array`).
+servers:
+  - url: https://api.open-meteo.com
+paths:
+  /v1/forecast:
+    get:
+      summary: 7 day weather forecast for coordinates
+      operationId: getForecast
+      parameters:
+        - name: latitude
+          in: query
+          required: true
+          description: WGS84 latitude. Negative values for the southern hemisphere.
+          schema:
+            type: number
+            format: float
+        - name: longitude
+          in: query
+          required: true
+          description: WGS84 longitude. Negative values for the western hemisphere.
+          schema:
+            type: number
+            format: float
+        - name: hourly
+          in: query
+          required: false
+          description: Comma-separated list of hourly weather variables, e.g. `temperature_2m,precipitation`.
+          schema:
+            type: string
+        - name: daily
+          in: query
+          required: false
+          description: Comma-separated list of daily weather variables, e.g. `weather_code,temperature_2m_max`.
+          schema:
+            type: string
+        - name: current
+          in: query
+          required: false
+          description: Comma-separated list of current weather variables.
+          schema:
+            type: string
+        - name: timezone
+          in: query
+          required: false
+          description: Any IANA time zone name. `auto` resolves it from the coordinates.
+          schema:
+            type: string
+        - name: forecast_days
+          in: query
+          required: false
+          description: Number of forecast days, 1–16. Default 7.
+          schema:
+            type: integer
+            format: int32
+        - name: temperature_unit
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [celsius, fahrenheit]
+        - name: wind_speed_unit
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [kmh, ms, mph, kn]
+      responses:
+        '200':
+          description: Successful forecast response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForecastResponse'
+        '400':
+          description: Invalid request parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+components:
+  schemas:
+    ForecastResponse:
+      type: object
+      required: [latitude, longitude, generationtime_ms, utc_offset_seconds, timezone, timezone_abbreviation, elevation]
+      properties:
+        latitude:
+          type: number
+          format: float
+        longitude:
+          type: number
+          format: float
+        generationtime_ms:
+          type: number
+          format: float
+          description: Generation time of the forecast in milliseconds.
+        utc_offset_seconds:
+          type: integer
+          format: int32
+        timezone:
+          type: string
+        timezone_abbreviation:
+          type: string
+        elevation:
+          type: number
+          format: float
+          description: Elevation of the selected grid cell in metres.
+        current_units:
+          type: object
+          additionalProperties:
+            type: string
+          description: Per-variable unit labels for `current` keyed by variable name.
+        current:
+          type: object
+          additionalProperties:
+            type: string
+        hourly_units:
+          type: object
+          additionalProperties:
+            type: string
+        daily_units:
+          type: object
+          additionalProperties:
+            type: string
+    ApiError:
+      type: object
+      required: [error, reason]
+      properties:
+        error:
+          type: boolean
+        reason:
+          type: string

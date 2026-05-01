@@ -1,0 +1,243 @@
+openapi: 3.0.0
+info:
+  title: Skywatch Weather
+  version: '1.0.0'
+  description: >
+    Fictional commercial weather API. Demonstrates the auth interceptor —
+    every endpoint is protected by either an `appid` query parameter (the
+    OpenWeatherMap convention) or a `Bearer` token. Either is sufficient.
+servers:
+  - url: https://api.skywatch.example.com/v1
+paths:
+  /weather:
+    get:
+      summary: Current weather for a city.
+      operationId: getCurrentWeather
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: City name, optionally followed by a country code, e.g. `London,uk`.
+          schema:
+            type: string
+        - name: units
+          in: query
+          required: false
+          description: Unit system for temperatures, wind speed, etc.
+          schema:
+            type: string
+            enum: [standard, metric, imperial]
+        - name: lang
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current weather for the requested city.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentWeather'
+        '401':
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '404':
+          description: City not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /forecast:
+    get:
+      summary: 5 day / 3 hour forecast for a city.
+      operationId: getForecast
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: units
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [standard, metric, imperial]
+        - name: cnt
+          in: query
+          required: false
+          description: Number of timestamps to return, 1–40.
+          schema:
+            type: integer
+            format: int32
+      responses:
+        '200':
+          description: Forecast.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Forecast'
+        '401':
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /alerts:
+    post:
+      summary: Subscribe to severe weather alerts for a region.
+      operationId: subscribeAlerts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertSubscriptionRequest'
+      responses:
+        '201':
+          description: Subscription created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertSubscription'
+        '401':
+          description: Missing or invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+security:
+  - bearerAuth: []
+  - appId: []
+components:
+  schemas:
+    CurrentWeather:
+      type: object
+      required: [name, dt, main]
+      properties:
+        name:
+          type: string
+          description: Resolved city name.
+        dt:
+          type: string
+          format: date-time
+          description: Timestamp of the observation.
+        main:
+          $ref: '#/components/schemas/MainConditions'
+        wind:
+          $ref: '#/components/schemas/Wind'
+        weather:
+          $ref: '#/components/schemas/WeatherDescription'
+    MainConditions:
+      type: object
+      required: [temp, humidity]
+      properties:
+        temp:
+          type: number
+          format: float
+        feels_like:
+          type: number
+          format: float
+        humidity:
+          type: integer
+          format: int32
+        pressure:
+          type: integer
+          format: int32
+    Wind:
+      type: object
+      properties:
+        speed:
+          type: number
+          format: float
+        deg:
+          type: integer
+          format: int32
+        gust:
+          type: number
+          format: float
+    WeatherDescription:
+      type: object
+      required: [main]
+      properties:
+        main:
+          type: string
+          enum: [Clear, Clouds, Rain, Snow, Thunderstorm, Drizzle, Mist, Fog]
+        description:
+          type: string
+        icon:
+          type: string
+    Forecast:
+      type: object
+      required: [city, list]
+      properties:
+        city:
+          type: string
+        list:
+          $ref: '#/components/schemas/ForecastEntries'
+    ForecastEntries:
+      type: array
+      items:
+        $ref: '#/components/schemas/ForecastEntry'
+    ForecastEntry:
+      type: object
+      required: [dt, main]
+      properties:
+        dt:
+          type: string
+          format: date-time
+        main:
+          $ref: '#/components/schemas/MainConditions'
+        weather:
+          $ref: '#/components/schemas/WeatherDescription'
+    AlertSubscriptionRequest:
+      type: object
+      required: [region, channel]
+      properties:
+        region:
+          type: string
+          description: Region identifier, e.g. ISO 3166 country or `lat,lon`.
+        channel:
+          type: string
+          enum: [email, sms, webhook]
+        target:
+          type: string
+          description: Email address, phone number, or webhook URL.
+    AlertSubscription:
+      type: object
+      required: [id, region, channel, created_at]
+      properties:
+        id:
+          type: string
+        region:
+          type: string
+        channel:
+          type: string
+          enum: [email, sms, webhook]
+        target:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+          format: int32
+        message:
+          type: string
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    appId:
+      type: apiKey
+      in: query
+      name: appid

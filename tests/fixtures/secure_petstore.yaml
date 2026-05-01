@@ -1,0 +1,37 @@
+openapi: 3.0.0
+info:
+  title: Secure Petstore
+  version: '1.0.0'
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key

@@ -17,6 +17,19 @@ pub struct Api {
     pub operations: Vec<Operation>,
     /// Ordered by schema name — deterministic output.
     pub schemas: Vec<Schema>,
+    /// All security schemes declared in `components.securitySchemes`,
+    /// ordered alphabetically by scheme name (BTreeMap-driven, deterministic).
+    /// Empty when the spec defines no security schemes — the emitter then
+    /// skips generating any auth-related code.
+    pub security_schemes: Vec<SecurityScheme>,
+    /// The set of security scheme names applied to every operation by
+    /// default (the top-level `security` block). Stored as a flat,
+    /// deduplicated list of scheme names — OpenAPI's full
+    /// list-of-AND-of-OR structure is collapsed in v0.1, since the
+    /// generated Dart client supports providing any combination of
+    /// credentials and sending whichever ones are non-null. Each entry
+    /// is expected to reference an entry in `security_schemes`.
+    pub security: Vec<String>,
 }
 
 // ── Operations ───────────────────────────────────────────────────────────────
@@ -66,6 +79,21 @@ pub struct Operation {
     /// no responses are declared (rare — OpenAPI requires at least one,
     /// but we don't enforce that here).
     pub responses: Vec<Response>,
+    /// Per-operation security override.
+    ///
+    /// - `None` means "use the API-level default" (`Api.security`).
+    /// - `Some(empty)` means an explicit override to *no* security —
+    ///   the OpenAPI sentinel for marking an endpoint public even when
+    ///   the rest of the API requires auth.
+    /// - `Some(non-empty)` means use these specific scheme names instead
+    ///   of the API default.
+    ///
+    /// The Dart emitter currently treats credentials globally (any
+    /// configured credential gets sent on every request via the Dio
+    /// interceptor), so this field is captured for fidelity but not yet
+    /// used to gate per-operation injection. A future phase can refine
+    /// the interceptor to consult per-operation requirements.
+    pub security: Option<Vec<String>>,
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
@@ -226,6 +254,81 @@ impl fmt::Display for TypeRef {
             }
             TypeRef::Map(inner) => write!(f, "map<{inner}>"),
             TypeRef::Named(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+// ── Security ─────────────────────────────────────────────────────────────────
+
+/// Where an API key parameter is sent on the wire.
+///
+/// Distinct from [`ParameterLocation`] because OpenAPI does not permit
+/// `apiKey` schemes in path position — only header, query, or cookie. Keeping
+/// this as its own enum stops emitters from having to handle a `Path` arm
+/// that can never legitimately occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyLocation {
+    Cookie,
+    Header,
+    Query,
+}
+
+impl fmt::Display for ApiKeyLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApiKeyLocation::Cookie => f.write_str("cookie"),
+            ApiKeyLocation::Header => f.write_str("header"),
+            ApiKeyLocation::Query => f.write_str("query"),
+        }
+    }
+}
+
+/// A security scheme declared in `components.securitySchemes`.
+///
+/// v0.1 supports the two most common shapes:
+///
+/// - `apiKey` — a credential transmitted as a header, query parameter, or
+///   cookie under a fixed wire-side name.
+/// - `http` with `scheme: bearer` — RFC 6750 bearer tokens, sent as
+///   `Authorization: Bearer <token>`.
+///
+/// `oauth2` and `openIdConnect` flows are out of scope for v0.1 — the
+/// generated client would need a token-acquisition step that doesn't
+/// belong in a single-method interceptor. They will be modelled in a
+/// future phase that adds a real auth-flow IR.
+#[derive(Debug, Clone)]
+pub enum SecurityScheme {
+    /// `type: apiKey` — a static credential the caller supplies once.
+    ApiKey {
+        /// The key under which this scheme is registered in
+        /// `components.securitySchemes`. Used as a stable handle by both
+        /// `Api.security` / `Operation.security` references and as the
+        /// basis for the emitted Dart constructor parameter name.
+        scheme_name: String,
+        /// The wire-side name of the header / query parameter / cookie,
+        /// e.g. `"X-API-Key"` or `"api_key"`.
+        parameter_name: String,
+        location: ApiKeyLocation,
+    },
+    /// `type: http`, `scheme: bearer` — a bearer token sent in the
+    /// `Authorization` header.
+    HttpBearer {
+        scheme_name: String,
+        /// Optional hint about the token format (e.g. `"JWT"`). Carried
+        /// through unchanged for documentation; v0.1 emitters do not vary
+        /// behaviour on it.
+        bearer_format: Option<String>,
+    },
+}
+
+impl SecurityScheme {
+    /// Returns the registry key under `components.securitySchemes`.
+    /// Common to every variant — handy for cross-referencing with
+    /// `Api.security` / `Operation.security`.
+    pub fn scheme_name(&self) -> &str {
+        match self {
+            SecurityScheme::ApiKey { scheme_name, .. } => scheme_name,
+            SecurityScheme::HttpBearer { scheme_name, .. } => scheme_name,
         }
     }
 }

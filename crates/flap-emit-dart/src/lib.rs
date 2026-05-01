@@ -53,11 +53,33 @@
 //! - **Two parameters in the same operation sharing a name across
 //!   locations** (DECISIONS D10): hard error during generation. We panic
 //!   rather than silently shadow.
+//!
+//! ## Phase 5 — authentication
+//!
+//! When `Api.security_schemes` is non-empty, the emitted client constructor
+//! gains one optional `String?` parameter per scheme and installs a Dio
+//! `InterceptorsWrapper` that injects the supplied credentials into every
+//! outgoing request. Specifically:
+//!
+//! - `HttpBearer` → `options.headers['Authorization'] = 'Bearer $token'`
+//! - `ApiKey` (header) → `options.headers['<name>'] = key`
+//! - `ApiKey` (query)  → `options.queryParameters['<name>'] = key`
+//! - `ApiKey` (cookie) → appends `<name>=$key` to any existing `Cookie`
+//!   header so caller-set cookies survive.
+//!
+//! Each injection is wrapped in `if (cred != null) { ... }` so omitted
+//! credentials produce no header — endpoints that opt out of auth via
+//! `security: []` continue to work without surprises. Per-operation
+//! overrides (`Operation.security`) live in the IR but are not yet routed
+//! through; the interceptor is global. Refining that — e.g. to skip
+//! credential injection on operations that explicitly declare `security: []`
+//! — is a follow-up for a future phase.
 
 use std::collections::{BTreeMap, HashMap};
 
 use flap_ir::{
-    Api, Field, Operation, ParameterLocation, RequestBody, Response, Schema, SchemaKind, TypeRef,
+    Api, ApiKeyLocation, Field, Operation, ParameterLocation, RequestBody, Response, Schema,
+    SchemaKind, SecurityScheme, TypeRef,
 };
 
 // ── Identifier policy ────────────────────────────────────────────────────────
@@ -94,13 +116,69 @@ const DART_CORE_COLLISIONS: &[&str] = &[
 /// Limited to entries that could plausibly appear as an OpenAPI parameter
 /// or field name. Built-in types like `int` are handled separately by D7.
 const DART_RESERVED_KEYWORDS: &[&str] = &[
-    "abstract", "as", "assert", "async", "await", "break", "case", "catch", "class", "const",
-    "continue", "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
-    "extends", "extension", "external", "factory", "false", "final", "finally", "for", "get",
-    "hide", "if", "implements", "import", "in", "interface", "is", "late", "library", "mixin",
-    "new", "null", "of", "on", "operator", "part", "required", "rethrow", "return", "set", "show",
-    "static", "super", "switch", "sync", "this", "throw", "true", "try", "typedef", "var", "void",
-    "while", "with", "yield",
+    "abstract",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "dynamic",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extension",
+    "external",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "get",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "of",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "set",
+    "show",
+    "static",
+    "super",
+    "switch",
+    "sync",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
 ];
 
 /// Dart class name for an OpenAPI schema. Appends "Model" on collision (D7).
@@ -359,7 +437,14 @@ fn collect_field_imports(
             }
         }
         TypeRef::Map(inner) => {
-            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
+            collect_field_imports(
+                inner,
+                field_name,
+                schema_name,
+                class_name,
+                registry,
+                imports,
+            );
         }
         TypeRef::String
         | TypeRef::Integer { .. }
@@ -379,7 +464,11 @@ fn emit_synth_enum(synth: &SynthEnum) -> String {
     for (i, value) in synth.values.iter().enumerate() {
         let case = to_dart_enum_case(value);
         out.push_str(&format!("  @JsonValue('{value}')\n"));
-        let trailing = if i == synth.values.len() - 1 { ";" } else { "," };
+        let trailing = if i == synth.values.len() - 1 {
+            ";"
+        } else {
+            ","
+        };
         out.push_str(&format!("  {case}{trailing}\n"));
     }
     out.push_str("}\n");
@@ -438,9 +527,22 @@ fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> S
     }
     out.push('\n');
 
+    // Phase 5 (auth): each declared security scheme becomes an optional
+    // constructor parameter. The Dart identifier is derived from the
+    // scheme's registry key (e.g. `bearerAuth` → `bearerAuth`,
+    // `X-API-Key` → `xApiKey`), with reserved-word collisions handled
+    // by the same `escape_dart_keyword` policy used for path/query
+    // parameters. Each entry pairs the original scheme with its chosen
+    // Dart identifier so signature, interceptor, and any future
+    // per-scheme branching all use the same name.
+    let credentials: Vec<DartCredential> = api
+        .security_schemes
+        .iter()
+        .map(DartCredential::from_scheme)
+        .collect();
+
     out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str(&format!("  {class_name}({{required String baseUrl}})\n"));
-    out.push_str("      : _dio = Dio(BaseOptions(baseUrl: baseUrl));\n");
+    out.push_str(&emit_constructor(class_name, &credentials));
     out.push('\n');
     out.push_str("  final Dio _dio;\n");
 
@@ -451,6 +553,142 @@ fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> S
 
     out.push_str("}\n");
     out
+}
+
+// ── Phase 5 (auth): credential plumbing ──────────────────────────────────────
+
+/// One per `Api.security_schemes` entry. Pre-computes the Dart-side identity
+/// of each scheme so the constructor signature, the interceptor body, and
+/// any future per-scheme touch point share a single source of truth.
+struct DartCredential<'a> {
+    scheme: &'a SecurityScheme,
+    /// Dart identifier for the constructor parameter, e.g. `bearerAuth`,
+    /// `apiKeyAuth`, or `xApiKey` for a scheme literally named `X-API-Key`.
+    /// Reserved words are escaped with the same `Param` suffix used for
+    /// route parameters (DECISIONS D10).
+    dart_param_name: String,
+}
+
+impl<'a> DartCredential<'a> {
+    fn from_scheme(scheme: &'a SecurityScheme) -> Self {
+        let dart_param_name = escape_dart_keyword(&to_camel_case(scheme.scheme_name()));
+        Self {
+            scheme,
+            dart_param_name,
+        }
+    }
+}
+
+/// Emits the constructor — including the auth interceptor wiring when one
+/// or more security schemes are present.
+///
+/// Without auth, the body matches the pre-Phase-5 shape:
+/// ```dart
+///   FooClient({required String baseUrl})
+///       : _dio = Dio(BaseOptions(baseUrl: baseUrl));
+/// ```
+///
+/// With auth, the constructor accepts each credential as an optional named
+/// argument and installs an `InterceptorsWrapper` that injects the configured
+/// credentials into every outgoing request:
+/// ```dart
+///   FooClient({
+///     required String baseUrl,
+///     String? bearerAuth,
+///     String? apiKeyAuth,
+///   }) : _dio = Dio(BaseOptions(baseUrl: baseUrl)) {
+///     _dio.interceptors.add(
+///       InterceptorsWrapper(
+///         onRequest: (options, handler) {
+///           if (bearerAuth != null) {
+///             options.headers['Authorization'] = 'Bearer $bearerAuth';
+///           }
+///           if (apiKeyAuth != null) {
+///             options.headers['X-API-Key'] = apiKeyAuth;
+///           }
+///           handler.next(options);
+///         },
+///       ),
+///     );
+///   }
+/// ```
+///
+/// We choose the assertion form `if (cred != null)` even though Dart's
+/// null-promotion makes `options.headers[k] = cred!` redundant — the
+/// nullable form keeps the interceptor honest about *not* sending headers
+/// when no credential is configured, which is the behaviour callers expect
+/// for endpoints flagged `security: []`.
+fn emit_constructor(class_name: &str, credentials: &[DartCredential]) -> String {
+    let mut out = String::new();
+
+    if credentials.is_empty() {
+        // Same shape the emitter produced before Phase 5 — keeps the
+        // generated output stable for specs that never declare auth.
+        out.push_str(&format!("  {class_name}({{required String baseUrl}})\n"));
+        out.push_str("      : _dio = Dio(BaseOptions(baseUrl: baseUrl));\n");
+        return out;
+    }
+
+    // Multi-line constructor signature.
+    out.push_str(&format!("  {class_name}({{\n"));
+    out.push_str("    required String baseUrl,\n");
+    for cred in credentials {
+        out.push_str(&format!("    String? {},\n", cred.dart_param_name));
+    }
+    out.push_str("  }) : _dio = Dio(BaseOptions(baseUrl: baseUrl)) {\n");
+
+    // Interceptor body.
+    out.push_str("    _dio.interceptors.add(\n");
+    out.push_str("      InterceptorsWrapper(\n");
+    out.push_str("        onRequest: (options, handler) {\n");
+    for cred in credentials {
+        out.push_str(&emit_credential_injection(cred));
+    }
+    out.push_str("          handler.next(options);\n");
+    out.push_str("        },\n");
+    out.push_str("      ),\n");
+    out.push_str("    );\n");
+    out.push_str("  }\n");
+
+    out
+}
+
+/// One credential's `if (...) ...` block inside the interceptor.
+///
+/// - `HttpBearer` → `options.headers['Authorization'] = 'Bearer $cred';`
+/// - `ApiKey` in header → `options.headers['<param>'] = cred;`
+/// - `ApiKey` in query  → `options.queryParameters['<param>'] = cred;`
+/// - `ApiKey` in cookie → append `<param>=$cred` to the `Cookie` header,
+///   preserving any existing cookies a caller may have set themselves.
+fn emit_credential_injection(cred: &DartCredential) -> String {
+    let dart = &cred.dart_param_name;
+    match cred.scheme {
+        SecurityScheme::HttpBearer { .. } => format!(
+            "          if ({dart} != null) {{\n            \
+             options.headers['Authorization'] = 'Bearer ${dart}';\n          }}\n"
+        ),
+        SecurityScheme::ApiKey {
+            parameter_name,
+            location,
+            ..
+        } => match location {
+            ApiKeyLocation::Header => format!(
+                "          if ({dart} != null) {{\n            \
+                 options.headers['{parameter_name}'] = {dart};\n          }}\n"
+            ),
+            ApiKeyLocation::Query => format!(
+                "          if ({dart} != null) {{\n            \
+                 options.queryParameters['{parameter_name}'] = {dart};\n          }}\n"
+            ),
+            ApiKeyLocation::Cookie => format!(
+                "          if ({dart} != null) {{\n            \
+                 final existing = options.headers['Cookie'];\n            \
+                 final cookie = '{parameter_name}=${dart}';\n            \
+                 options.headers['Cookie'] = existing == null\n                \
+                 ? cookie\n                : '$existing; $cookie';\n          }}\n"
+            ),
+        },
+    }
 }
 
 // ── Method emission ───────────────────────────────────────────────────────────
@@ -818,7 +1056,9 @@ fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
         },
         TypeRef::Boolean => "bool".into(),
         TypeRef::DateTime => "DateTime".into(),
-        TypeRef::Enum(_) => enum_synth_name.map(str::to_string).unwrap_or_else(|| "String".into()),
+        TypeRef::Enum(_) => enum_synth_name
+            .map(str::to_string)
+            .unwrap_or_else(|| "String".into()),
         TypeRef::Map(inner) => format!("Map<String, {}>", to_dart_type(inner, None)),
         TypeRef::Named(name) => dart_class_name(name),
     }
@@ -1015,6 +1255,7 @@ mod tests {
                             schema_ref: Some(TypeRef::Named("Error".into())),
                         },
                     ],
+                    security: None,
                 },
                 Operation {
                     method: HttpMethod::Post,
@@ -1038,6 +1279,7 @@ mod tests {
                             schema_ref: Some(TypeRef::Named("Error".into())),
                         },
                     ],
+                    security: None,
                 },
                 Operation {
                     method: HttpMethod::Get,
@@ -1061,9 +1303,12 @@ mod tests {
                             schema_ref: Some(TypeRef::Named("Error".into())),
                         },
                     ],
+                    security: None,
                 },
             ],
             schemas: vec![error_schema(), pet_schema(), pets_schema()],
+            security_schemes: vec![],
+            security: vec![],
         }
     }
 
@@ -1228,6 +1473,8 @@ mod tests {
             base_url: None,
             operations: vec![],
             schemas: vec![error_schema()],
+            security_schemes: vec![],
+            security: vec![],
         };
         let files = emit_models(&api);
         assert!(files.contains_key("error_model.dart"));
@@ -1248,6 +1495,8 @@ mod tests {
             base_url: None,
             operations: vec![],
             schemas: vec![error_schema(), pet_schema(), pets_schema()],
+            security_schemes: vec![],
+            security: vec![],
         };
         let files = emit_models(&api);
         assert!(files.contains_key("error_model.dart"));
@@ -1278,6 +1527,8 @@ mod tests {
             base_url: None,
             operations: vec![],
             schemas: vec![pet_with_status],
+            security_schemes: vec![],
+            security: vec![],
         };
         let files = emit_models(&api);
 
@@ -1333,10 +1584,7 @@ mod tests {
 
     #[test]
     fn map_of_named_lowers_correctly() {
-        let dart_type = to_dart_type(
-            &TypeRef::Map(Box::new(TypeRef::Named("Pet".into()))),
-            None,
-        );
+        let dart_type = to_dart_type(&TypeRef::Map(Box::new(TypeRef::Named("Pet".into()))), None);
         assert_eq!(dart_type, "Map<String, Pet>");
     }
 
@@ -1449,8 +1697,11 @@ mod tests {
                 }],
                 request_body: None,
                 responses: vec![],
+                security: None,
             }],
             schemas: vec![],
+            security_schemes: vec![],
+            security: vec![],
         };
         let (_, src) = emit_client(&api);
         assert!(
@@ -1491,8 +1742,11 @@ mod tests {
                 ],
                 request_body: None,
                 responses: vec![],
+                security: None,
             }],
             schemas: vec![],
+            security_schemes: vec![],
+            security: vec![],
         };
         let _ = emit_client(&api);
     }
@@ -1588,11 +1842,14 @@ mod tests {
                     status_code: "204".into(),
                     schema_ref: None,
                 }],
+                security: None,
             }],
             schemas: vec![Schema {
                 name: "Upload".into(),
                 kind: SchemaKind::Object { fields: vec![] },
             }],
+            security_schemes: vec![],
+            security: vec![],
         };
         let (_, src) = emit_client(&api);
         assert!(
@@ -1619,8 +1876,11 @@ mod tests {
                 }],
                 request_body: None,
                 responses: vec![],
+                security: None,
             }],
             schemas: vec![],
+            security_schemes: vec![],
+            security: vec![],
         };
         let (_, src) = emit_client(&api);
         assert!(
@@ -1650,8 +1910,11 @@ mod tests {
                     status_code: "default".into(),
                     schema_ref: Some(TypeRef::Named("Error".into())),
                 }],
+                security: None,
             }],
             schemas: vec![error_schema()],
+            security_schemes: vec![],
+            security: vec![],
         };
         let (_, src) = emit_client(&api);
         assert!(
@@ -1674,5 +1937,303 @@ mod tests {
                 .collect(),
             _ => panic!("expected object schema"),
         }
+    }
+}
+
+// ── Phase 5 (auth) tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod auth_tests {
+    //! Phase 5 (auth) tests. These are deliberately self-contained — they
+    //! build minimal `Api` fixtures rather than reusing the petstore helper
+    //! so they remain readable in isolation and are easy to extend as new
+    //! scheme variants arrive.
+
+    use super::*;
+    use flap_ir::{ApiKeyLocation, SecurityScheme};
+
+    fn empty_api(title: &str, schemes: Vec<SecurityScheme>) -> Api {
+        Api {
+            title: title.into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![],
+            security_schemes: schemes,
+            security: vec![],
+        }
+    }
+
+    // ── Constructor shape ────────────────────────────────────────────────────
+
+    #[test]
+    fn no_security_keeps_pre_phase5_constructor() {
+        // Specs without auth must produce the exact same constructor shape
+        // we emitted before Phase 5 — single-line initializer, no body block,
+        // no interceptor wiring. Anything else is a regression.
+        let api = empty_api("Plain", vec![]);
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("PlainClient({required String baseUrl})\n"),
+            "expected single-line constructor signature, got:\n{src}"
+        );
+        assert!(
+            src.contains(": _dio = Dio(BaseOptions(baseUrl: baseUrl));\n"),
+            "expected initializer-only constructor, got:\n{src}"
+        );
+        assert!(
+            !src.contains("InterceptorsWrapper"),
+            "no auth → no interceptor, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn http_bearer_emits_bearer_token_param_and_header_injection() {
+        let api = empty_api(
+            "Secure",
+            vec![SecurityScheme::HttpBearer {
+                scheme_name: "bearerAuth".into(),
+                bearer_format: Some("JWT".into()),
+            }],
+        );
+        let (_, src) = emit_client(&api);
+
+        // Constructor signature.
+        assert!(
+            src.contains(
+                "SecureClient({\n    required String baseUrl,\n    String? bearerAuth,\n  })"
+            ),
+            "constructor should accept optional bearerAuth, got:\n{src}"
+        );
+        // Initializer + body block.
+        assert!(
+            src.contains(": _dio = Dio(BaseOptions(baseUrl: baseUrl)) {"),
+            "constructor should open a body block when auth is present, got:\n{src}"
+        );
+        // Interceptor wiring.
+        assert!(
+            src.contains("_dio.interceptors.add("),
+            "missing interceptor registration, got:\n{src}"
+        );
+        assert!(
+            src.contains("InterceptorsWrapper("),
+            "missing InterceptorsWrapper, got:\n{src}"
+        );
+        assert!(
+            src.contains("onRequest: (options, handler) {"),
+            "missing onRequest handler, got:\n{src}"
+        );
+        // Header injection — guarded by a null check.
+        assert!(
+            src.contains("if (bearerAuth != null) {"),
+            "missing null guard, got:\n{src}"
+        );
+        assert!(
+            src.contains("options.headers['Authorization'] = 'Bearer $bearerAuth';"),
+            "missing Authorization header, got:\n{src}"
+        );
+        assert!(
+            src.contains("handler.next(options);"),
+            "interceptor must call handler.next, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn api_key_in_header_injects_custom_header() {
+        let api = empty_api(
+            "Secure",
+            vec![SecurityScheme::ApiKey {
+                scheme_name: "apiKeyAuth".into(),
+                parameter_name: "X-API-Key".into(),
+                location: ApiKeyLocation::Header,
+            }],
+        );
+        let (_, src) = emit_client(&api);
+
+        assert!(
+            src.contains("String? apiKeyAuth,"),
+            "missing apiKeyAuth param, got:\n{src}"
+        );
+        assert!(
+            src.contains("if (apiKeyAuth != null) {"),
+            "missing null guard, got:\n{src}"
+        );
+        assert!(
+            src.contains("options.headers['X-API-Key'] = apiKeyAuth;"),
+            "header should use the spec's parameter name, not the scheme name, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn api_key_in_query_injects_query_parameter() {
+        let api = empty_api(
+            "Secure",
+            vec![SecurityScheme::ApiKey {
+                scheme_name: "apiKeyAuth".into(),
+                parameter_name: "api_key".into(),
+                location: ApiKeyLocation::Query,
+            }],
+        );
+        let (_, src) = emit_client(&api);
+
+        assert!(
+            src.contains("options.queryParameters['api_key'] = apiKeyAuth;"),
+            "query-located key must go on queryParameters, got:\n{src}"
+        );
+        assert!(
+            !src.contains("options.headers['api_key']"),
+            "query key must not also land in headers, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn api_key_in_cookie_appends_to_existing_cookie_header() {
+        // Caller may have set their own cookies on the request before the
+        // interceptor runs (e.g. a session cookie). The injection must
+        // preserve those, not clobber them.
+        let api = empty_api(
+            "Secure",
+            vec![SecurityScheme::ApiKey {
+                scheme_name: "session".into(),
+                parameter_name: "session_id".into(),
+                location: ApiKeyLocation::Cookie,
+            }],
+        );
+        let (_, src) = emit_client(&api);
+
+        assert!(
+            src.contains("final existing = options.headers['Cookie'];"),
+            "cookie injection must read existing header, got:\n{src}"
+        );
+        assert!(
+            src.contains("final cookie = 'session_id=$session';"),
+            "cookie value must use spec parameter name, got:\n{src}"
+        );
+        assert!(
+            src.contains("? cookie\n                : '$existing; $cookie';"),
+            "must append (with `; ` separator) when caller already set Cookie, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn multiple_schemes_each_get_their_own_injection_block() {
+        // Bearer + ApiKey/header on the same client — both arguments accepted,
+        // both injected, both null-guarded independently.
+        let api = empty_api(
+            "Secure",
+            vec![
+                SecurityScheme::ApiKey {
+                    scheme_name: "apiKeyAuth".into(),
+                    parameter_name: "X-API-Key".into(),
+                    location: ApiKeyLocation::Header,
+                },
+                SecurityScheme::HttpBearer {
+                    scheme_name: "bearerAuth".into(),
+                    bearer_format: None,
+                },
+            ],
+        );
+        let (_, src) = emit_client(&api);
+
+        assert!(src.contains("String? apiKeyAuth,"));
+        assert!(src.contains("String? bearerAuth,"));
+        assert!(src.contains("options.headers['X-API-Key'] = apiKeyAuth;"));
+        assert!(src.contains("options.headers['Authorization'] = 'Bearer $bearerAuth';"));
+
+        // Each block is independently guarded — supplying one credential
+        // must not affect whether the other gets sent.
+        let api_key_guards = src.matches("if (apiKeyAuth != null)").count();
+        let bearer_guards = src.matches("if (bearerAuth != null)").count();
+        assert_eq!(
+            api_key_guards, 1,
+            "expected exactly one guard per scheme for apiKeyAuth, got {api_key_guards}"
+        );
+        assert_eq!(
+            bearer_guards, 1,
+            "expected exactly one guard per scheme for bearerAuth, got {bearer_guards}"
+        );
+
+        // Single shared `handler.next(options);` at the end of the closure.
+        assert_eq!(
+            src.matches("handler.next(options);").count(),
+            1,
+            "handler.next must be called exactly once per request"
+        );
+    }
+
+    #[test]
+    fn reserved_word_scheme_name_gets_param_suffix() {
+        // A scheme literally named `default` would produce a Dart param
+        // called `default`, which is a reserved word. D10's escape policy
+        // applies — the param becomes `defaultParam`. The wire-side spec
+        // (the header name from `parameter_name`) is unaffected.
+        let api = empty_api(
+            "Secure",
+            vec![SecurityScheme::ApiKey {
+                scheme_name: "default".into(),
+                parameter_name: "X-API-Key".into(),
+                location: ApiKeyLocation::Header,
+            }],
+        );
+        let (_, src) = emit_client(&api);
+
+        assert!(
+            src.contains("String? defaultParam,"),
+            "reserved word must be escaped in the constructor, got:\n{src}"
+        );
+        assert!(
+            src.contains("if (defaultParam != null) {"),
+            "guard must use the escaped name, got:\n{src}"
+        );
+        assert!(
+            src.contains("options.headers['X-API-Key'] = defaultParam;"),
+            "header value must use the escaped Dart name, got:\n{src}"
+        );
+        // The wire-side header key remains the spec's parameter_name —
+        // `defaultParam` must not leak there.
+        assert!(
+            !src.contains("options.headers['default']"),
+            "wire header key must not use the (escaped) Dart name, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn dashed_scheme_name_produces_valid_dart_identifier() {
+        // `X-API-Key` as a registry key cannot appear verbatim in Dart —
+        // dashes are illegal in identifiers. The exact camelCase shape is
+        // up to `to_camel_case` (and is exercised by its own dedicated
+        // tests); here we just assert auth-relevant invariants:
+        //  1. The constructor parameter is a valid Dart identifier.
+        //  2. The wire-side header key is the spec's parameter_name verbatim.
+        let api = empty_api(
+            "Secure",
+            vec![SecurityScheme::ApiKey {
+                scheme_name: "X-API-Key".into(),
+                parameter_name: "X-API-Key".into(),
+                location: ApiKeyLocation::Header,
+            }],
+        );
+        let (_, src) = emit_client(&api);
+
+        let ident_line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("String? "))
+            .expect("expected a `String? <ident>,` line");
+        let ident = ident_line
+            .trim()
+            .trim_start_matches("String? ")
+            .trim_end_matches(',');
+        assert!(
+            !ident.contains('-'),
+            "dart identifier `{ident}` must not contain dashes"
+        );
+        assert!(
+            ident != "X-API-Key",
+            "dart identifier must not be the bare spec name"
+        );
+        assert!(
+            src.contains(&format!("options.headers['X-API-Key'] = {ident};")),
+            "header injection must use the spec's parameter_name as the key \
+             and the dart identifier as the value, got:\n{src}"
+        );
     }
 }
