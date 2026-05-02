@@ -904,10 +904,12 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
         let type_ref = lower_type_ref(field_name, sor, ctx)
             .with_context(|| format!("field `{field_name}`"))?;
         let is_required = own_required.contains(field_name.as_str());
+        let is_recursive = type_ref_is_recursive(&type_ref, &ctx.visiting);
         fields.push(Field {
             name: field_name.clone(),
             type_ref,
             required: is_required,
+            is_recursive,
         });
     }
 
@@ -917,8 +919,10 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
     for field in fields {
         if let Some(&idx) = seen.get(&field.name) {
             let merged_required = deduped[idx].required || field.required;
+            let merged_recursive = deduped[idx].is_recursive || field.is_recursive;
             deduped[idx] = Field {
                 required: merged_required,
+                is_recursive: merged_recursive,
                 ..field
             };
         } else {
@@ -1153,6 +1157,20 @@ fn stringify_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<
             )),
         })
         .collect()
+}
+
+/// Returns true if `t` (or any inner `Array`/`Map` element) names a schema
+/// currently being lowered — i.e. a back-edge into the visiting set.
+///
+/// Recursing through `Array` and `Map` is intentional: a `Node.children:
+/// List<Node>` or a `Tree.subtrees: Map<String, Tree>` is just as much a
+/// cycle as a bare `Node.next: Node`, and Freezed needs to know.
+fn type_ref_is_recursive(t: &TypeRef, visiting: &HashSet<String>) -> bool {
+    match t {
+        TypeRef::Named(n) => visiting.contains(n),
+        TypeRef::Array(inner) | TypeRef::Map(inner) => type_ref_is_recursive(inner, visiting),
+        _ => false,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1699,4 +1717,152 @@ components:
     let err = load_str(yaml).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("inline"), "got: {msg}");
+}
+
+#[test]
+#[test]
+fn self_referencing_schema_lowers_within_timeout_and_flags_recursive_field() {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    // Self-referencing schema: `Node.next` is a bare $ref to Node, and
+    // `Node.children` is a List of Node. This is the canonical shape
+    // that would hang the lowering pass if `$ref` resolution were ever
+    // changed to inline the target schema without a cycle guard.
+    //
+    // The test does two jobs at once:
+    //
+    // 1. Termination brake. The lower runs on a worker thread; if it
+    //    doesn't return inside the timeout, we panic with a pointed
+    //    message naming the guard that has most likely regressed. The
+    //    current `lower_type_ref` strategy (name references, not
+    //    inlining) means this branch is unreachable today — the test
+    //    is a forward-compat brake against future refactors that
+    //    switch to inline-lowering and forget to thread a cycle check
+    //    through it.
+    //
+    // 2. Flag check. On the happy path we assert that `is_recursive`
+    //    fires exactly on the fields whose type names a schema in the
+    //    `visiting` set, including through `List<>`.
+    //
+    // Caveat on the brake: a hung worker thread cannot be cancelled
+    // from stable Rust. If this test ever times out, the worker stays
+    // parked until the test binary exits — fine for `cargo test`, but
+    // worth knowing when chasing leaks. A genuine stack overflow in
+    // the worker will likely abort the whole test process before the
+    // timeout fires; either way the failure is loud, which is what we
+    // want.
+    let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  schemas:
+    Node:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        next:
+          $ref: '#/components/schemas/Node'
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+";
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        // Send-failure is fine: it just means we already timed out
+        // and the receiver was dropped.
+        let _ = tx.send(load_str(yaml));
+    });
+
+    // 2 seconds is generous: even a cold-cache CI node lowers a single
+    // three-field schema in microseconds. Anything close to the bound
+    // is a regression, not slow hardware.
+    let result = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+        panic!(
+            "lowering a self-referencing schema did not return within 2s — \
+             the visiting-set loop guard in `LoweringContext` has most \
+             likely regressed (or `$ref` resolution was changed to inline \
+             the target schema)."
+        )
+    });
+
+    let api = result.expect("recursive schema should lower without erroring");
+    let node = api
+        .schemas
+        .iter()
+        .find(|s| s.name == "Node")
+        .expect("Node schema present");
+
+    let SchemaKind::Object { fields } = &node.kind else {
+        panic!("Node should lower as an object, got {:?}", node.kind);
+    };
+
+    let id = fields.iter().find(|f| f.name == "id").unwrap();
+    let next = fields.iter().find(|f| f.name == "next").unwrap();
+    let children = fields.iter().find(|f| f.name == "children").unwrap();
+
+    // Bare $ref to self.
+    assert!(matches!(&next.type_ref, TypeRef::Named(n) if n == "Node"));
+    assert!(next.is_recursive, "bare self-ref must be flagged");
+
+    // List<Self>.
+    let TypeRef::Array(inner) = &children.type_ref else {
+        panic!("children should be Array, got {:?}", children.type_ref);
+    };
+    assert!(matches!(&**inner, TypeRef::Named(n) if n == "Node"));
+    assert!(
+        children.is_recursive,
+        "List<Self> must be flagged as recursive"
+    );
+
+    // Primitive field stays clean.
+    assert!(!id.is_recursive, "primitive field must not be flagged");
+}
+
+#[test]
+fn mutually_recursive_schemas_only_flag_back_edges() {
+    // A → B → A. While lowering `A`, `visiting = {A}`, so a $ref to `B`
+    // is *not* recursive at that moment — `B` is a separate, fully-
+    // lowerable schema. The flag should only fire on the back-edge
+    // inside `B` that points at `A`. (`A`'s direct ref to `B` flags
+    // false; `B`'s direct ref to `A` would also flag false because by
+    // the time we lower `B`, only `B` is in `visiting`. So in this
+    // shape neither field is flagged — and that is correct: each
+    // schema can be emitted as a standalone Freezed class with normal
+    // cross-file imports. Recursion only matters when a schema points
+    // back at *itself* mid-lowering.)
+    let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  schemas:
+    A:
+      type: object
+      properties:
+        b: { $ref: '#/components/schemas/B' }
+    B:
+      type: object
+      properties:
+        a: { $ref: '#/components/schemas/A' }
+";
+    let api = load_str(yaml).expect("mutually recursive lower OK");
+    for schema in &api.schemas {
+        let SchemaKind::Object { fields } = &schema.kind else {
+            unreachable!();
+        };
+        for f in fields {
+            assert!(
+                !f.is_recursive,
+                "{}.{} should not be self-recursive",
+                schema.name, f.name
+            );
+        }
+    }
 }

@@ -561,9 +561,14 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
 }
 
 /// Walks a field's `TypeRef` and pushes any `import '...dart';` lines the
-/// generated source will need. Recurses through `Map` so nested named refs
-/// pull in their files too. Self-references (`class_name == cls`) are
-/// skipped — Freezed's `part` directives handle those without an import.
+/// generated source will need. Recurses through `Map` and `Array`.
+///
+/// Self-references are skipped — Freezed's `part 'x.freezed.dart'` files
+/// see the surrounding class without any `import`, and emitting one would
+/// produce a circular-import error from the Dart analyzer. The skip is
+/// keyed on `cls == class_name`, which holds for every field whose IR
+/// `is_recursive` flag is true (the flag is the IR-level statement of the
+/// same condition; the comparison here is the emitter-level enforcement).
 fn collect_field_imports(
     type_ref: &TypeRef,
     field_name: &str,
@@ -1362,16 +1367,19 @@ mod tests {
                             format: Some("int64".into()),
                         },
                         required: true,
+                        is_recursive: false,
                     },
                     Field {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: false,
                     },
                     Field {
                         name: "tag".into(),
                         type_ref: TypeRef::String,
                         required: false,
+                        is_recursive: true,
                     },
                 ],
             },
@@ -1398,11 +1406,13 @@ mod tests {
                             format: Some("int32".into()),
                         },
                         required: true,
+                        is_recursive: true,
                     },
                     Field {
                         name: "message".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: true,
                     },
                 ],
             },
@@ -1617,11 +1627,13 @@ mod tests {
                         name: "first_name".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: true,
                     },
                     Field {
                         name: "id".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: true,
                     },
                 ],
             },
@@ -1702,6 +1714,7 @@ mod tests {
                         "sold".into(),
                     ]),
                     required: false,
+                    is_recursive: true,
                 }],
             },
         };
@@ -1754,6 +1767,7 @@ mod tests {
                     name: "labels".into(),
                     type_ref: TypeRef::Map(Box::new(TypeRef::String)),
                     required: false,
+                    is_recursive: false,
                 }],
             },
         };
@@ -1780,6 +1794,7 @@ mod tests {
                     name: "createdAt".into(),
                     type_ref: TypeRef::DateTime,
                     required: true,
+                    is_recursive: false,
                 }],
             },
         };
@@ -2116,6 +2131,7 @@ mod tests {
                     name: f.name.clone(),
                     type_ref: f.type_ref.clone(),
                     required: f.required,
+                    is_recursive: f.is_recursive,
                 })
                 .collect(),
             _ => panic!("expected object schema"),
@@ -2510,6 +2526,7 @@ mod phase6_tests {
                     name: "tags".into(),
                     type_ref: TypeRef::Array(Box::new(TypeRef::String)),
                     required: true,
+                    is_recursive: false,
                 }],
             },
         };
@@ -2530,6 +2547,7 @@ mod phase6_tests {
                     name: "pups".into(),
                     type_ref: TypeRef::Array(Box::new(TypeRef::Named("Pet".into()))),
                     required: false,
+                    is_recursive: false,
                 }],
             },
         };
@@ -2629,6 +2647,7 @@ mod phase6_tests {
                     name: f.name.clone(),
                     type_ref: f.type_ref.clone(),
                     required: f.required,
+                    is_recursive: f.is_recursive,
                 })
                 .collect(),
             _ => panic!("expected object schema"),
@@ -2651,16 +2670,19 @@ fn union_emits_freezed_union_class() {
                             name: "petType".into(),
                             type_ref: TypeRef::String,
                             required: true,
+                            is_recursive: true,
                         },
                         Field {
                             name: "name".into(),
                             type_ref: TypeRef::String,
                             required: true,
+                            is_recursive: true,
                         },
                         Field {
                             name: "breed".into(),
                             type_ref: TypeRef::String,
                             required: false,
+                            is_recursive: true,
                         },
                     ],
                 },
@@ -2673,16 +2695,19 @@ fn union_emits_freezed_union_class() {
                             name: "petType".into(),
                             type_ref: TypeRef::String,
                             required: true,
+                            is_recursive: true,
                         },
                         Field {
                             name: "name".into(),
                             type_ref: TypeRef::String,
                             required: true,
+                            is_recursive: true,
                         },
                         Field {
                             name: "indoor".into(),
                             type_ref: TypeRef::Boolean,
                             required: false,
+                            is_recursive: false,
                         },
                     ],
                 },
@@ -2736,6 +2761,7 @@ fn explicit_variant_tags_emit_union_value_annotation() {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: true,
                     }],
                 },
             },
@@ -2746,6 +2772,7 @@ fn explicit_variant_tags_emit_union_value_annotation() {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: true,
                     }],
                 },
             },
@@ -2791,6 +2818,7 @@ fn one_of_without_mapping_uses_schema_name_default() {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: true,
                     }],
                 },
             },
@@ -2827,6 +2855,7 @@ fn one_of_with_camelcase_matching_tags_omits_annotation() {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
+                        is_recursive: false,
                     }],
                 },
             },

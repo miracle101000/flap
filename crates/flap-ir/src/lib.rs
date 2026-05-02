@@ -232,6 +232,31 @@ pub struct Field {
     pub name: String,
     pub type_ref: TypeRef,
     pub required: bool,
+    /// True when this field's type (directly, or via `List<>` / `Map<>`)
+    /// points at the schema currently being lowered — i.e. self-recursion
+    /// (`Node.children: List<Node>`) or a back-edge through an `allOf`
+    /// chain. Set by the lowering pass; downstream emitters use this as
+    /// an explicit signal that:
+    ///   - the field type must be rendered as the bare class name,
+    ///   - inline typedef wrappers would break Freezed's generator,
+    ///   - no cross-file `import` is required (Freezed's `part` files
+    ///     handle the cycle naturally).
+    pub is_recursive: bool,
+}
+
+impl Field {
+    /// Construct a non-recursive field — the common case for hand-written
+    /// IR (test fixtures, golden builders, etc.). The lowering pass in
+    /// `flap_spec` constructs `Field` directly because it computes
+    /// `is_recursive` from the visiting set; everywhere else, prefer this.
+    pub fn new(name: impl Into<String>, type_ref: TypeRef, required: bool) -> Self {
+        Self {
+            name: name.into(),
+            type_ref,
+            required,
+            is_recursive: false,
+        }
+    }
 }
 
 /// A reference to a concrete type, either primitive or a named schema.
