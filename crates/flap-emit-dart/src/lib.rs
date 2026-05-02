@@ -322,7 +322,27 @@ fn emit_schema(schema: &Schema, class_name: &str, registry: &EnumRegistry) -> St
             emit_freezed_class(class_name, &schema.name, fields, registry)
         }
         SchemaKind::Array { item } => emit_array_typedef(class_name, item),
+        SchemaKind::Map { value } => emit_map_typedef(class_name, value),
     }
+}
+
+// ── Top-level array / map → typedef ──────────────────────────────────────────
+
+fn emit_array_typedef(name: &str, item: &TypeRef) -> String {
+    let dart_item = to_dart_type(item, None);
+    format!(
+        "// Generated from OpenAPI array schema `{name}`.\n\
+         typedef {name} = List<{dart_item}>;\n"
+    )
+}
+
+fn emit_map_typedef(name: &str, value: &TypeRef) -> String {
+    let dart_value = to_dart_type(value, None);
+    format!(
+        "// Generated from OpenAPI map schema `{name}`\n\
+         // (object with `additionalProperties` and no fixed properties).\n\
+         typedef {name} = Map<String, {dart_value}>;\n"
+    )
 }
 
 // ── Object schemas → @freezed class ──────────────────────────────────────────
@@ -402,16 +422,6 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
     line
 }
 
-// ── Array schemas → typedef ───────────────────────────────────────────────────
-
-fn emit_array_typedef(name: &str, item: &TypeRef) -> String {
-    let dart_item = to_dart_type(item, None);
-    format!(
-        "// Generated from OpenAPI array schema `{name}`.\n\
-         typedef {name} = List<{dart_item}>;\n"
-    )
-}
-
 /// Walks a field's `TypeRef` and pushes any `import '...dart';` lines the
 /// generated source will need. Recurses through `Map` so nested named refs
 /// pull in their files too. Self-references (`class_name == cls`) are
@@ -437,6 +447,16 @@ fn collect_field_imports(
             }
         }
         TypeRef::Map(inner) => {
+            collect_field_imports(
+                inner,
+                field_name,
+                schema_name,
+                class_name,
+                registry,
+                imports,
+            );
+        }
+        TypeRef::Array(inner) => {
             collect_field_imports(
                 inner,
                 field_name,
@@ -488,6 +508,10 @@ pub fn emit_client(api: &Api) -> (String, String) {
 
 /// "Swagger Petstore" → "SwaggerPetstoreClient".
 fn api_client_name(title: &str) -> String {
+    // Each whitespace-separated word becomes a Pascal-cased segment:
+    // first char uppercased, remainder lowercased so all-caps words like
+    // "API" round-trip as "Api" rather than staying SHOUTED. This mirrors
+    // the policy used by `to_camel_case` for separator-bearing inputs.
     let pascal: String = title
         .split_whitespace()
         .filter(|w| !w.is_empty())
@@ -495,7 +519,7 @@ fn api_client_name(title: &str) -> String {
             let mut chars = word.chars();
             match chars.next() {
                 None => String::new(),
-                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
             }
         })
         .collect();
@@ -983,6 +1007,12 @@ fn deserialize_expr(
                  (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()"
             )
         }
+        TypeRef::Array(inner) => {
+            let inner_expr = deserialize_expr(inner, schemas, registry, "e");
+            format!(
+                "({data_var} as List<dynamic>)\n        .map((e) => {inner_expr})\n        .toList()"
+            )
+        }
         TypeRef::Enum(_) => {
             // Top-level enum response — uncommon. The wire form is a string;
             // downstream code can construct the synthesised enum case
@@ -998,6 +1028,17 @@ fn deserialize_expr(
                 let item_expr = deserialize_expr(item, schemas, registry, "e");
                 format!(
                     "({data_var} as List<dynamic>)\n        .map((e) => {item_expr})\n        .toList()"
+                )
+            }
+            // A $ref to a top-level pure-map schema. The Dart side is a
+            // `typedef <Name> = Map<String, V>;` so the runtime shape is
+            // identical to an inline map — defer to the same casting pipe.
+            Some(SchemaKind::Map { value }) => {
+                let value_ty = to_dart_type(value, None);
+                let inner_expr = deserialize_expr(value, schemas, registry, "v");
+                format!(
+                    "({data_var} as Map<String, dynamic>).map(\n      \
+                     (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()"
                 )
             }
             None => {
@@ -1060,6 +1101,7 @@ fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
             .map(str::to_string)
             .unwrap_or_else(|| "String".into()),
         TypeRef::Map(inner) => format!("Map<String, {}>", to_dart_type(inner, None)),
+        TypeRef::Array(inner) => format!("List<{}>", to_dart_type(inner, None)),
         TypeRef::Named(name) => dart_class_name(name),
     }
 }
@@ -1084,29 +1126,32 @@ fn to_snake_case(s: &str) -> String {
 ///
 /// Splits on `_` and `-` so OpenAPI's three common naming styles all
 /// converge: `created_at` → `createdAt`, `X-Auth` → `xAuth`,
-/// `content-type` → `contentType`, `petId` → `petId` (unchanged).
+/// `content-type` → `contentType`, `petId` → `petId` (unchanged),
+/// `API_KEY` → `apiKey`, `X-API-Key` → `xApiKey`.
+///
+/// When the input contains no separators we pass it through unchanged —
+/// already-camelCase names like `petId` must round-trip without being
+/// flattened. With separators present, each split segment is lowercased
+/// so that fully-uppercase initialisms (`API`, `URL`) are preserved as
+/// camelCase fragments rather than left in their SHOUTED form.
 fn to_camel_case(s: &str) -> String {
     if !s.contains('_') && !s.contains('-') {
         return s.to_string();
     }
+    let parts: Vec<&str> = s
+        .split(|c| c == '_' || c == '-')
+        .filter(|p| !p.is_empty())
+        .collect();
     let mut out = String::with_capacity(s.len());
-    let mut next_upper = false;
-    let mut started = false;
-    for ch in s.chars() {
-        if ch == '_' || ch == '-' {
-            if started {
-                next_upper = true;
-            }
-            continue;
-        }
-        if !started {
-            out.extend(ch.to_lowercase());
-            started = true;
-        } else if next_upper {
-            out.extend(ch.to_uppercase());
-            next_upper = false;
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            out.push_str(&part.to_lowercase());
         } else {
-            out.push(ch);
+            let mut chars = part.chars();
+            if let Some(c) = chars.next() {
+                out.extend(c.to_uppercase());
+            }
+            out.push_str(&chars.as_str().to_lowercase());
         }
     }
     out
@@ -1405,7 +1450,7 @@ mod tests {
             "missing required String name"
         );
         assert!(src.contains("String? tag"), "missing optional String? tag");
-        assert!(src.contains("} = _Pet"), "missing = _Pet");
+        assert!(src.contains(") = _Pet"), "missing = _Pet");
         assert!(src.contains("_$PetFromJson(json)"), "missing fromJson");
         assert!(
             src.contains("part 'pet.freezed.dart'"),
@@ -1482,7 +1527,7 @@ mod tests {
         let src = &files["error_model.dart"];
         assert!(src.contains("class ErrorModel"));
         assert!(src.contains("with _$ErrorModel"));
-        assert!(src.contains("} = _ErrorModel"));
+        assert!(src.contains(") = _ErrorModel"));
         assert!(src.contains("_$ErrorModelFromJson"));
         assert!(src.contains("part 'error_model.freezed.dart'"));
         assert!(src.contains("part 'error_model.g.dart'"));
@@ -2235,5 +2280,220 @@ mod auth_tests {
             "header injection must use the spec's parameter_name as the key \
              and the dart identifier as the value, got:\n{src}"
         );
+    }
+}
+
+// ── Phase 6 (top-level maps & inline arrays) tests ───────────────────────────
+
+#[cfg(test)]
+mod phase6_tests {
+    //! Tests for the post-Phase-5 expansion: top-level pure-map schemas
+    //! become Dart typedefs, and inline `type: array` produces
+    //! `TypeRef::Array` which renders as `List<T>` everywhere a TypeRef is
+    //! used (fields, parameters, responses, request bodies).
+
+    use super::*;
+    use flap_ir::{
+        Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, Response, Schema,
+        SchemaKind, TypeRef,
+    };
+
+    // ── Top-level map → typedef ──────────────────────────────────────────────
+
+    #[test]
+    fn top_level_map_emits_typedef() {
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![Schema {
+                name: "UnitsMap".into(),
+                kind: SchemaKind::Map {
+                    value: TypeRef::String,
+                },
+            }],
+            security_schemes: vec![],
+            security: vec![],
+        };
+        let files = emit_models(&api);
+        assert!(
+            files.contains_key("units_map.dart"),
+            "missing units_map.dart, got: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        let src = &files["units_map.dart"];
+        assert!(
+            src.contains("typedef UnitsMap = Map<String, String>;"),
+            "expected typedef, got:\n{src}"
+        );
+        assert!(
+            !src.contains("@freezed"),
+            "map typedef must not be a Freezed class, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn top_level_map_of_named_ref_in_typedef() {
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![
+                Schema {
+                    name: "Pet".into(),
+                    kind: SchemaKind::Object { fields: vec![] },
+                },
+                Schema {
+                    name: "PetCatalog".into(),
+                    kind: SchemaKind::Map {
+                        value: TypeRef::Named("Pet".into()),
+                    },
+                },
+            ],
+            security_schemes: vec![],
+            security: vec![],
+        };
+        let files = emit_models(&api);
+        let src = &files["pet_catalog.dart"];
+        assert!(
+            src.contains("typedef PetCatalog = Map<String, Pet>;"),
+            "expected typedef of named ref, got:\n{src}"
+        );
+    }
+
+    // ── Inline array TypeRef ─────────────────────────────────────────────────
+
+    #[test]
+    fn inline_array_field_renders_as_list() {
+        let schema = Schema {
+            name: "Pet".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "tags".into(),
+                    type_ref: TypeRef::Array(Box::new(TypeRef::String)),
+                    required: true,
+                }],
+            },
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Pet", "Pet", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("required List<String> tags"),
+            "expected List<String>, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn inline_array_of_named_renders_with_import() {
+        let schema = Schema {
+            name: "Litter".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "pups".into(),
+                    type_ref: TypeRef::Array(Box::new(TypeRef::Named("Pet".into()))),
+                    required: false,
+                }],
+            },
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Litter", "Litter", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("List<Pet>? pups"),
+            "expected optional List<Pet>, got:\n{src}"
+        );
+        assert!(
+            src.contains("import 'pet.dart';"),
+            "List of Named must import the element's file, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn inline_array_query_parameter_in_signature() {
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Get,
+                path: "/forecast".into(),
+                operation_id: Some("getForecast".into()),
+                summary: None,
+                parameters: vec![Parameter {
+                    name: "hourly".into(),
+                    location: ParameterLocation::Query,
+                    type_ref: TypeRef::Array(Box::new(TypeRef::String)),
+                    required: false,
+                }],
+                request_body: None,
+                responses: vec![],
+                security: None,
+            }],
+            schemas: vec![],
+            security_schemes: vec![],
+            security: vec![],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("List<String>? hourly,"),
+            "expected List<String> param, got:\n{src}"
+        );
+        // Wire-side serialisation: the existing query map shape passes the
+        // List value through — Dio handles the repeated-key encoding.
+        assert!(
+            src.contains("if (hourly != null) 'hourly': hourly,"),
+            "expected pass-through into query map, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn inline_array_response_deserialises_via_list_map() {
+        let api = Api {
+            title: "T".into(),
+            base_url: None,
+            operations: vec![Operation {
+                method: HttpMethod::Get,
+                path: "/things".into(),
+                operation_id: Some("listThings".into()),
+                summary: None,
+                parameters: vec![],
+                request_body: None,
+                responses: vec![Response {
+                    status_code: "200".into(),
+                    schema_ref: Some(TypeRef::Array(Box::new(TypeRef::String))),
+                }],
+                security: None,
+            }],
+            schemas: vec![],
+            security_schemes: vec![],
+            security: vec![],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(
+            src.contains("Future<List<String>> listThings("),
+            "expected Future<List<String>> return, got:\n{src}"
+        );
+        assert!(
+            src.contains("(data as List<dynamic>)"),
+            "expected list cast, got:\n{src}"
+        );
+        assert!(
+            src.contains(".map((e) => e as String)"),
+            "expected element extraction, got:\n{src}"
+        );
+    }
+
+    // ── Helper ───────────────────────────────────────────────────────────────
+
+    fn fields_of(schema: &Schema) -> Vec<Field> {
+        match &schema.kind {
+            SchemaKind::Object { fields } => fields
+                .iter()
+                .map(|f| Field {
+                    name: f.name.clone(),
+                    type_ref: f.type_ref.clone(),
+                    required: f.required,
+                })
+                .collect(),
+            _ => panic!("expected object schema"),
+        }
     }
 }

@@ -185,6 +185,15 @@ pub enum SchemaKind {
     Object { fields: Vec<Field> },
     /// A homogeneous list — e.g. OpenAPI `type: array`.
     Array { item: TypeRef },
+    /// A homogeneous string-keyed dictionary at the top level — e.g. an
+    /// OpenAPI schema declared as
+    /// `{ type: object, additionalProperties: { ... } }` with no concrete
+    /// properties of its own. Emitters render this as a type alias rather
+    /// than a class (the same shape as `SchemaKind::Array`), so a
+    /// top-level `UnitsMap` becomes
+    /// `typedef UnitsMap = Map<String, String>;`. The boxed value type
+    /// follows the same rules as `TypeRef::Map`'s inner.
+    Map { value: TypeRef },
 }
 
 #[derive(Debug)]
@@ -228,6 +237,12 @@ pub enum TypeRef {
     /// `additionalProperties: { type: string }`. The boxed inner `TypeRef`
     /// is the value type; the key is always `String` per JSON semantics.
     Map(Box<TypeRef>),
+    /// An inline homogeneous list — `{ type: array, items: ... }` appearing
+    /// as a field type, parameter type, request/response body, or nested
+    /// inside another `Array`/`Map`. Top-level array schemas continue to
+    /// be modelled by `SchemaKind::Array`; this variant covers the cases
+    /// where an array shows up as part of a larger type.
+    Array(Box<TypeRef>),
     /// Reference to a named component schema (the bare name, not the $ref path).
     Named(String),
 }
@@ -253,6 +268,7 @@ impl fmt::Display for TypeRef {
                 f.write_str("]")
             }
             TypeRef::Map(inner) => write!(f, "map<{inner}>"),
+            TypeRef::Array(inner) => write!(f, "array<{inner}>"),
             TypeRef::Named(n) => write!(f, "{n}"),
         }
     }

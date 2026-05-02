@@ -44,9 +44,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use flap_ir::{
-    ApiKeyLocation, Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody,
+    Api, ApiKeyLocation, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody,
     Response, Schema, SchemaKind, SecurityScheme, TypeRef,
 };
 use serde::Deserialize;
@@ -795,6 +795,28 @@ fn lower_inline_schema(
             Ok(SchemaKind::Object { fields })
         }
 
+        // Top-level pure-map schema:
+        //   { type: object, additionalProperties: { ... } }
+        // with no concrete `properties`. Emitted as a `typedef` rather than
+        // a class, parallel to how top-level arrays are handled.
+        // Only triggered when the schema form is the typed-map case
+        // (`additionalProperties: { schema }`); the boolean form is treated
+        // as a no-op object — same as inside object schemas.
+        Some("object") | None
+            if raw.properties.is_empty()
+                && matches!(
+                    &raw.additional_properties,
+                    Some(RawAdditionalProperties::Schema(_))
+                ) =>
+        {
+            let Some(RawAdditionalProperties::Schema(inner)) = &raw.additional_properties else {
+                unreachable!("guarded by matches! above");
+            };
+            let value = lower_type_ref("<additionalProperties>", inner, ctx)
+                .with_context(|| format!("in `{name}.additionalProperties`"))?;
+            Ok(SchemaKind::Map { value })
+        }
+
         Some("array") => {
             let items = raw
                 .items
@@ -957,16 +979,24 @@ fn lower_type_ref(
                 }),
                 Some("boolean") => Ok(TypeRef::Boolean),
                 Some("array") => {
-                    // Inline arrays — common in response schemas like
-                    // `application/json: { schema: { type: array, items: ... } }`.
-                    // We can't synthesise a top-level Schema here, so treat
-                    // the array as a Map-like-but-list... actually, no: the IR
-                    // doesn't yet model inline list TypeRefs. Reject with a
-                    // clear pointer to the workaround (declare a named schema).
-                    Err(anyhow!(
-                        "field `{field_name}` is an inline array — declare it \
-                         as a named schema in components.schemas and $ref to it"
-                    ))
+                    // Inline arrays as a TypeRef. Common shapes:
+                    //   - Response/request body declared inline:
+                    //       schema: { type: array, items: ... }
+                    //   - Query parameter accepting multiple values:
+                    //       parameters:
+                    //         - name: tags
+                    //           schema: { type: array, items: { type: string } }
+                    // The boxed inner TypeRef carries the element type; the
+                    // emitter renders it as `List<T>`. For query parameters,
+                    // Dio serialises a Dart `List` as repeated `?key=v1&key=v2`
+                    // entries by default, which matches the OpenAPI 3 default
+                    // (`style: form, explode: true`).
+                    let items = raw.items.as_ref().ok_or_else(|| {
+                        anyhow!("field `{field_name}` is `type: array` but has no `items`")
+                    })?;
+                    let inner = lower_type_ref("<items>", items, ctx)
+                        .with_context(|| format!("in `{field_name}.items`"))?;
+                    Ok(TypeRef::Array(Box::new(inner)))
                 }
                 Some(other) => Err(anyhow!(
                     "field `{field_name}` has unsupported inline type `{other}`"
@@ -1261,5 +1291,214 @@ components:
         );
 
         assert_eq!(api.security, vec!["bearerAuth".to_string()]);
+    }
+
+    // ── Phase 6: top-level map schemas ───────────────────────────────────────
+
+    #[test]
+    fn top_level_map_schema_lowers_to_schemakind_map() {
+        // The exact shape that previously errored:
+        //   { type: object, additionalProperties: { type: string } }
+        // with no concrete properties. Should now lower to SchemaKind::Map.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    UnitsMap:
+      type: object
+      additionalProperties:
+        type: string
+";
+        let api = load_str(yaml).expect("top-level map should lower cleanly");
+        assert_eq!(api.schemas.len(), 1);
+        assert_eq!(api.schemas[0].name, "UnitsMap");
+        let SchemaKind::Map { value } = &api.schemas[0].kind else {
+            panic!("expected SchemaKind::Map, got {:?}", api.schemas[0].kind);
+        };
+        assert!(matches!(value, TypeRef::String));
+    }
+
+    #[test]
+    fn top_level_map_of_named_ref() {
+        // additionalProperties referencing another schema.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        name:
+          type: string
+    PetCatalog:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/Pet'
+";
+        let api = load_str(yaml).expect("should lower");
+        let catalog = api.schemas.iter().find(|s| s.name == "PetCatalog").unwrap();
+        let SchemaKind::Map { value } = &catalog.kind else {
+            panic!("expected SchemaKind::Map");
+        };
+        assert!(matches!(value, TypeRef::Named(n) if n == "Pet"));
+    }
+
+    #[test]
+    fn map_with_properties_still_emits_object() {
+        // If a schema has both properties AND additionalProperties, the
+        // properties win — it's an object that happens to allow extras.
+        // We model it as an Object (the extras are silently dropped in
+        // v0.1, same as boolean additionalProperties on an object).
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Mixed:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+      additionalProperties:
+        type: integer
+";
+        let api = load_str(yaml).expect("should lower");
+        assert!(matches!(api.schemas[0].kind, SchemaKind::Object { .. }));
+    }
+
+    // ── Phase 6: inline array TypeRef ────────────────────────────────────────
+
+    #[test]
+    fn inline_array_field_lowers_to_typeref_array() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [tags]
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
+";
+        let api = load_str(yaml).expect("should lower");
+        let SchemaKind::Object { fields } = &api.schemas[0].kind else {
+            panic!("Pet should be an object");
+        };
+        let tags = fields.iter().find(|f| f.name == "tags").unwrap();
+        let TypeRef::Array(inner) = &tags.type_ref else {
+            panic!("tags should be Array, got {:?}", tags.type_ref);
+        };
+        assert!(matches!(**inner, TypeRef::String));
+        assert!(tags.required);
+    }
+
+    #[test]
+    fn inline_array_query_parameter() {
+        // The Open-Meteo case: a query parameter that takes a list.
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths:
+  /forecast:
+    get:
+      operationId: getForecast
+      parameters:
+        - name: hourly
+          in: query
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '200':
+          description: ok
+";
+        let api = load_str(yaml).expect("should lower");
+        let param = &api.operations[0].parameters[0];
+        let TypeRef::Array(inner) = &param.type_ref else {
+            panic!("hourly should be Array, got {:?}", param.type_ref);
+        };
+        assert!(matches!(**inner, TypeRef::String));
+    }
+
+    #[test]
+    fn inline_array_of_named_ref() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Pet:
+      type: object
+      properties:
+        name:
+          type: string
+    Litter:
+      type: object
+      properties:
+        pups:
+          type: array
+          items:
+            $ref: '#/components/schemas/Pet'
+";
+        let api = load_str(yaml).expect("should lower");
+        let litter = api.schemas.iter().find(|s| s.name == "Litter").unwrap();
+        let SchemaKind::Object { fields } = &litter.kind else {
+            panic!("Litter should be an object");
+        };
+        let pups = fields.iter().find(|f| f.name == "pups").unwrap();
+        let TypeRef::Array(inner) = &pups.type_ref else {
+            panic!("pups should be Array");
+        };
+        assert!(matches!(&**inner, TypeRef::Named(n) if n == "Pet"));
+    }
+
+    #[test]
+    fn inline_array_without_items_is_a_clear_error() {
+        let yaml = "
+openapi: 3.0.0
+info:
+  title: test
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Bad:
+      type: object
+      properties:
+        things:
+          type: array
+";
+        let err = load_str(yaml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("items"),
+            "expected error mentioning missing items, got: {msg}"
+        );
     }
 }
