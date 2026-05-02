@@ -71,6 +71,25 @@ fn main() -> ExitCode {
             SchemaKind::Array { item } => {
                 println!("  {} (array of {})", schema.name, item);
             }
+            SchemaKind::Union {
+                variants,
+                variant_tags,
+                discriminator,
+            } => {
+                println!(
+                    "  {} (union on `{}`, {} variants, tags: {:?})",
+                    schema.name,
+                    discriminator,
+                    variants.len(),
+                    variant_tags
+                );
+                for v in variants {
+                    println!("    | {}", v);
+                }
+            }
+            SchemaKind::Map { value } => {
+                println!("  {} (map of string to {})", schema.name, value);
+            }
         }
     }
 

@@ -194,6 +194,37 @@ pub enum SchemaKind {
     /// `typedef UnitsMap = Map<String, String>;`. The boxed value type
     /// follows the same rules as `TypeRef::Map`'s inner.
     Map { value: TypeRef },
+    /// A discriminated union — OpenAPI `oneOf` with a `discriminator` block.
+    ///
+    /// Per DECISIONS D6, structural unions (no discriminator) are a hard
+    /// error during lowering. Each entry in `variants` is a `TypeRef::Named`
+    /// pointing at a top-level schema in `components.schemas`.
+    ///
+    /// `discriminator` is the wire-side property name carrying the variant
+    /// tag (e.g. `"petType"` from `discriminator: { propertyName: petType }`).
+    /// The Dart emitter wires this directly into Freezed's
+    /// `@Freezed(unionKey: '<name>')` so `fromJson` automatically routes
+    /// payloads to the correct variant.
+    ///
+    /// `variant_tags` holds the wire-side value that selects each variant,
+    /// parallel to `variants` (same length, same order). Population rules
+    /// during lowering:
+    /// - If `discriminator.mapping` lists the variant explicitly, that tag
+    ///   wins — `mapping: { "v1.dog": "#/components/schemas/Dog" }` produces
+    ///   the tag `"v1.dog"` for the `Dog` variant.
+    /// - Otherwise the OpenAPI default applies and the tag is the variant's
+    ///   schema name verbatim (PascalCase).
+    ///
+    /// The emitter compares each tag against the camelCased factory name
+    /// derived from the schema name and emits `@FreezedUnionValue('<tag>')`
+    /// only when they differ. The `Vec<String>` shape (rather than
+    /// `Vec<Option<String>>`) keeps the IR fully self-describing — you
+    /// don't need to remember the default-derivation rule to consume it.
+    Union {
+        variants: Vec<TypeRef>,
+        discriminator: String,
+        variant_tags: Vec<String>,
+    },
 }
 
 #[derive(Debug)]

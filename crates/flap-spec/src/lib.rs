@@ -283,6 +283,28 @@ struct RawSchema {
     /// schema by concatenating their fields (see `collect_object_fields`).
     #[serde(default, rename = "allOf")]
     all_of: Vec<RawSchemaOrRef>,
+    /// Phase 7 (polymorphism, D6): `oneOf` member list. Lowering rejects
+    /// the schema if this is non-empty without a sibling `discriminator`.
+    #[serde(default, rename = "oneOf")]
+    one_of: Vec<RawSchemaOrRef>,
+    /// Phase 7: discriminator block paired with `oneOf`. Required by D6.
+    discriminator: Option<RawDiscriminator>,
+}
+
+/// `discriminator` per OpenAPI 3.0.
+///
+/// `propertyName` is mandatory and identifies the wire-side field whose
+/// value selects the variant. `mapping` is parsed for forward compatibility
+/// (so real specs that include it don't trip serde) but currently unused —
+/// v0.1 derives variant tags from the variant schema name. A later phase
+/// can honour explicit mappings without changing the IR.
+#[derive(Debug, Deserialize)]
+struct RawDiscriminator {
+    #[serde(rename = "propertyName")]
+    property_name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    mapping: BTreeMap<String, String>,
 }
 
 /// `additionalProperties` in OpenAPI is either a boolean (allow / forbid extra
@@ -781,6 +803,22 @@ fn lower_inline_schema(
     raw: &RawSchema,
     ctx: &mut LoweringContext,
 ) -> Result<SchemaKind> {
+    // Phase 7: discriminated unions (D6). Checked first so a spec that
+    // accidentally mixes `oneOf` with other constructs gets a focused
+    // error rather than a confusing "schema has no type" downstream.
+    if !raw.one_of.is_empty() {
+        return lower_one_of(name, raw, ctx);
+    }
+
+    // Phase 2: composition. `allOf` takes precedence over the schema's
+    // `type`, because real-world specs frequently omit `type: object` on
+    // composed schemas. Any own `properties` are appended after the
+    // inherited ones.
+    if !raw.all_of.is_empty() {
+        let fields = collect_object_fields(raw, ctx)?;
+        return Ok(SchemaKind::Object { fields });
+    }
+
     // Phase 2: composition. `allOf` takes precedence over the schema's `type`,
     // because real-world specs frequently omit `type: object` on composed
     // schemas. Any own `properties` are appended after the inherited ones.
@@ -890,6 +928,96 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
     }
 
     Ok(deduped)
+}
+
+fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Result<SchemaKind> {
+    let discriminator = raw.discriminator.as_ref().ok_or_else(|| {
+        anyhow!(
+            "schema `{name}` uses `oneOf` without a `discriminator` block. \
+             Per DECISIONS D6, only discriminated unions are supported in \
+             v0.1 — add a `discriminator: {{ propertyName: <field> }}` \
+             block alongside the `oneOf` list, or replace the `oneOf` \
+             with an `allOf` composition if the schemas share a base."
+        )
+    })?;
+
+    let property_name = discriminator.property_name.trim();
+    if property_name.is_empty() {
+        bail!(
+            "schema `{name}` has a `discriminator` with an empty \
+             `propertyName` — set it to the wire-side field whose value \
+             selects the variant."
+        );
+    }
+
+    // Invert the wire→schema mapping so we can look up a wire tag by
+    // variant name during the per-member walk. Mapping values may be
+    // either bare schema names ("Dog") or full $ref pointers
+    // ("#/components/schemas/Dog") — accept both forms.
+    let mut tag_by_schema: BTreeMap<String, String> = BTreeMap::new();
+    for (wire_tag, schema_ref) in &discriminator.mapping {
+        let bare = parse_mapping_target(schema_ref)
+            .with_context(|| format!("discriminator mapping entry `{wire_tag}` of `{name}`"))?;
+        tag_by_schema.insert(bare.to_string(), wire_tag.clone());
+    }
+
+    let mut variants = Vec::with_capacity(raw.one_of.len());
+    let mut variant_tags = Vec::with_capacity(raw.one_of.len());
+
+    for (i, member) in raw.one_of.iter().enumerate() {
+        let (variant, variant_name) = match member {
+            RawSchemaOrRef::Ref { reference } => {
+                let bare = parse_schema_ref_pointer(reference)
+                    .with_context(|| format!("oneOf[{i}] of `{name}`"))?;
+                let resolved = ctx
+                    .resolve_schema(bare)
+                    .with_context(|| format!("oneOf[{i}] of `{name}` references `{bare}`"))?;
+                (resolved, bare.to_string())
+            }
+            RawSchemaOrRef::Inline(_) => bail!(
+                "oneOf[{i}] of `{name}` is an inline schema. \
+                 v0.1 requires every `oneOf` variant to be a $ref into \
+                 `components.schemas` so each variant has a stable class \
+                 name. Lift the inline schema into a named component."
+            ),
+        };
+
+        // Wire tag: explicit mapping wins; otherwise the OpenAPI default
+        // is the bare schema name. The emitter decides whether to emit
+        // a `@FreezedUnionValue` based on whether this matches the
+        // camelCased factory name it'll generate.
+        let wire_tag = tag_by_schema
+            .get(&variant_name)
+            .cloned()
+            .unwrap_or(variant_name.clone());
+
+        variants.push(variant);
+        variant_tags.push(wire_tag);
+    }
+
+    Ok(SchemaKind::Union {
+        variants,
+        discriminator: property_name.to_string(),
+        variant_tags,
+    })
+}
+
+/// Parses a `discriminator.mapping` value into a bare schema name.
+///
+/// OpenAPI 3.0 permits two forms:
+/// - A `$ref` pointer: `"#/components/schemas/Dog"`.
+/// - A bare schema name: `"Dog"`. (Common in real specs even though the
+///   spec text leans toward the $ref form.)
+///
+/// Both produce the same `Dog` lookup key.
+fn parse_mapping_target(value: &str) -> Result<&str> {
+    if value.starts_with("#/") {
+        return parse_schema_ref_pointer(value);
+    }
+    if value.is_empty() || value.contains('/') {
+        bail!("malformed mapping target `{value}` — expected schema name or $ref");
+    }
+    Ok(value)
 }
 
 /// Resolves a single `allOf` member into a flat list of fields.
@@ -1501,4 +1629,74 @@ components:
             "expected error mentioning missing items, got: {msg}"
         );
     }
+}
+
+#[test]
+fn one_of_explicit_mapping_populates_variant_tags() {
+    let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  schemas:
+    Dog: { type: object, properties: { name: { type: string } } }
+    Cat: { type: object, properties: { name: { type: string } } }
+    Pet:
+      oneOf:
+        - $ref: '#/components/schemas/Dog'
+        - $ref: '#/components/schemas/Cat'
+      discriminator:
+        propertyName: petType
+        mapping:
+          'v1.dog': '#/components/schemas/Dog'
+          'v1.cat': 'Cat'
+";
+    let api = load_str(yaml).expect("should lower");
+    let pet = api.schemas.iter().find(|s| s.name == "Pet").unwrap();
+    let SchemaKind::Union { variant_tags, .. } = &pet.kind else {
+        panic!("expected Union");
+    };
+    assert_eq!(variant_tags.len(), 2);
+    assert_eq!(variant_tags[0], "v1.dog"); // $ref form
+    assert_eq!(variant_tags[1], "v1.cat"); // bare-name form
+}
+
+#[test]
+fn one_of_without_discriminator_errors() {
+    let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  schemas:
+    Dog: { type: object, properties: { name: { type: string } } }
+    Cat: { type: object, properties: { name: { type: string } } }
+    Pet:
+      oneOf:
+        - $ref: '#/components/schemas/Dog'
+        - $ref: '#/components/schemas/Cat'
+";
+    let err = load_str(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("discriminator"), "got: {msg}");
+    assert!(msg.contains("D6"), "should cite the decision: {msg}");
+}
+
+#[test]
+fn one_of_inline_variant_errors() {
+    let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  schemas:
+    Pet:
+      oneOf:
+        - type: object
+          properties: { name: { type: string } }
+      discriminator: { propertyName: petType }
+";
+    let err = load_str(yaml).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("inline"), "got: {msg}");
 }

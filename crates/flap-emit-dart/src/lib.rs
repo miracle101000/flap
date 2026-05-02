@@ -301,7 +301,7 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
     for schema in &api.schemas {
         let class_name = dart_class_name(&schema.name);
         let filename = format!("{}.dart", to_snake_case(&class_name));
-        let source = emit_schema(schema, &class_name, &registry);
+        let source = emit_schema(schema, &class_name, &registry, &api.schemas);
         files.insert(filename, source);
     }
 
@@ -316,14 +316,152 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
 
 // ── Schema-shape dispatch ─────────────────────────────────────────────────────
 
-fn emit_schema(schema: &Schema, class_name: &str, registry: &EnumRegistry) -> String {
+fn emit_schema(
+    schema: &Schema,
+    class_name: &str,
+    registry: &EnumRegistry,
+    schemas: &[Schema],
+) -> String {
     match &schema.kind {
         SchemaKind::Object { fields } => {
             emit_freezed_class(class_name, &schema.name, fields, registry)
         }
         SchemaKind::Array { item } => emit_array_typedef(class_name, item),
         SchemaKind::Map { value } => emit_map_typedef(class_name, value),
+        SchemaKind::Union {
+            variants,
+            discriminator,
+            variant_tags,
+        } => emit_freezed_union(
+            class_name,
+            &schema.name,
+            variants,
+            discriminator,
+            variant_tags,
+            schemas,
+            registry,
+        ),
     }
+}
+
+// ── Union schemas → @Freezed union ───────────────────────────────────────────
+
+/// Emits a Freezed sealed-class union for a `SchemaKind::Union`.
+///
+/// Freezed unions look like:
+///
+///   @Freezed(unionKey: 'petType')
+///   sealed class Pet with _$Pet {
+///     const factory Pet.dog({ required String name, required int age }) = Dog;
+///     const factory Pet.cat({ required String name, required bool indoor }) = Cat;
+///
+///     factory Pet.fromJson(Map<String, dynamic> json) => _$PetFromJson(json);
+///   }
+///
+/// Each variant's fields are inlined into its factory parameters. We
+/// reuse `emit_field` so JsonKey rewrites, optionality, and synth-enum
+/// lookups behave identically to standalone object emission. Imports are
+/// gathered across all variants' field types — recursion through Map and
+/// Array is handled by `collect_field_imports`.
+///
+/// The right-hand class name (`= Dog;`) uses the variant schema's Dart
+/// class name verbatim; D7 collisions are still applied. If the same
+/// schema is also emitted as a standalone `@freezed class`, the user
+/// will get a duplicate-definition error from Dart — that interaction
+/// is documented as a known v0.1 limitation.
+fn emit_freezed_union(
+    class_name: &str,
+    _schema_name: &str,
+    variants: &[TypeRef],
+    discriminator: &str,
+    variant_tags: &[String],
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+) -> String {
+    let snake = to_snake_case(class_name);
+    let mut out = String::new();
+
+    out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
+
+    // Collect imports needed by any variant's fields. We do NOT import the
+    // variant classes themselves — Freezed defines them via the `=` on each
+    // factory. We DO import every named ref / synth enum referenced inside
+    // those variant fields.
+    let mut imports: Vec<String> = Vec::new();
+    for variant in variants {
+        let TypeRef::Named(variant_name) = variant else {
+            continue; // lowering rejects non-Named variants; defensive.
+        };
+        if let Some(SchemaKind::Object { fields }) = named_schema_kind(variant_name, schemas) {
+            for field in fields {
+                collect_field_imports(
+                    &field.type_ref,
+                    &field.name,
+                    variant_name, // registry keys are scoped to the variant schema
+                    class_name,
+                    registry,
+                    &mut imports,
+                );
+            }
+        }
+    }
+    imports.sort();
+    imports.dedup();
+    for line in &imports {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str(&format!("part '{snake}.freezed.dart';\n"));
+    out.push_str(&format!("part '{snake}.g.dart';\n"));
+    out.push('\n');
+
+    out.push_str(&format!("@Freezed(unionKey: '{discriminator}')\n"));
+    out.push_str(&format!(
+        "sealed class {class_name} with _${class_name} {{\n"
+    ));
+
+    for (variant, wire_tag) in variants.iter().zip(variant_tags.iter()) {
+        let TypeRef::Named(variant_name) = variant else {
+            continue;
+        };
+        let variant_class = format!("{}{}", class_name, to_pascal_case(variant_name));
+        let factory_name = to_camel_case(variant_name);
+
+        let fields: &[Field] = match named_schema_kind(variant_name, schemas) {
+            Some(SchemaKind::Object { fields }) => fields.as_slice(),
+            // Non-object variants (array/map/union-of-union) are exotic
+            // enough that v0.1 just emits an empty factory rather than
+            // failing the whole emission. A future phase can bail here
+            // once we've seen what real specs do with this.
+            _ => &[],
+        };
+
+        // Override Freezed's default tag-from-factory-name behaviour only
+        // when the wire tag genuinely differs. Common cases (camelCase
+        // wire tags matching schema names) emit no annotation, which
+        // keeps the output clean for the 90% spec.
+        if factory_name != *wire_tag {
+            out.push_str(&format!("  @FreezedUnionValue('{wire_tag}')\n"));
+        }
+
+        out.push_str(&format!("  const factory {class_name}.{factory_name}({{\n"));
+        for field in fields {
+            // Pass the variant's schema name so JsonKey + synth-enum lookups
+            // resolve against the registry entries created during build().
+            out.push_str(&emit_field(field, variant_name, registry));
+        }
+        out.push_str(&format!("  }}) = {variant_class};\n\n"));
+    }
+
+    out.push_str(&format!(
+        "  factory {class_name}.fromJson(Map<String, dynamic> json) =>\n"
+    ));
+    out.push_str(&format!("      _${class_name}FromJson(json);\n"));
+    out.push_str("}\n");
+
+    out
 }
 
 // ── Top-level array / map → typedef ──────────────────────────────────────────
@@ -1020,7 +1158,7 @@ fn deserialize_expr(
             format!("{data_var} as String")
         }
         TypeRef::Named(name) => match named_schema_kind(name, schemas) {
-            Some(SchemaKind::Object { .. }) => {
+            Some(SchemaKind::Object { .. }) | Some(SchemaKind::Union { .. }) => {
                 let cls = dart_class_name(name);
                 format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
             }
@@ -2496,4 +2634,218 @@ mod phase6_tests {
             _ => panic!("expected object schema"),
         }
     }
+}
+
+#[test]
+fn union_emits_freezed_union_class() {
+    let api = Api {
+        title: "T".into(),
+        base_url: None,
+        operations: vec![],
+        schemas: vec![
+            Schema {
+                name: "Dog".into(),
+                kind: SchemaKind::Object {
+                    fields: vec![
+                        Field {
+                            name: "petType".into(),
+                            type_ref: TypeRef::String,
+                            required: true,
+                        },
+                        Field {
+                            name: "name".into(),
+                            type_ref: TypeRef::String,
+                            required: true,
+                        },
+                        Field {
+                            name: "breed".into(),
+                            type_ref: TypeRef::String,
+                            required: false,
+                        },
+                    ],
+                },
+            },
+            Schema {
+                name: "Cat".into(),
+                kind: SchemaKind::Object {
+                    fields: vec![
+                        Field {
+                            name: "petType".into(),
+                            type_ref: TypeRef::String,
+                            required: true,
+                        },
+                        Field {
+                            name: "name".into(),
+                            type_ref: TypeRef::String,
+                            required: true,
+                        },
+                        Field {
+                            name: "indoor".into(),
+                            type_ref: TypeRef::Boolean,
+                            required: false,
+                        },
+                    ],
+                },
+            },
+            Schema {
+                name: "Pet".into(),
+                kind: SchemaKind::Union {
+                    variants: vec![TypeRef::Named("Dog".into()), TypeRef::Named("Cat".into())],
+                    discriminator: "petType".into(),
+                    variant_tags: vec!["dog".into(), "cat".into()],
+                },
+            },
+        ],
+        security_schemes: vec![],
+        security: vec![],
+    };
+    let files = emit_models(&api);
+    let src = &files["pet.dart"];
+    assert!(src.contains("@Freezed(unionKey: 'petType')"), "got:\n{src}");
+    assert!(src.contains("sealed class Pet with _$Pet"), "got:\n{src}");
+    assert!(src.contains("const factory Pet.dog({"), "got:\n{src}");
+    assert!(src.contains("}) = PetDog;"), "got:\n{src}");
+    assert!(src.contains("const factory Pet.cat({"), "got:\n{src}");
+    assert!(src.contains("}) = PetCat;"), "got:\n{src}");
+    assert!(
+        src.contains("required String name"),
+        "field inlining: {src}"
+    );
+    assert!(src.contains("bool? indoor"), "optional bool: {src}");
+    assert!(src.contains("factory Pet.fromJson"), "got:\n{src}");
+    assert!(src.contains("_$PetFromJson(json)"), "got:\n{src}");
+    assert!(
+        !src.contains("@FreezedUnionValue"),
+        "no annotation should fire when tag matches camelCase factory: {src}"
+    );
+    assert!(src.contains("part 'pet.freezed.dart'"));
+    assert!(src.contains("part 'pet.g.dart'"));
+}
+
+#[test]
+fn explicit_variant_tags_emit_union_value_annotation() {
+    let api = Api {
+        title: "T".into(),
+        base_url: None,
+        operations: vec![],
+        schemas: vec![
+            Schema {
+                name: "Dog".into(),
+                kind: SchemaKind::Object {
+                    fields: vec![Field {
+                        name: "name".into(),
+                        type_ref: TypeRef::String,
+                        required: true,
+                    }],
+                },
+            },
+            Schema {
+                name: "Cat".into(),
+                kind: SchemaKind::Object {
+                    fields: vec![Field {
+                        name: "name".into(),
+                        type_ref: TypeRef::String,
+                        required: true,
+                    }],
+                },
+            },
+            Schema {
+                name: "Pet".into(),
+                kind: SchemaKind::Union {
+                    variants: vec![TypeRef::Named("Dog".into()), TypeRef::Named("Cat".into())],
+                    discriminator: "petType".into(),
+                    variant_tags: vec!["v1.dog".into(), "v1.cat".into()],
+                },
+            },
+        ],
+        security_schemes: vec![],
+        security: vec![],
+    };
+    let files = emit_models(&api);
+    let src = &files["pet.dart"];
+    assert!(
+        src.contains("@FreezedUnionValue('v1.dog')"),
+        "missing annotation for Dog, got:\n{src}"
+    );
+    assert!(
+        src.contains("@FreezedUnionValue('v1.cat')"),
+        "missing annotation for Cat, got:\n{src}"
+    );
+}
+
+#[test]
+fn one_of_without_mapping_uses_schema_name_default() {
+    // OpenAPI default: wire tag is the schema name verbatim ("Dog").
+    // Factory name is camelCased ("dog"). They differ, so we expect
+    // an annotation — this pins down the "honest OpenAPI" behaviour
+    // even though most specs in practice use lowercase tags.
+    let api = Api {
+        title: "T".into(),
+        base_url: None,
+        operations: vec![],
+        schemas: vec![
+            Schema {
+                name: "Dog".into(),
+                kind: SchemaKind::Object {
+                    fields: vec![Field {
+                        name: "name".into(),
+                        type_ref: TypeRef::String,
+                        required: true,
+                    }],
+                },
+            },
+            Schema {
+                name: "Pet".into(),
+                kind: SchemaKind::Union {
+                    variants: vec![TypeRef::Named("Dog".into())],
+                    discriminator: "petType".into(),
+                    variant_tags: vec!["Dog".into()], // OpenAPI default
+                },
+            },
+        ],
+        security_schemes: vec![],
+        security: vec![],
+    };
+    let files = emit_models(&api);
+    let src = &files["pet.dart"];
+    assert!(src.contains("@FreezedUnionValue('Dog')"), "got:\n{src}");
+}
+
+#[test]
+fn one_of_with_camelcase_matching_tags_omits_annotation() {
+    // The clean path: spec uses lowercase wire tags that match the
+    // camelCased factory name. No annotation needed.
+    let api = Api {
+        title: "T".into(),
+        base_url: None,
+        operations: vec![],
+        schemas: vec![
+            Schema {
+                name: "Dog".into(),
+                kind: SchemaKind::Object {
+                    fields: vec![Field {
+                        name: "name".into(),
+                        type_ref: TypeRef::String,
+                        required: true,
+                    }],
+                },
+            },
+            Schema {
+                name: "Pet".into(),
+                kind: SchemaKind::Union {
+                    variants: vec![TypeRef::Named("Dog".into())],
+                    discriminator: "petType".into(),
+                    variant_tags: vec!["dog".into()], // matches factory name
+                },
+            },
+        ],
+        security_schemes: vec![],
+        security: vec![],
+    };
+    let files = emit_models(&api);
+    let src = &files["pet.dart"];
+    assert!(
+        !src.contains("@FreezedUnionValue"),
+        "no annotation expected when tag matches factory name, got:\n{src}"
+    );
 }
