@@ -232,6 +232,22 @@ pub struct Field {
     pub name: String,
     pub type_ref: TypeRef,
     pub required: bool,
+    /// True when the field's value may legitimately be JSON `null` on the
+    /// wire — set by lowering when the schema declares `nullable: true`
+    /// (OpenAPI 3.0). Orthogonal to `required`:
+    ///
+    /// | `required` | `nullable` | wire semantics                            |
+    /// |------------|------------|-------------------------------------------|
+    /// | true       | false      | key MUST be present, value non-null       |
+    /// | true       | true       | key MUST be present, value MAY be null    |
+    /// | false      | false      | key MAY be omitted, never null when present |
+    /// | false      | true       | key MAY be omitted, value MAY be null     |
+    ///
+    /// The last row is the one that motivates the `Optional<T?>` wrapper
+    /// in the Dart emitter — it's the only case where the receiver of a
+    /// PATCH must be able to distinguish "client did not send this key"
+    /// from "client explicitly set this key to null".
+    pub nullable: bool,
     /// True when this field's type (directly, or via `List<>` / `Map<>`)
     /// points at the schema currently being lowered — i.e. self-recursion
     /// (`Node.children: List<Node>`) or a back-edge through an `allOf`
@@ -254,6 +270,7 @@ impl Field {
             name: name.into(),
             type_ref,
             required,
+            nullable: false,
             is_recursive: false,
         }
     }

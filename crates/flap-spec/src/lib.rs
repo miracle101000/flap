@@ -289,6 +289,14 @@ struct RawSchema {
     one_of: Vec<RawSchemaOrRef>,
     /// Phase 7: discriminator block paired with `oneOf`. Required by D6.
     discriminator: Option<RawDiscriminator>,
+    /// OpenAPI 3.0 `nullable: true`. Defaults to false. v0.1 rejects 3.1
+    /// up front (DECISIONS D5), so 3.1's type-array form
+    /// (`type: [string, "null"]`) is intentionally not modelled here —
+    /// the version guard runs before serde, so we'd never see one.
+    /// When we drop the 3.1 ban, lowering will need a small pass to
+    /// translate that shape into the same `nullable` boolean.
+    #[serde(default)]
+    nullable: Option<bool>,
 }
 
 /// `discriminator` per OpenAPI 3.0.
@@ -905,11 +913,19 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
             .with_context(|| format!("field `{field_name}`"))?;
         let is_required = own_required.contains(field_name.as_str());
         let is_recursive = type_ref_is_recursive(&type_ref, &ctx.visiting);
+        // OpenAPI 3.0: `nullable` is only meaningful on inline schemas. A
+        // bare `$ref` cannot carry a `nullable` flag — that's a 3.0 spec
+        // limitation, not ours; specs that need it use an `allOf` wrapper.
+        let is_nullable = match sor {
+            RawSchemaOrRef::Inline(raw) => raw.nullable.unwrap_or(false),
+            RawSchemaOrRef::Ref { .. } => false,
+        };
         fields.push(Field {
             name: field_name.clone(),
             type_ref,
             required: is_required,
             is_recursive,
+            nullable: is_nullable,
         });
     }
 
@@ -919,9 +935,11 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
     for field in fields {
         if let Some(&idx) = seen.get(&field.name) {
             let merged_required = deduped[idx].required || field.required;
+            let merged_nullable = deduped[idx].nullable || field.nullable;
             let merged_recursive = deduped[idx].is_recursive || field.is_recursive;
             deduped[idx] = Field {
                 required: merged_required,
+                nullable: merged_nullable,
                 is_recursive: merged_recursive,
                 ..field
             };

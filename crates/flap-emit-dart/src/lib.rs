@@ -298,6 +298,11 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
     let registry = EnumRegistry::build(api);
     let mut files = HashMap::new();
 
+    // Always emit the shared utility file. It's tiny and harmless when
+    // unused; emitting it unconditionally keeps the output set stable
+    // across spec edits that add or remove the first Optional field.
+    files.insert("flap_utils.dart".to_string(), emit_flap_utils());
+
     for schema in &api.schemas {
         let class_name = dart_class_name(&schema.name);
         let filename = format!("{}.dart", to_snake_case(&class_name));
@@ -312,6 +317,108 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
     }
 
     files
+}
+
+/// The shared `Optional<T>` + `OptionalConverter` runtime.
+///
+/// Generated as a single file imported by every model that has an
+/// `Optional`-wrapped field. The contents are static — the function
+/// returns a string literal rather than building from IR — because
+/// nothing in here depends on the spec.
+fn emit_flap_utils() -> String {
+    r#"// GENERATED — do not edit by hand.
+// Shared runtime for fields whose absence and explicit-null forms must
+// be distinguished on the wire (notably HTTP PATCH bodies).
+
+import 'package:freezed_annotation/freezed_annotation.dart';
+
+/// Tri-state wrapper. `Optional.absent()` means "the key was omitted
+/// from the payload"; `Optional.present(value)` means "the key was
+/// supplied with this value", where `value` itself may be `null`.
+sealed class Optional<T> {
+  const Optional();
+  const factory Optional.present(T value) = _Present<T>;
+  const factory Optional.absent() = _Absent<T>;
+
+  bool get isPresent => this is _Present<T>;
+  bool get isAbsent  => this is _Absent<T>;
+
+  /// Throws if `isAbsent`. Use `valueOrNull` if you want a fallback.
+  T get value => switch (this) {
+        _Present<T>(:final value) => value,
+        _Absent<T>() => throw StateError(
+            'Optional.value called on Optional.absent()'),
+      };
+
+  T? get valueOrNull => switch (this) {
+        _Present<T>(:final value) => value,
+        _Absent<T>() => null,
+      };
+}
+
+final class _Present<T> extends Optional<T> {
+  final T value;
+  const _Present(this.value);
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is _Present<T> && other.value == value);
+  @override
+  int get hashCode => Object.hash(_Present, value);
+}
+
+final class _Absent<T> extends Optional<T> {
+  const _Absent();
+
+  @override
+  bool operator ==(Object other) => other is _Absent<T>;
+  @override
+  int get hashCode => (_Absent).hashCode;
+}
+
+/// Sentinel emitted by [OptionalConverter.toJson] for the absent case.
+/// `stripOptionalAbsent` removes any map entry whose value is identical
+/// to this object before the map ever reaches `jsonEncode`.
+const Object kOptionalAbsentSentinel = _OptionalAbsentSentinel();
+class _OptionalAbsentSentinel { const _OptionalAbsentSentinel(); }
+
+/// Removes any entry whose value is the absence sentinel. Generated
+/// `toJson` overrides on models with `Optional` fields call this on the
+/// `_$ClassNameToJson` output before returning.
+Map<String, dynamic> stripOptionalAbsent(Map<String, dynamic> m) {
+  m.removeWhere((_, v) => identical(v, kOptionalAbsentSentinel));
+  return m;
+}
+
+/// Converter for `Optional<T?>` where `T` has a direct JSON shape
+/// (`String`, `int`, `double`, `num`, `bool`). For non-primitive `T`
+/// (DateTime, custom classes, lists, maps), generated code emits
+/// per-field `@JsonKey(fromJson: ..., toJson: ...)` lambdas instead,
+/// because `as T?` won't survive the JSON-side runtime types.
+///
+/// Round-trip:
+/// - `fromJson(null)` → `Optional.present(null)` (key was present with null)
+/// - `fromJson(value)` → `Optional.present(value)`
+/// - **the absent case is encoded by NOT calling fromJson at all**, which
+///   relies on `@Default(Optional<T?>.absent())` on the field.
+/// - `toJson(Optional.absent())` → sentinel (stripped at the boundary)
+/// - `toJson(Optional.present(null))` → `null` (preserved as `"key": null`)
+/// - `toJson(Optional.present(value))` → `value`
+class OptionalConverter<T> implements JsonConverter<Optional<T?>, Object?> {
+  const OptionalConverter();
+
+  @override
+  Optional<T?> fromJson(Object? json) => Optional<T?>.present(json as T?);
+
+  @override
+  Object? toJson(Optional<T?> opt) => switch (opt) {
+        _Absent<T?>()                  => kOptionalAbsentSentinel,
+        _Present<T?>(:final value)     => value,
+      };
+}
+"#
+    .to_string()
 }
 
 // ── Schema-shape dispatch ─────────────────────────────────────────────────────
@@ -483,6 +590,12 @@ fn emit_map_typedef(name: &str, value: &TypeRef) -> String {
     )
 }
 
+fn class_has_optional_wrapper_field(fields: &[Field]) -> bool {
+    fields
+        .iter()
+        .any(|f| !f.required && f.nullable && type_ref_supports_optional_wrapper(&f.type_ref))
+}
+
 // ── Object schemas → @freezed class ──────────────────────────────────────────
 
 fn emit_freezed_class(
@@ -492,10 +605,14 @@ fn emit_freezed_class(
     registry: &EnumRegistry,
 ) -> String {
     let snake = to_snake_case(class_name);
+    let has_optional = class_has_optional_wrapper_field(fields);
     let mut out = String::new();
 
     // Freezed import.
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
+    if has_optional {
+        out.push_str("import 'flap_utils.dart';\n");
+    }
 
     // Cross-file imports: any synth enum referenced by a field, plus any
     // named refs that resolve to schemas (so the tooling sees them, even
@@ -527,6 +644,14 @@ fn emit_freezed_class(
 
     out.push_str("@freezed\n");
     out.push_str(&format!("class {class_name} with _${class_name} {{\n"));
+
+    // Freezed requires a private constructor to attach custom methods.
+    // We only add it when we actually need to override `toJson` — keeps
+    // the emitted code unchanged for specs that never touch nullability.
+    if has_optional {
+        out.push_str(&format!("  const {class_name}._();\n\n"));
+    }
+
     out.push_str(&format!("  const factory {class_name}({{\n"));
     for field in fields {
         out.push_str(&emit_field(field, schema_name, registry));
@@ -542,21 +667,80 @@ fn emit_freezed_class(
     out
 }
 
+/// Whether the `Optional<T?>` wrapper can use the canonical
+/// `OptionalConverter<T>`. True for primitives whose JSON shape is `T`
+/// itself; false for types that need transformation (DateTime → String,
+/// Named → Map, etc.). The `false` branch falls back to `T?` semantics
+/// in this iteration with a TODO for the per-field-lambda follow-up.
+fn type_ref_supports_optional_wrapper(type_ref: &TypeRef) -> bool {
+    matches!(
+        type_ref,
+        TypeRef::String | TypeRef::Integer { .. } | TypeRef::Number { .. } | TypeRef::Boolean
+    )
+}
+
 fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> String {
     let synth = registry.lookup_field(schema_name, &field.name);
     let dart_type = to_dart_type(&field.type_ref, synth);
     let dart_name = to_camel_case(&field.name);
 
-    let mut line = String::from("    ");
+    // Build up the @JsonKey args (name-rewrite + includeIfNull) and any
+    // sibling annotations (@OptionalConverter, @Default) separately.
+    let mut json_key_args: Vec<String> = Vec::new();
     if dart_name != field.name {
-        // snake_case wire name preserved via @JsonKey, camelCase property.
-        line.push_str(&format!("@JsonKey(name: '{}') ", field.name));
+        json_key_args.push(format!("name: '{}'", field.name));
     }
-    if field.required {
-        line.push_str(&format!("required {dart_type} {dart_name},\n"));
-    } else {
-        line.push_str(&format!("{dart_type}? {dart_name},\n"));
+    let mut sibling_annotations: Vec<String> = Vec::new();
+
+    // Decide the typed fragment — i.e. everything from `T name,` to
+    // `Optional<T?> name,`.
+    let typed_fragment = match (field.required, field.nullable) {
+        // required + non-nullable: as before.
+        (true, false) => format!("required {dart_type} {dart_name},\n"),
+
+        // required + nullable: explicitly nullable, ALWAYS sent (no
+        // includeIfNull suppression — that would lose the `null` wire form).
+        (true, true) => format!("required {dart_type}? {dart_name},\n"),
+
+        // optional + non-nullable: `T?` with `includeIfNull: false` so
+        // a Dart-side null doesn't leak onto the wire as `"key": null`.
+        (false, false) => {
+            json_key_args.push("includeIfNull: false".to_string());
+            format!("{dart_type}? {dart_name},\n")
+        }
+
+        // optional + nullable: the Optional<T?> case — but only if T is
+        // a primitive whose JSON shape matches Dart's. For non-primitive
+        // T we degrade to the (false, false) shape with a TODO comment;
+        // a future phase will emit per-field fromJson/toJson lambdas.
+        (false, true) => {
+            if type_ref_supports_optional_wrapper(&field.type_ref) {
+                sibling_annotations.push("@OptionalConverter()".to_string());
+                sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
+                format!("Optional<{dart_type}?> {dart_name},\n")
+            } else {
+                json_key_args.push("includeIfNull: false".to_string());
+                // Visible warning so non-primitive Optional fields don't
+                // silently lose their absent/present-null distinction.
+                format!(
+                    "// TODO(flap): nullable+optional non-primitive — \
+                     `Optional<{dart_type}?>` not yet supported for this type\n    \
+                     {dart_type}? {dart_name},\n"
+                )
+            }
+        }
+    };
+
+    // Assemble: indent → @JsonKey(...) → other annotations → typed fragment.
+    let mut line = String::from("    ");
+    if !json_key_args.is_empty() {
+        line.push_str(&format!("@JsonKey({}) ", json_key_args.join(", ")));
     }
+    for ann in &sibling_annotations {
+        line.push_str(ann);
+        line.push(' ');
+    }
+    line.push_str(&typed_fragment);
     line
 }
 
@@ -1368,18 +1552,21 @@ mod tests {
                         },
                         required: true,
                         is_recursive: false,
+                        nullable: false,
                     },
                     Field {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: false,
+                        nullable: false,
                     },
                     Field {
                         name: "tag".into(),
                         type_ref: TypeRef::String,
                         required: false,
                         is_recursive: true,
+                        nullable: false,
                     },
                 ],
             },
@@ -1407,12 +1594,14 @@ mod tests {
                         },
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     },
                     Field {
                         name: "message".into(),
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     },
                 ],
             },
@@ -1628,12 +1817,14 @@ mod tests {
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     },
                     Field {
                         name: "id".into(),
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     },
                 ],
             },
@@ -1715,6 +1906,7 @@ mod tests {
                     ]),
                     required: false,
                     is_recursive: true,
+                    nullable: false,
                 }],
             },
         };
@@ -1768,6 +1960,7 @@ mod tests {
                     type_ref: TypeRef::Map(Box::new(TypeRef::String)),
                     required: false,
                     is_recursive: false,
+                    nullable: false,
                 }],
             },
         };
@@ -1795,6 +1988,7 @@ mod tests {
                     type_ref: TypeRef::DateTime,
                     required: true,
                     is_recursive: false,
+                    nullable: false,
                 }],
             },
         };
@@ -2132,6 +2326,7 @@ mod tests {
                     type_ref: f.type_ref.clone(),
                     required: f.required,
                     is_recursive: f.is_recursive,
+                    nullable: f.nullable,
                 })
                 .collect(),
             _ => panic!("expected object schema"),
@@ -2527,6 +2722,7 @@ mod phase6_tests {
                     type_ref: TypeRef::Array(Box::new(TypeRef::String)),
                     required: true,
                     is_recursive: false,
+                    nullable: false,
                 }],
             },
         };
@@ -2548,6 +2744,7 @@ mod phase6_tests {
                     type_ref: TypeRef::Array(Box::new(TypeRef::Named("Pet".into()))),
                     required: false,
                     is_recursive: false,
+                    nullable: false,
                 }],
             },
         };
@@ -2648,6 +2845,7 @@ mod phase6_tests {
                     type_ref: f.type_ref.clone(),
                     required: f.required,
                     is_recursive: f.is_recursive,
+                    nullable: false,
                 })
                 .collect(),
             _ => panic!("expected object schema"),
@@ -2671,18 +2869,21 @@ fn union_emits_freezed_union_class() {
                             type_ref: TypeRef::String,
                             required: true,
                             is_recursive: true,
+                            nullable: false,
                         },
                         Field {
                             name: "name".into(),
                             type_ref: TypeRef::String,
                             required: true,
                             is_recursive: true,
+                            nullable: false,
                         },
                         Field {
                             name: "breed".into(),
                             type_ref: TypeRef::String,
                             required: false,
                             is_recursive: true,
+                            nullable: false,
                         },
                     ],
                 },
@@ -2696,18 +2897,21 @@ fn union_emits_freezed_union_class() {
                             type_ref: TypeRef::String,
                             required: true,
                             is_recursive: true,
+                            nullable: false,
                         },
                         Field {
                             name: "name".into(),
                             type_ref: TypeRef::String,
                             required: true,
                             is_recursive: true,
+                            nullable: false,
                         },
                         Field {
                             name: "indoor".into(),
                             type_ref: TypeRef::Boolean,
                             required: false,
                             is_recursive: false,
+                            nullable: false,
                         },
                     ],
                 },
@@ -2762,6 +2966,7 @@ fn explicit_variant_tags_emit_union_value_annotation() {
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     }],
                 },
             },
@@ -2773,6 +2978,7 @@ fn explicit_variant_tags_emit_union_value_annotation() {
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     }],
                 },
             },
@@ -2819,6 +3025,7 @@ fn one_of_without_mapping_uses_schema_name_default() {
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: true,
+                        nullable: false,
                     }],
                 },
             },
@@ -2856,6 +3063,7 @@ fn one_of_with_camelcase_matching_tags_omits_annotation() {
                         type_ref: TypeRef::String,
                         required: true,
                         is_recursive: false,
+                        nullable: false,
                     }],
                 },
             },
