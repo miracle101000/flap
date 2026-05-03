@@ -1263,10 +1263,7 @@ fn to_camel_case(s: &str) -> String {
     if !s.contains('_') && !s.contains('-') {
         return s.to_string();
     }
-    let parts: Vec<&str> = s
-        .split(|c| c == '_' || c == '-')
-        .filter(|p| !p.is_empty())
-        .collect();
+    let parts: Vec<&str> = s.split(['_', '-']).filter(|p| !p.is_empty()).collect();
     let mut out = String::with_capacity(s.len());
     for (i, part) in parts.iter().enumerate() {
         if i == 0 {

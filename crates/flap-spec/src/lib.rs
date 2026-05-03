@@ -199,7 +199,7 @@ enum RawSchemaOrRef {
         #[serde(rename = "$ref")]
         reference: String,
     },
-    Inline(RawSchema),
+    Inline(Box<RawSchema>),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -586,9 +586,9 @@ fn lower_parameter(path: &str, raw: &RawParameter, ctx: &mut LoweringContext) ->
     })
 }
 
-fn pick_request_body_content<'a>(
-    content: &'a BTreeMap<String, RawMediaType>,
-) -> Option<(String, &'a RawMediaType, bool)> {
+fn pick_request_body_content(
+    content: &BTreeMap<String, RawMediaType>,
+) -> Option<(String, &RawMediaType, bool)> {
     if let Some(mt) = content.get("application/json") {
         return Some(("application/json".to_string(), mt, false));
     }
