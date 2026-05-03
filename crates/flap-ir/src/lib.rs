@@ -151,6 +151,9 @@ pub enum SchemaKind {
         discriminator: String,
         variant_tags: Vec<String>,
     },
+    /// A union of forms where no single explicit discriminator field
+    /// exists. Deserialization must attempt each variant in order.
+    UntaggedUnion { variants: Vec<TypeRef> },
 }
 
 #[derive(Debug)]

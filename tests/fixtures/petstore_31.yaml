@@ -1,0 +1,42 @@
+openapi: "3.1.0"
+info:
+  title: "Petstore 3.1"
+  version: "1.0"
+paths:
+  /pets:
+    patch:
+      operationId: updatePet
+      summary: "Update a pet (3.1 style)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchPetRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+components:
+  schemas:
+    PatchPetRequest:
+      type: object
+      properties:
+        name:
+          type: ["string", "null"]   # 3.1 nullable string
+        tag:
+          type: string
+          nullable: false             # 3.0 style still allowed in 3.1?
+        age:
+          type: integer
+      required: [age]
+    Pet:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string

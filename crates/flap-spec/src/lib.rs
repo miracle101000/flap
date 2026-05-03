@@ -19,6 +19,7 @@
 //! reaching `collect_object_fields`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -50,11 +51,8 @@ fn reject_unsupported_version(text: &str) -> Result<()> {
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("openapi:") {
             let v = rest.trim().trim_matches(|c: char| c == '"' || c == '\'');
-            if v.starts_with("3.1") {
-                bail!(
-                    "OpenAPI 3.1 is not supported in v0.1 (DECISIONS D5). \
-                     Found `openapi: {v}`. Downgrade your spec to 3.0.x."
-                );
+            if v.starts_with("3.") {
+                return Ok(());
             }
             if !v.starts_with("3.") {
                 bail!("unsupported OpenAPI version `{v}` — flap v0.1 requires 3.0.x");
@@ -204,8 +202,8 @@ enum RawSchemaOrRef {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawSchema {
-    #[serde(rename = "type")]
-    ty: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_openapi_type")]
+    ty: Vec<String>,
     format: Option<String>,
     #[serde(default)]
     required: Vec<String>,
@@ -218,6 +216,8 @@ struct RawSchema {
     additional_properties: Option<RawAdditionalProperties>,
     #[serde(default, rename = "allOf")]
     all_of: Vec<RawSchemaOrRef>,
+    #[serde(default, rename = "anyOf")]
+    any_of: Vec<RawSchemaOrRef>,
     #[serde(default, rename = "oneOf")]
     one_of: Vec<RawSchemaOrRef>,
     discriminator: Option<RawDiscriminator>,
@@ -254,6 +254,7 @@ enum RawAdditionalProperties {
 struct LoweringContext<'a> {
     components: &'a RawComponents,
     visiting: HashSet<String>,
+    synthetic_schemas: Vec<Schema>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -261,6 +262,7 @@ impl<'a> LoweringContext<'a> {
         Self {
             components,
             visiting: HashSet::new(),
+            synthetic_schemas: Vec::new(),
         }
     }
 
@@ -276,6 +278,36 @@ impl<'a> LoweringContext<'a> {
         }
         Ok(TypeRef::Named(name.to_string()))
     }
+}
+
+use serde::de;
+
+fn deserialize_openapi_type<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct TypeVisitor;
+    impl<'de> de::Visitor<'de> for TypeVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or an array of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                v.push(s);
+            }
+            Ok(v)
+        }
+    }
+
+    d.deserialize_any(TypeVisitor)
 }
 
 fn parse_schema_ref_pointer(reference: &str) -> Result<&str> {
@@ -707,6 +739,7 @@ fn lower_schemas(
             kind,
         });
     }
+    out.append(&mut ctx.synthetic_schemas);
     Ok(out)
 }
 
@@ -729,6 +762,10 @@ fn lower_inline_schema(
     raw: &RawSchema,
     ctx: &mut LoweringContext,
 ) -> Result<SchemaKind> {
+    if !raw.any_of.is_empty() {
+        return lower_any_of(name, raw, ctx);
+    }
+
     if !raw.one_of.is_empty() {
         return lower_one_of(name, raw, ctx);
     }
@@ -738,7 +775,7 @@ fn lower_inline_schema(
         return Ok(SchemaKind::Object { fields });
     }
 
-    match raw.ty.as_deref() {
+    match primary_type(&raw.ty) {
         Some("object") | None if !raw.properties.is_empty() => {
             let fields = collect_object_fields(raw, ctx)?;
             Ok(SchemaKind::Object { fields })
@@ -781,6 +818,53 @@ fn lower_inline_schema(
     }
 }
 
+fn lower_any_of(
+    parent_name: &str,
+    raw: &RawSchema,
+    ctx: &mut LoweringContext,
+) -> Result<SchemaKind> {
+    let mut variants = Vec::with_capacity(raw.any_of.len());
+    let mut wrapper_schemas = Vec::new(); // to register synthetic schemas later
+
+    for (i, sor) in raw.any_of.iter().enumerate() {
+        let type_ref = lower_type_ref(&format!("{parent_name}_variant_{i}"), sor, ctx)?;
+        match type_ref {
+            // Named references are already valid union variants
+            TypeRef::Named(n) => {
+                variants.push(TypeRef::Named(n));
+            }
+            // Primitives (including enums, maps, arrays) need to be wrapped
+            // in a named schema so Freezed can generate a class for them.
+            other => {
+                let wrapper_name = format!("{parent_name}Variant{i}"); // e.g., "MyFieldVariant0"
+                // Create a simple wrapper schema: a single field called "value"
+                let wrapper = Schema {
+                    name: wrapper_name.clone(),
+                    kind: SchemaKind::Object {
+                        fields: vec![Field {
+                            name: "value".to_string(),
+                            type_ref: other,
+                            required: true,
+                            nullable: false,
+                            is_recursive: false,
+                        }],
+                    },
+                };
+                wrapper_schemas.push(wrapper);
+                variants.push(TypeRef::Named(wrapper_name));
+            }
+        }
+    }
+
+    // Register the wrapper schemas in the lowering context so they are
+    // included in the final Api.schemas list. We'll inject them into the
+    // final schemas vector after the main loop.
+    // For now, add them to a temporary list stored on the context:
+    ctx.synthetic_schemas.extend(wrapper_schemas);
+
+    Ok(SchemaKind::UntaggedUnion { variants })
+}
+
 /// Builds the merged field list for an object schema, honouring `allOf`
 /// and the schema's own `properties` in order.
 ///
@@ -812,7 +896,11 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
         // spec limitation, not ours; specs that need it use an `allOf`
         // wrapper around the ref.
         let is_nullable = match sor {
-            RawSchemaOrRef::Inline(raw) => raw.nullable.unwrap_or(false),
+            RawSchemaOrRef::Inline(raw) => {
+                let mut n = raw.nullable.unwrap_or(false);
+                n |= is_nullable(&raw.ty); // helper that checks if type array contains "null"
+                n
+            }
             RawSchemaOrRef::Ref { .. } => false,
         };
 
@@ -956,6 +1044,14 @@ fn collect_member_fields(sor: &RawSchemaOrRef, ctx: &mut LoweringContext) -> Res
     }
 }
 
+fn primary_type(types: &[String]) -> Option<&str> {
+    types.iter().find(|t| *t != "null").map(String::as_str)
+}
+
+fn is_nullable(types: &[String]) -> bool {
+    types.iter().any(|t| t == "null")
+}
+
 fn lower_type_ref(
     field_name: &str,
     sor: &RawSchemaOrRef,
@@ -978,7 +1074,7 @@ fn lower_type_ref(
                 return Ok(TypeRef::Map(Box::new(value)));
             }
 
-            match raw.ty.as_deref() {
+            match primary_type(&raw.ty) {
                 Some("string") => {
                     if raw.format.as_deref() == Some("date-time") {
                         Ok(TypeRef::DateTime)
@@ -1198,6 +1294,51 @@ components:
     }
 
     #[test]
+    fn anyof_with_primitives_generates_union_and_wrappers() {
+        let yaml = r#"
+openapi: "3.1.0"
+info:
+  title: t
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Example:
+      type: object
+      properties:
+        mixed:
+          anyOf:
+            - type: string
+            - type: integer
+"#;
+        let api = load_str(yaml).expect("should parse");
+        let example = api.schemas.iter().find(|s| s.name == "Example").unwrap();
+        let SchemaKind::Object { fields } = &example.kind else {
+            panic!()
+        };
+        let mixed = fields.iter().find(|f| f.name == "mixed").unwrap();
+        assert!(matches!(mixed.type_ref, TypeRef::Named(_)));
+        if let TypeRef::Named(union_name) = &mixed.type_ref {
+            let union_schema = api.schemas.iter().find(|s| &s.name == union_name).unwrap();
+            assert!(matches!(
+                union_schema.kind,
+                SchemaKind::UntaggedUnion { .. }
+            ));
+            // Check wrapper schemas exist
+            assert!(
+                api.schemas
+                    .iter()
+                    .any(|s| s.name == format!("{union_name}Variant0"))
+            );
+            assert!(
+                api.schemas
+                    .iter()
+                    .any(|s| s.name == format!("{union_name}Variant1"))
+            );
+        }
+    }
+
+    #[test]
     fn ref_property_is_not_nullable() {
         // A bare `$ref` cannot carry `nullable: true` per the OpenAPI 3.0
         // spec. The lowering pass treats refs as non-nullable; specs that
@@ -1391,4 +1532,34 @@ components:
             "expected openIdConnectUrl in error, got: {err}"
         );
     }
+}
+
+#[test]
+fn openapi_31_parses_and_propagates_nullable() {
+    let yaml = r#"
+openapi: "3.1.0"
+info:
+  title: t
+  version: '1'
+paths: {}
+components:
+  schemas:
+    Update:
+      type: object
+      properties:
+        nickname:
+          type: ["string", "null"]
+    "#;
+
+    let api = load_str(yaml).expect("3.1 spec should parse");
+    let schema = api.schemas.iter().find(|s| s.name == "Update").unwrap();
+    let SchemaKind::Object { fields } = &schema.kind else {
+        panic!("expected object");
+    };
+    let nickname = fields.iter().find(|f| f.name == "nickname").unwrap();
+    assert!(
+        nickname.nullable,
+        "field with type: [string, 'null'] must be nullable"
+    );
+    assert!(!nickname.required);
 }
