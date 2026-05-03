@@ -6,6 +6,14 @@
 
 use std::fmt;
 
+#[derive(Debug, Clone)]
+pub enum DefaultValue {
+    String(String),
+    Integer(i64),
+    Number(f64),
+    Boolean(bool),
+}
+
 // ── Top-level ────────────────────────────────────────────────────────────────
 
 /// A fully-resolved API, ready for code generation.
@@ -121,12 +129,31 @@ pub struct RequestBody {
     pub is_multipart: bool,
 }
 
-// ── Responses ────────────────────────────────────────────────────────────────
+// ── Response headers ──────────────────────────────────────────────────────────
+
+/// A single header declared on a response.
+///
+/// OpenAPI allows any header whose schema resolves to a scalar or array of
+/// scalars. v0.1 supports `string`, `integer`, `number`, `boolean`, and
+/// `array<scalar>` — complex object headers are rejected at lowering time.
+#[derive(Debug)]
+pub struct ResponseHeader {
+    /// The wire-side header name, e.g. `"X-Rate-Limit-Remaining"`.
+    pub name: String,
+    pub type_ref: TypeRef,
+    /// Whether the header is guaranteed to be present on every response.
+    /// Emitters use this to decide between `String` and `String?`.
+    pub required: bool,
+}
 
 #[derive(Debug)]
 pub struct Response {
     pub status_code: String,
     pub schema_ref: Option<TypeRef>,
+    /// Response headers declared in the spec for this status code.
+    /// Empty when no `headers:` block is present — the emitter then
+    /// returns the body type directly rather than wrapping in a record.
+    pub headers: Vec<ResponseHeader>,
 }
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
@@ -198,6 +225,10 @@ pub struct Field {
     /// bare class name (no inline typedef wrapping that would break
     /// Freezed's generator).
     pub is_recursive: bool,
+    /// A spec-declared default value for this field, if present and expressible
+    /// as a Dart compile-time constant. `None` when the spec has no `default:`,
+    /// or when the type is too complex (array, object) to inline.
+    pub default_value: Option<DefaultValue>,
 }
 
 impl Field {
@@ -213,6 +244,7 @@ impl Field {
             required,
             nullable: false,
             is_recursive: false,
+            default_value: None,
         }
     }
 }

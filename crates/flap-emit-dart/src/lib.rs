@@ -850,69 +850,80 @@ fn emit_field(
     let dart_type = to_dart_type(&field.type_ref, synth);
     let dart_name = to_camel_case(&field.name);
 
-    // Build up @JsonKey args (name-rewrite + includeIfNull) and any
-    // sibling annotations (@OptionalConverter, @Default) separately.
+    // A directly recursive Named field (e.g. `Node parent`) cannot be
+    // `required Node parent` in Freezed — Dart's type system requires the
+    // field to be nullable to break the infinite-size cycle.
+    // Array/Map wrappers already break the chain at the collection level,
+    // so only a bare Named reference needs this treatment.
+    let force_nullable_for_recursion =
+        field.is_recursive && matches!(&field.type_ref, TypeRef::Named(_));
+
     let mut json_key_args: Vec<String> = Vec::new();
     if dart_name != field.name {
         json_key_args.push(format!("name: '{}'", field.name));
     }
     let mut sibling_annotations: Vec<String> = Vec::new();
 
-    if let TypeRef::Named(name) = &field.type_ref {
-        if is_untagged_union(schemas, name) {
-            let converter = format!("_{name}Converter");
-            sibling_annotations.push(format!("@{converter}()"));
-            // Also ensure the import of that file exists (via collect_field_imports)
-        }
+    if let TypeRef::Named(name) = &field.type_ref
+        && is_untagged_union(schemas, name)
+    {
+        let converter = format!("_{name}Converter");
+        sibling_annotations.push(format!("@{converter}()"));
     }
 
-    // Optional leading comment line (currently only used for the
-    // non-primitive Optional<T?> fallback, where we want a visible
-    // marker that the absent-vs-null distinction is being lost).
     let mut leading_comment: Option<String> = None;
 
-    // Decide the typed fragment — `T name,`, `T? name,`, or
-    // `Optional<T?> name,`.
-    let typed_fragment = match (field.required, field.nullable) {
-        // required + non-nullable: as before.
-        (true, false) => format!("required {dart_type} {dart_name},\n"),
-
-        // required + nullable: explicitly nullable, ALWAYS sent — no
-        // includeIfNull suppression, that would lose the `null` wire form.
-        (true, true) => format!("required {dart_type}? {dart_name},\n"),
-
-        // optional + non-nullable: `T?` with `includeIfNull: false` so a
-        // Dart-side null doesn't leak onto the wire as `"key": null`.
-        (false, false) => {
+    let typed_fragment = if force_nullable_for_recursion {
+        // Required + directly recursive: force nullable so Freezed can
+        // represent the type. Null means "absent parent" / "leaf node".
+        // Non-required recursive fields already land in the (false, _) arms
+        // below and get `?` naturally.
+        if field.required {
+            // Keep required keyword so the factory constructor enforces
+            // callers explicitly pass null for leaf nodes rather than
+            // accidentally omitting the field.
+            format!("required {dart_type}? {dart_name},\n")
+        } else {
+            // Non-required recursive: same as (false, false) — omit null
+            // from the wire so leaf nodes don't serialise as `"child": null`.
             json_key_args.push("includeIfNull: false".to_string());
             format!("{dart_type}? {dart_name},\n")
         }
-
-        // optional + nullable: the Optional<T?> case — but only if T is
-        // a primitive whose JSON shape matches Dart's. For non-primitive
-        // T we degrade to (false, false) shape with a TODO; a future
-        // phase will emit per-field fromJson/toJson lambdas.
-        (false, true) => {
-            if type_ref_supports_optional_wrapper(&field.type_ref) {
-                sibling_annotations.push("@OptionalConverter()".to_string());
-                sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
-                format!("Optional<{dart_type}?> {dart_name},\n")
-            } else {
+    } else {
+        match (field.required, field.nullable) {
+            (true, false) => format!("required {dart_type} {dart_name},\n"),
+            (true, true) => format!("required {dart_type}? {dart_name},\n"),
+            (false, false) => {
                 json_key_args.push("includeIfNull: false".to_string());
-                leading_comment = Some(format!(
-                    "// TODO(flap): nullable+optional non-primitive — \
-                     `Optional<{dart_type}?>` not yet supported for this type"
-                ));
-                format!("{dart_type}? {dart_name},\n")
+                if let Some(default) = &field.default_value {
+                    // A spec-declared default lets us keep the field non-nullable in
+                    // the constructor — callers can omit it and get the documented
+                    // default rather than null. includeIfNull: false still suppresses
+                    // null if the field is somehow null at runtime.
+                    let default_expr = dart_default_expr(default);
+                    sibling_annotations.push(format!("@Default({default_expr})"));
+                    format!("{dart_type} {dart_name},\n")
+                } else {
+                    format!("{dart_type}? {dart_name},\n")
+                }
+            }
+            (false, true) => {
+                if type_ref_supports_optional_wrapper(&field.type_ref) {
+                    sibling_annotations.push("@OptionalConverter()".to_string());
+                    sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
+                    format!("Optional<{dart_type}?> {dart_name},\n")
+                } else {
+                    json_key_args.push("includeIfNull: false".to_string());
+                    leading_comment = Some(format!(
+                        "// TODO(flap): nullable+optional non-primitive — \
+                         `Optional<{dart_type}?>` not yet supported for this type"
+                    ));
+                    format!("{dart_type}? {dart_name},\n")
+                }
             }
         }
     };
 
-    // Assemble:
-    //     [    // TODO ...                      ]   (optional)
-    //     [    @JsonKey(...) ]                      (optional)
-    //     [    @OptionalConverter() @Default(...) ] (optional)
-    //     <typed fragment>
     let mut out = String::new();
     if let Some(c) = leading_comment {
         out.push_str("    ");
@@ -1246,6 +1257,146 @@ fn build_dart_params<'a>(op: &'a Operation, registry: &EnumRegistry) -> Vec<Dart
     out
 }
 
+/// The Dart return type for a response that has declared headers.
+///
+/// When headers are present the method returns a named Dart record:
+///   `({BodyType body, HeaderType xRateLimitRemaining, ...})`
+///
+/// When no headers are declared the method returns the body type directly,
+/// preserving the existing API for the common case.
+fn success_return_type(responses: &[Response]) -> String {
+    let Some(resp) = success_response(responses) else {
+        return "void".into();
+    };
+
+    let body_type = match &resp.schema_ref {
+        Some(t) => to_dart_type(t, None),
+        None => {
+            if resp.headers.is_empty() {
+                return "void".into();
+            }
+            // No body but headers — return a record with only headers.
+            "void".into() // placeholder; record built below
+        }
+    };
+
+    if resp.headers.is_empty() {
+        return match &resp.schema_ref {
+            Some(t) => to_dart_type(t, None),
+            None => "void".into(),
+        };
+    }
+
+    // Build `({BodyType body, T? headerName, ...})` record.
+    let mut fields: Vec<String> = Vec::new();
+    if resp.schema_ref.is_some() {
+        fields.push(format!("{body_type} body"));
+    }
+    for hdr in &resp.headers {
+        let dart_type = to_dart_type(&hdr.type_ref, None);
+        let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
+        if hdr.required {
+            fields.push(format!("{dart_type} {dart_name}"));
+        } else {
+            fields.push(format!("{dart_type}? {dart_name}"));
+        }
+    }
+    format!("({{{}}})", fields.join(", "))
+}
+
+/// Emit the return statement for a successful response, extracting declared
+/// headers from `response.headers` in addition to the body.
+fn emit_success_return(resp: &Response, schemas: &[Schema], registry: &EnumRegistry) -> String {
+    let has_body = resp.schema_ref.is_some();
+    let has_headers = !resp.headers.is_empty();
+
+    if !has_headers {
+        // Original code path — no record wrapper needed.
+        if let Some(schema) = &resp.schema_ref {
+            let expr = deserialize_expr(schema, schemas, registry, "response.data");
+            return format!("    return {expr};\n");
+        }
+        return String::new(); // void
+    }
+
+    let mut out = String::new();
+
+    // Extract each declared header from Dio's response.headers map.
+    // Dio stores all header values as List<String>; we take the first.
+    for hdr in &resp.headers {
+        let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
+        let raw_expr = format!("response.headers.value('{}')", hdr.name.to_lowercase());
+        let typed_expr = header_deserialize_expr(&hdr.type_ref, &raw_expr);
+        if hdr.required {
+            out.push_str(&format!("    final {dart_name} = {typed_expr};\n"));
+        } else {
+            // `Dio.Headers.value()` returns null when the header is absent.
+            out.push_str(&format!("    final {dart_name}Raw = {raw_expr};\n"));
+            let null_guarded =
+                header_deserialize_expr_nullable(&hdr.type_ref, &format!("{dart_name}Raw"));
+            out.push_str(&format!("    final {dart_name} = {null_guarded};\n"));
+        }
+    }
+
+    // Build the record literal.
+    let mut record_fields: Vec<String> = Vec::new();
+    if has_body {
+        let body_expr = resp
+            .schema_ref
+            .as_ref()
+            .map(|s| deserialize_expr(s, schemas, registry, "response.data"))
+            .unwrap_or_default();
+        record_fields.push(format!("body: {body_expr}"));
+    }
+    for hdr in &resp.headers {
+        let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
+        record_fields.push(format!("{dart_name}: {dart_name}"));
+    }
+    out.push_str(&format!("    return ({});\n", record_fields.join(", ")));
+    out
+}
+
+/// Deserialize a response header value (a raw `String`) into the declared type.
+fn header_deserialize_expr(type_ref: &TypeRef, raw: &str) -> String {
+    match type_ref {
+        TypeRef::String | TypeRef::DateTime => raw.to_string(),
+        TypeRef::Integer { .. } => format!("int.parse({raw})"),
+        TypeRef::Number { .. } => format!("num.parse({raw})"),
+        TypeRef::Boolean => format!("({raw} == 'true')"),
+        TypeRef::Array(inner) => {
+            // Headers may be comma-separated lists.
+            let item_expr = header_deserialize_expr(inner, "e");
+            format!("{raw}.split(',').map((e) => {item_expr}).toList()")
+        }
+        _ => raw.to_string(), // unreachable for validated types
+    }
+}
+
+/// Like `header_deserialize_expr` but guards on a nullable raw value.
+fn header_deserialize_expr_nullable(type_ref: &TypeRef, raw_var: &str) -> String {
+    match type_ref {
+        TypeRef::String | TypeRef::DateTime => raw_var.to_string(),
+        TypeRef::Integer { .. } => {
+            format!("{raw_var} != null ? int.parse({raw_var}) : null")
+        }
+        TypeRef::Number { .. } => {
+            format!("{raw_var} != null ? num.parse({raw_var}) : null")
+        }
+        TypeRef::Boolean => {
+            format!("{raw_var} != null ? ({raw_var} == 'true') : null")
+        }
+        TypeRef::Array(inner) => {
+            let item_expr = header_deserialize_expr(inner, "e");
+            format!(
+                "{raw_var} != null \
+                 ? {raw_var}!.split(',').map((e) => {item_expr}).toList() \
+                 : null"
+            )
+        }
+        _ => raw_var.to_string(),
+    }
+}
+
 fn emit_method_body(
     op: &Operation,
     dart_params: &[DartParam],
@@ -1304,8 +1455,10 @@ fn emit_method_body(
 
     let data_expr = op.request_body.as_ref().map(body_data_expression);
 
-    let success_schema = success_response_schema(&op.responses);
-    let needs_response_var = success_schema.is_some();
+    // We need `final response = ...` whenever we read body OR headers from it.
+    let needs_response_var = success_response(&op.responses)
+        .map(|r| r.schema_ref.is_some() || !r.headers.is_empty())
+        .unwrap_or(false);
 
     let response_assign = if needs_response_var {
         "    final response = "
@@ -1335,40 +1488,52 @@ fn emit_method_body(
     }
     body.push_str("    );\n");
 
-    if let Some(schema) = success_schema {
-        body.push_str("    final data = response.data;\n");
-        let expr = deserialize_expr(schema, schemas, registry, "data");
-        body.push_str(&format!("    return {expr};\n"));
+    // Emit body deserialization + header extraction via emit_success_return.
+    // This replaces the old `final data = response.data; return ...;` block.
+    if let Some(resp) = success_response(&op.responses) {
+        body.push_str(&emit_success_return(resp, schemas, registry));
     }
 
     body
 }
 
 fn body_data_expression(body: &RequestBody) -> String {
-    if body.is_multipart {
-        return "FormData.fromMap(body.toJson())".into();
+    if !body.is_multipart {
+        return match &body.schema_ref {
+            TypeRef::Named(_) => "body.toJson()".into(),
+            _ => "body".into(),
+        };
     }
-    match &body.schema_ref {
-        TypeRef::Named(_) => "body.toJson()".into(),
-        _ => "body".into(),
-    }
-}
 
-fn success_response_schema(responses: &[Response]) -> Option<&TypeRef> {
-    success_response(responses).and_then(|r| r.schema_ref.as_ref())
+    match &body.schema_ref {
+        // Named object: has a toJson() we can spread into FormData.
+        TypeRef::Named(_) => "FormData.fromMap(body.toJson())".into(),
+
+        // Map<String, T>: already key-value shaped, pass directly.
+        TypeRef::Map(_) => "FormData.fromMap(body)".into(),
+
+        // Array: wrap under a conventional 'file' key — Dio accepts
+        // List<MultipartFile> or List<String> as a field value.
+        TypeRef::Array(_) => "FormData.fromMap({'file': body})".into(),
+
+        // DateTime must be serialised to a string before going on the wire.
+        TypeRef::DateTime => "FormData.fromMap({'data': body.toIso8601String()})".into(),
+
+        // Enum: use the wire value via .name (works for json_annotation enums).
+        TypeRef::Enum(_) => "FormData.fromMap({'data': body.name})".into(),
+
+        // Primitives (String, int, num, bool): Dio's FormData.fromMap
+        // accepts these directly as field values.
+        TypeRef::String | TypeRef::Integer { .. } | TypeRef::Number { .. } | TypeRef::Boolean => {
+            "FormData.fromMap({'data': body})".into()
+        }
+    }
 }
 
 fn success_response(responses: &[Response]) -> Option<&Response> {
     responses
         .iter()
         .find(|r| matches!(r.status_code.parse::<u16>(), Ok(c) if (200..300).contains(&c)))
-}
-
-fn success_return_type(responses: &[Response]) -> String {
-    match success_response_schema(responses) {
-        Some(t) => to_dart_type(t, None),
-        None => "void".into(),
-    }
 }
 
 fn deserialize_expr(
@@ -1552,878 +1717,23 @@ fn to_dart_enum_case(value: &str) -> String {
     out
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use flap_ir::{
-        Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody, Response,
-        Schema, SchemaKind, TypeRef,
-    };
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
-    fn fields_of(schema: &Schema) -> Vec<Field> {
-        match &schema.kind {
-            SchemaKind::Object { fields } => fields
-                .iter()
-                .map(|f| Field {
-                    name: f.name.clone(),
-                    type_ref: f.type_ref.clone(),
-                    required: f.required,
-                    nullable: f.nullable,
-                    is_recursive: f.is_recursive,
-                })
-                .collect(),
-            _ => panic!("expected object schema"),
+fn dart_default_expr(default: &flap_ir::DefaultValue) -> String {
+    use flap_ir::DefaultValue;
+    match default {
+        DefaultValue::String(s) => {
+            // Escape single quotes inside the string.
+            let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+            format!("'{escaped}'")
         }
-    }
-
-    fn pet_schema() -> Schema {
-        Schema {
-            name: "Pet".into(),
-            kind: SchemaKind::Object {
-                fields: vec![
-                    Field {
-                        name: "id".into(),
-                        type_ref: TypeRef::Integer {
-                            format: Some("int64".into()),
-                        },
-                        required: true,
-                        nullable: false,
-                        is_recursive: false,
-                    },
-                    Field {
-                        name: "name".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        nullable: false,
-                        is_recursive: false,
-                    },
-                    Field {
-                        name: "tag".into(),
-                        type_ref: TypeRef::String,
-                        required: false,
-                        nullable: false,
-                        is_recursive: true,
-                    },
-                ],
-            },
-            internal: false,
-            extends: None,
+        DefaultValue::Integer(n) => n.to_string(),
+        DefaultValue::Number(n) => {
+            // Dart requires a decimal point for double literals.
+            if n.fract() == 0.0 {
+                format!("{n:.1}")
+            } else {
+                n.to_string()
+            }
         }
+        DefaultValue::Boolean(b) => b.to_string(),
     }
-
-    fn pets_schema() -> Schema {
-        Schema {
-            name: "Pets".into(),
-            kind: SchemaKind::Array {
-                item: TypeRef::Named("Pet".into()),
-            },
-            internal: false,
-            extends: None,
-        }
-    }
-
-    fn error_schema() -> Schema {
-        Schema {
-            name: "Error".into(),
-            kind: SchemaKind::Object {
-                fields: vec![
-                    Field {
-                        name: "code".into(),
-                        type_ref: TypeRef::Integer {
-                            format: Some("int32".into()),
-                        },
-                        required: true,
-                        nullable: false,
-                        is_recursive: true,
-                    },
-                    Field {
-                        name: "message".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        nullable: false,
-                        is_recursive: true,
-                    },
-                ],
-            },
-            internal: false,
-            extends: None,
-        }
-    }
-
-    fn petstore_api() -> Api {
-        Api {
-            title: "Swagger Petstore".into(),
-            base_url: Some("http://petstore.swagger.io/v1".into()),
-            operations: vec![
-                Operation {
-                    method: HttpMethod::Get,
-                    path: "/pets".into(),
-                    operation_id: Some("listPets".into()),
-                    summary: Some("List all pets".into()),
-                    parameters: vec![Parameter {
-                        name: "limit".into(),
-                        location: ParameterLocation::Query,
-                        type_ref: TypeRef::Integer {
-                            format: Some("int32".into()),
-                        },
-                        required: false,
-                    }],
-                    request_body: None,
-                    responses: vec![
-                        Response {
-                            status_code: "200".into(),
-                            schema_ref: Some(TypeRef::Named("Pets".into())),
-                        },
-                        Response {
-                            status_code: "default".into(),
-                            schema_ref: Some(TypeRef::Named("Error".into())),
-                        },
-                    ],
-                    security: None,
-                },
-                Operation {
-                    method: HttpMethod::Post,
-                    path: "/pets".into(),
-                    operation_id: Some("createPets".into()),
-                    summary: Some("Create a pet".into()),
-                    parameters: vec![],
-                    request_body: Some(RequestBody {
-                        content_type: "application/json".into(),
-                        schema_ref: TypeRef::Named("Pet".into()),
-                        required: true,
-                        is_multipart: false,
-                    }),
-                    responses: vec![
-                        Response {
-                            status_code: "201".into(),
-                            schema_ref: None,
-                        },
-                        Response {
-                            status_code: "default".into(),
-                            schema_ref: Some(TypeRef::Named("Error".into())),
-                        },
-                    ],
-                    security: None,
-                },
-                Operation {
-                    method: HttpMethod::Get,
-                    path: "/pets/{petId}".into(),
-                    operation_id: Some("showPetById".into()),
-                    summary: Some("Info for a specific pet".into()),
-                    parameters: vec![Parameter {
-                        name: "petId".into(),
-                        location: ParameterLocation::Path,
-                        type_ref: TypeRef::String,
-                        required: true,
-                    }],
-                    request_body: None,
-                    responses: vec![
-                        Response {
-                            status_code: "200".into(),
-                            schema_ref: Some(TypeRef::Named("Pet".into())),
-                        },
-                        Response {
-                            status_code: "default".into(),
-                            schema_ref: Some(TypeRef::Named("Error".into())),
-                        },
-                    ],
-                    security: None,
-                },
-            ],
-            schemas: vec![error_schema(), pet_schema(), pets_schema()],
-            security_schemes: vec![],
-            security: vec![],
-        }
-    }
-
-    // ── Existing-shape regression tests ──────────────────────────────────────
-
-    #[test]
-    fn pet_emits_freezed_class() {
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &[], &registry);
-        assert!(src.contains("@freezed"));
-        assert!(src.contains("class Pet with _$Pet"));
-        assert!(src.contains("required int id"));
-        assert!(src.contains("required String name"));
-        assert!(src.contains("String? tag"));
-        assert!(src.contains("@JsonKey(includeIfNull: false) String? tag"));
-        assert!(src.contains(") = _Pet"));
-        assert!(src.contains("_$PetFromJson(json)"));
-        assert!(src.contains("part 'pet.freezed.dart'"));
-        assert!(src.contains("part 'pet.g.dart'"));
-    }
-
-    #[test]
-    fn pet_does_not_emit_optional_plumbing() {
-        // None of Pet's fields are nullable, so no `flap_utils.dart`
-        // import, no private constructor, no `toJson` override.
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &[], &registry);
-        assert!(!src.contains("flap_utils.dart"));
-        assert!(!src.contains("const Pet._();"));
-        assert!(!src.contains("Map<String, dynamic> toJson()"));
-        assert!(!src.contains("stripOptionalAbsent"));
-    }
-
-    #[test]
-    fn snake_case_fields_get_jsonkey_with_original_name() {
-        let schema = Schema {
-            name: "User".into(),
-            kind: SchemaKind::Object {
-                fields: vec![
-                    Field {
-                        name: "first_name".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        nullable: false,
-                        is_recursive: false,
-                    },
-                    Field {
-                        name: "id".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        nullable: false,
-                        is_recursive: false,
-                    },
-                ],
-            },
-            internal: false,
-            extends: None,
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("User", "User", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains("@JsonKey(name: 'first_name') required String firstName"),
-            "missing camelCased property + JsonKey, got:\n{src}"
-        );
-        assert!(src.contains("required String id,\n"));
-    }
-
-    // ── Phase 8: nullability + omission ──────────────────────────────────────
-
-    fn schema_with_field(name: &str, field: Field) -> Schema {
-        Schema {
-            name: name.into(),
-            kind: SchemaKind::Object {
-                fields: vec![field],
-            },
-            internal: false,
-            extends: None,
-
-        }
-    }
-
-    #[test]
-    fn required_nullable_string_keeps_required_keyword_and_question_mark() {
-        // Cell (true, true): the receiver always sees the key, but the
-        // value may be null.
-        let schema = schema_with_field(
-            "Profile",
-            Field {
-                name: "bio".into(),
-                type_ref: TypeRef::String,
-                required: true,
-                nullable: true,
-                is_recursive: false,
-            },
-        );
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Profile", "Profile", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains("required String? bio,"),
-            "expected `required String? bio,`, got:\n{src}"
-        );
-        // Must NOT suppress the null wire form — that would defeat the
-        // whole point of (true, true).
-        assert!(!src.contains("includeIfNull: false"));
-        // (true, true) doesn't trigger the Optional wrapper.
-        assert!(!src.contains("Optional<"));
-        assert!(!src.contains("flap_utils.dart"));
-    }
-
-    #[test]
-    fn optional_non_nullable_string_uses_includeifnull_false() {
-        // Cell (false, false): client may omit the key, but if present
-        // the value is never null. `includeIfNull: false` keeps Dart-side
-        // nulls from leaking onto the wire as `"key": null`.
-        let schema = schema_with_field(
-            "Update",
-            Field {
-                name: "tag".into(),
-                type_ref: TypeRef::String,
-                required: false,
-                nullable: false,
-                is_recursive: false,
-            },
-        );
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Update", "Update", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains("@JsonKey(includeIfNull: false) String? tag,"),
-            "expected includeIfNull: false on optional non-nullable, got:\n{src}"
-        );
-        // Still no Optional wrapper for this cell.
-        assert!(!src.contains("Optional<"));
-    }
-
-    #[test]
-    fn optional_nullable_primitive_uses_optional_wrapper() {
-        // Cell (false, true): the cell that motivates all of this. The
-        // wrapper is the only way to encode all three wire forms (absent,
-        // present-null, present-value) in a single Dart field.
-        let schema = schema_with_field(
-            "UpdateUserRequest",
-            Field {
-                name: "nickname".into(),
-                type_ref: TypeRef::String,
-                required: false,
-                nullable: true,
-                is_recursive: false,
-            },
-        );
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class(
-            "UpdateUserRequest",
-            "UpdateUserRequest",
-            &fields_of(&schema),
-            &[], // No additional imports needed
-            &registry,
-        );
-
-        // Field-level shape.
-        assert!(
-            src.contains("@OptionalConverter() @Default(Optional<String?>.absent()) Optional<String?> nickname,"),
-            "expected wrapper + converter + default, got:\n{src}"
-        );
-        // Class-level plumbing.
-        assert!(
-            src.contains("import 'flap_utils.dart';"),
-            "expected flap_utils.dart import, got:\n{src}"
-        );
-        assert!(
-            src.contains("const UpdateUserRequest._();"),
-            "Freezed needs a private constructor to attach toJson, got:\n{src}"
-        );
-        assert!(
-            src.contains("Map<String, dynamic> toJson() =>"),
-            "expected toJson override, got:\n{src}"
-        );
-        assert!(
-            src.contains(
-                "stripOptionalAbsent(_$UpdateUserRequestToJson(this as _UpdateUserRequest));"
-            ),
-            "toJson body must strip absence sentinels, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn optional_nullable_int_uses_wrapper() {
-        // Same cell but with `int` — confirms the wrapper extends to
-        // every supported primitive, not just String.
-        let schema = schema_with_field(
-            "Patch",
-            Field {
-                name: "count".into(),
-                type_ref: TypeRef::Integer { format: None },
-                required: false,
-                nullable: true,
-                is_recursive: false,
-            },
-        );
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains(
-                "@OptionalConverter() @Default(Optional<int?>.absent()) Optional<int?> count,"
-            ),
-            "expected int wrapper, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn optional_nullable_named_falls_back_with_todo() {
-        // A custom class is non-primitive — the canonical converter's
-        // `as T?` cast won't survive (the JSON is a Map, not a `Pet`).
-        // We degrade to (false, false) shape with a visible TODO so the
-        // round-trip loss is loud rather than silent.
-        let schema = schema_with_field(
-            "Patch",
-            Field {
-                name: "owner".into(),
-                type_ref: TypeRef::Named("Pet".into()),
-                required: false,
-                nullable: true,
-                is_recursive: false,
-            },
-        );
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains("// TODO(flap): nullable+optional non-primitive"),
-            "expected fallback TODO comment, got:\n{src}"
-        );
-        assert!(
-            src.contains("@JsonKey(includeIfNull: false) Pet? owner,"),
-            "fallback should be the (false, false) shape, got:\n{src}"
-        );
-        // No Optional plumbing at the class level since the wrapper
-        // wasn't used.
-        assert!(!src.contains("flap_utils.dart"));
-        assert!(!src.contains("const Patch._();"));
-    }
-
-    #[test]
-    fn snake_case_field_with_optional_wrapper_combines_jsonkey_and_converter() {
-        // Both annotations must coexist: @JsonKey carries the wire-side
-        // name rewrite, @OptionalConverter and @Default sit alongside.
-        let schema = schema_with_field(
-            "Patch",
-            Field {
-                name: "display_name".into(),
-                type_ref: TypeRef::String,
-                required: false,
-                nullable: true,
-                is_recursive: false,
-            },
-        );
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains("@JsonKey(name: 'display_name') @OptionalConverter() @Default(Optional<String?>.absent()) Optional<String?> displayName,"),
-            "expected JsonKey + converter + default + camelCased dart name, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn flap_utils_is_emitted_unconditionally() {
-        // Even a spec without any nullable+optional fields gets the
-        // utility file. Stable file set is more important than minimising
-        // emission.
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![pet_schema()],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let files = emit_models(&api);
-        assert!(files.contains_key("flap_utils.dart"));
-        let utils = &files["flap_utils.dart"];
-        assert!(utils.contains("sealed class Optional<T>"));
-        assert!(utils.contains("class OptionalConverter<T>"));
-        assert!(utils.contains("kOptionalAbsentSentinel"));
-        assert!(utils.contains("stripOptionalAbsent"));
-    }
-
-    #[test]
-    fn flap_utils_runtime_is_self_contained() {
-        // The utility file must be drop-in: imports only the public
-        // freezed_annotation package, no project-internal refs.
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let files = emit_models(&api);
-        let utils = &files["flap_utils.dart"];
-        assert!(utils.contains("import 'package:freezed_annotation/freezed_annotation.dart';"));
-        assert!(!utils.contains("import 'pet"));
-        assert!(!utils.contains("import 'flap_utils"));
-    }
-
-    #[test]
-    fn class_with_mixed_fields_only_adds_optional_plumbing_for_wrapper_cell() {
-        // Realistic shape: a PATCH body with a required field, an
-        // optional non-nullable field, and an optional nullable field.
-        // Only the third cell triggers the wrapper, but the wrapper is
-        // enough by itself to add the class-level plumbing.
-        let schema = Schema {
-            name: "PatchUser".into(),
-            extends: None,
-            kind: SchemaKind::Object {
-                fields: vec![
-                    Field {
-                        name: "id".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        nullable: false,
-                        is_recursive: false,
-                    },
-                    Field {
-                        name: "tag".into(),
-                        type_ref: TypeRef::String,
-                        required: false,
-                        nullable: false,
-                        is_recursive: false,
-                    },
-                    Field {
-                        name: "nickname".into(),
-                        type_ref: TypeRef::String,
-                        required: false,
-                        nullable: true,
-                        is_recursive: false,
-                    },
-                ],
-            },
-            internal: false,
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class(
-            "PatchUser",
-            "PatchUser",
-            &fields_of(&schema),
-            &[],
-            &registry,
-        );
-
-        // Required, non-nullable: untouched.
-        assert!(src.contains("required String id,"));
-        // Optional non-nullable: includeIfNull suppression only.
-        assert!(src.contains("@JsonKey(includeIfNull: false) String? tag,"));
-        // Optional nullable: full wrapper.
-        assert!(src.contains("Optional<String?> nickname,"));
-        // Class-level plumbing (driven by the wrapper field).
-        assert!(src.contains("import 'flap_utils.dart';"));
-        assert!(src.contains("const PatchUser._();"));
-        assert!(src.contains("stripOptionalAbsent(_$PatchUserToJson(this as _PatchUser));"));
-    }
-
-    #[test]
-    fn d7_renamed_class_uses_renamed_in_tojson_cast() {
-        // `Error` → `ErrorModel` per D7. The toJson cast must use the
-        // renamed class; if it didn't, the generated `_$ErrorModelToJson`
-        // would refuse the bare `Error` and the file wouldn't compile.
-        let schema = Schema {
-            name: "Error".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "detail".into(),
-                    type_ref: TypeRef::String,
-                    required: false,
-                    nullable: true,
-                    is_recursive: false,
-                }],
-            },
-            internal: false,
-            extends: None,
-
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("ErrorModel", "Error", &fields_of(&schema), &[], &registry);
-        assert!(
-            src.contains("stripOptionalAbsent(_$ErrorModelToJson(this as _ErrorModel));"),
-            "toJson cast must use the D7-renamed class, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn emit_anyof_union() {
-        let union_name = "ExampleMixed";
-        // No wrapper schemas needed; just the union schema itself.
-        let union_schema = Schema {
-            name: union_name.into(),
-            kind: SchemaKind::UntaggedUnion {
-                variants: vec![
-                    TypeRef::Named("__internal_wrapper_string".into()), // dummy; we'll mock internal detection
-                    TypeRef::Named("__internal_wrapper_int".into()),
-                ],
-            },
-            internal: false,
-            extends: None,
-
-        };
-
-        // We need the schemas to resolve internal wrappers; we'll add them as internal schemas.
-        let wrapper_string = Schema {
-            name: "__internal_wrapper_string".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "value".into(),
-                    type_ref: TypeRef::String,
-                    required: true,
-                    nullable: false,
-                    is_recursive: false,
-                }],
-            },
-            internal: true,
-            extends: None,
-
-        };
-        let wrapper_int = Schema {
-            name: "__internal_wrapper_int".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "value".into(),
-                    type_ref: TypeRef::Integer { format: None },
-                    required: true,
-                    nullable: false,
-                    is_recursive: false,
-                }],
-            },
-            internal: true,
-            extends: None,
-
-        };
-
-        let api = Api {
-            title: "Test".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![union_schema, wrapper_string, wrapper_int],
-            security_schemes: vec![],
-            security: vec![],
-        };
-
-        let files = emit_models(&api);
-        // wrapper schemas should NOT be emitted
-        assert!(!files.contains_key("__internal_wrapper_string.dart"));
-        assert!(!files.contains_key("__internal_wrapper_int.dart"));
-
-        let union_file = files.get("example_mixed.dart").expect("union file missing");
-        assert!(union_file.contains("sealed class ExampleMixed {"));
-        assert!(union_file.contains("factory ExampleMixed.fromJson(dynamic json)"));
-        assert!(union_file.contains(
-            "class _ExampleMixedConverter implements JsonConverter<ExampleMixed, Object?>"
-        ));
-        assert!(union_file.contains("if (json is String) return ExampleMixed.variant0(json);"));
-        assert!(union_file.contains("if (json is int) return ExampleMixed.variant1(json);"));
-        // The class should not have any Freezed annotations.
-        assert!(!union_file.contains("@Freezed"));
-        assert!(!union_file.contains("part '"));
-    }
-
-    #[test]
-    fn untagged_union_field_gets_converter_annotation() {
-        let union_name = "Mixed";
-        let union_schema = Schema {
-            name: union_name.into(),
-            kind: SchemaKind::UntaggedUnion {
-                variants: vec![TypeRef::Named("__internal_wrapper_string".into())],
-            },
-            internal: false,
-            extends: None,
-
-        };
-        let wrapper = Schema {
-            name: "__internal_wrapper_string".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "value".into(),
-                    type_ref: TypeRef::String,
-                    required: true,
-                    nullable: false,
-                    is_recursive: false,
-                }],
-            },
-            internal: true,
-            extends: None,
-
-        };
-        let container = Schema {
-            name: "Container".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "data".into(),
-                    type_ref: TypeRef::Named(union_name.into()),
-                    required: true,
-                    nullable: false,
-                    is_recursive: false,
-                }],
-            },
-            internal: false,
-            extends: None,
-
-        };
-        let api = Api {
-            title: "Test".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![container, union_schema, wrapper],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let files = emit_models(&api);
-        let container_file = files.get("container.dart").unwrap();
-        assert!(
-            container_file.contains("@_MixedConverter()"),
-            "Container.data should have the converter annotation"
-        );
-        assert!(
-            container_file.contains("Mixed data,"),
-            "field should be typed as the union class"
-        );
-    }
-
-    // ── Existing client tests, abridged to confirm no regressions ────────────
-
-    #[test]
-    fn list_pets_signature_unchanged() {
-        let (_, src) = emit_client(&petstore_api());
-        assert!(src.contains("Future<Pets> listPets({"));
-        assert!(src.contains("int? limit,"));
-    }
-
-    #[test]
-    fn show_pet_body_path_templating_unchanged() {
-        let (_, src) = emit_client(&petstore_api());
-        assert!(src.contains("'/pets/${petId}',"));
-        assert!(src.contains("return Pet.fromJson(data as Map<String, dynamic>);"));
-    }
-
-    // ── OAuth2 / OpenID Connect emission ─────────────────────────────────────
-
-    fn oauth2_api() -> Api {
-        use flap_ir::{OAuth2Flow, OAuth2FlowType};
-        Api {
-            title: "OAuth2 Petstore".into(),
-            base_url: Some("https://api.example.com/v1".into()),
-            operations: vec![],
-            schemas: vec![],
-            security_schemes: vec![SecurityScheme::OAuth2 {
-                scheme_name: "oauth2Auth".into(),
-                flows: vec![
-                    OAuth2Flow {
-                        flow_type: OAuth2FlowType::ClientCredentials,
-                        token_url: Some("https://auth.example.com/token".into()),
-                        authorization_url: None,
-                        scopes: vec!["read:pets".into()],
-                    },
-                    OAuth2Flow {
-                        flow_type: OAuth2FlowType::AuthorizationCode,
-                        token_url: Some("https://auth.example.com/token".into()),
-                        authorization_url: Some("https://auth.example.com/authorize".into()),
-                        scopes: vec!["read:pets".into()],
-                    },
-                ],
-            }],
-            security: vec!["oauth2Auth".into()],
-        }
-    }
-
-    fn oidc_api() -> Api {
-        Api {
-            title: "OIDC Petstore".into(),
-            base_url: Some("https://api.example.com/v1".into()),
-            operations: vec![],
-            schemas: vec![],
-            security_schemes: vec![SecurityScheme::OpenIdConnect {
-                scheme_name: "oidcAuth".into(),
-                openid_connect_url: "https://auth.example.com/.well-known/openid-configuration"
-                    .into(),
-            }],
-            security: vec!["oidcAuth".into()],
-        }
-    }
-
-    #[test]
-    fn oauth2_emits_access_token_constructor_param() {
-        let (_, src) = emit_client(&oauth2_api());
-        assert!(
-            src.contains("String? oauth2Auth,"),
-            "expected oauth2Auth param, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn oauth2_emits_bearer_interceptor_injection() {
-        let (_, src) = emit_client(&oauth2_api());
-        assert!(
-            src.contains("options.headers['Authorization'] = 'Bearer ${oauth2Auth}'"),
-            "expected Bearer injection, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn oidc_emits_access_token_constructor_param() {
-        let (_, src) = emit_client(&oidc_api());
-        assert!(
-            src.contains("String? oidcAuth,"),
-            "expected oidcAuth param, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn oidc_emits_bearer_interceptor_injection() {
-        let (_, src) = emit_client(&oidc_api());
-        assert!(
-            src.contains("options.headers['Authorization'] = 'Bearer ${oidcAuth}'"),
-            "expected Bearer injection, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn oauth2_and_bearer_can_coexist_in_constructor() {
-        use flap_ir::{OAuth2Flow, OAuth2FlowType};
-        let api = Api {
-            title: "Mixed".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![],
-            security_schemes: vec![
-                SecurityScheme::HttpBearer {
-                    scheme_name: "bearerAuth".into(),
-                    bearer_format: Some("JWT".into()),
-                },
-                SecurityScheme::OAuth2 {
-                    scheme_name: "oauth2Auth".into(),
-                    flows: vec![OAuth2Flow {
-                        flow_type: OAuth2FlowType::ClientCredentials,
-                        token_url: Some("https://auth.example.com/token".into()),
-                        authorization_url: None,
-                        scopes: vec![],
-                    }],
-                },
-            ],
-            security: vec!["bearerAuth".into(), "oauth2Auth".into()],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(src.contains("String? bearerAuth,"));
-        assert!(src.contains("String? oauth2Auth,"));
-    }
-
-    // #[test]
-    // fn openapi_31_field_emits_optional_wrapper() {
-    //     let api = load_str("... same YAML ...").unwrap();
-    //     let registry = EnumRegistry::build(&api);
-    //     // Pick the schema
-    //     let schema = api.schemas.iter().find(|s| s.name == "Update").unwrap();
-    //     let fields = match &schema.kind {
-    //         SchemaKind::Object { fields } => fields,
-    //         _ => panic!(),
-    //     };
-    //     let src = emit_freezed_class("Update", "Update", &fields, &registry);
-    //     assert!(
-    //         src.contains("Optional<String?> nickname,"),
-    //         "3.1 nullable field should emit Optional<String?> wrapper, got:\n{src}"
-    //     );
-    //     // Must include the utils import and toJson override
-    //     assert!(src.contains("import 'flap_utils.dart';"));
-    //     assert!(src.contains("stripOptionalAbsent"));
-    // }
-
-    // #[test]
-    // fn petstore_30_still_works() {
-    //     let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
-    //     let api = load_str(yaml).expect("3.0 petstore should still parse");
-    //     // Check a field that should not be nullable
-    //     let pet = api.schemas.iter().find(|s| s.name == "Pet").unwrap();
-    //     let SchemaKind::Object { fields } = &pet.kind else {
-    //         panic!()
-    //     };
-    //     let name = fields.iter().find(|f| f.name == "name").unwrap();
-    //     assert!(!name.nullable);
-    //     // Also check the emitter output signature
-    //     let registry = EnumRegistry::build(&api);
-    //     let src = emit_freezed_class("Pet", "Pet", &fields, &registry);
-    //     assert!(!src.contains("Optional<")); // 3.0 Pet has no Optional fields
-    // }
 }

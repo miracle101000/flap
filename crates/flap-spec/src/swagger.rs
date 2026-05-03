@@ -21,6 +21,7 @@ pub struct SwaggerSpec {
     pub security: Vec<BTreeMap<String, Vec<String>>>,
 }
 
+#[derive(Clone)]
 pub struct SwaggerContext<'a> {
     pub definitions: &'a BTreeMap<String, SwaggerSchemaOrRef>,
     pub visiting: HashSet<String>,
@@ -32,6 +33,11 @@ impl<'a> SwaggerContext<'a> {
             definitions,
             visiting: HashSet::new(),
         }
+    }
+    pub fn with_visiting(&self, name: &str) -> Self {
+        let mut child = self.clone();
+        child.visiting.insert(name.to_string());
+        child
     }
 }
 

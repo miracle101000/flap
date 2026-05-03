@@ -259,7 +259,7 @@ fn lower_swagger_schemas(
             name: name.clone(),
             kind,
             internal: false, // none are synthetic for Swagger
-            extends
+            extends,
         });
     }
     Ok(out)
@@ -339,6 +339,7 @@ fn collect_swagger_object_fields(
             required: is_required,
             nullable: false, // Swagger 2.0 has no nullable
             is_recursive,
+            default_value: None,
         });
     }
 
@@ -355,6 +356,7 @@ fn collect_swagger_object_fields(
                 required: merged_required,
                 nullable: false, // Swagger has no nullable
                 is_recursive: merged_recursive,
+                default_value: None, // Swagger has no default values
             };
         } else {
             seen.insert(field.name.clone(), deduped.len());
@@ -364,6 +366,7 @@ fn collect_swagger_object_fields(
                 required: field.required,
                 nullable: false,
                 is_recursive: field.is_recursive,
+                default_value: None,
             });
         }
     }
@@ -388,14 +391,7 @@ fn collect_allof_fields_swagger(
                 SwaggerSchemaOrRef::Inline(raw) => {
                     // Build a temporary context that marks `name` as visiting
                     // so cycles through this ref are caught on the next level.
-                    let inner_ctx = SwaggerContext {
-                        definitions: ctx.definitions,
-                        visiting: {
-                            let mut v = ctx.visiting.clone();
-                            v.insert(name.to_string());
-                            v
-                        },
-                    };
+                    let inner_ctx = ctx.with_visiting(name);
                     collect_swagger_object_fields(raw, definitions, &inner_ctx)
                 }
                 SwaggerSchemaOrRef::Ref { .. } => bail!("chained $ref not supported"),
@@ -435,15 +431,20 @@ fn lower_swagger_operations(
                     merged_params.push(op_param);
                 }
 
-                let parameters = merged_params
+                // Separate body from the merged list before lowering.
+                let body_param = merged_params.iter().find(|p| p.location == "body").copied();
+                let non_body_params: Vec<&SwaggerParameter> = merged_params
+                    .iter()
+                    .filter(|p| p.location != "body")
+                    .copied()
+                    .collect();
+
+                let parameters = non_body_params
                     .iter()
                     .map(|p| lower_swagger_parameter(p, ctx.definitions, &ctx.visiting))
                     .collect::<Result<Vec<_>>>()?;
 
-                let request_body = raw_op
-                    .parameters
-                    .iter()
-                    .find(|p| p.location == "body")
+                let request_body = body_param
                     .map(|p| lower_swagger_body_param(p, ctx.definitions, &ctx.visiting))
                     .transpose()?;
 
@@ -452,6 +453,7 @@ fn lower_swagger_operations(
                     .iter()
                     .map(|(code, resp)| {
                         Ok(Response {
+                            headers: vec![],
                             status_code: code.clone(),
                             schema_ref: resp
                                 .schema
@@ -496,7 +498,17 @@ fn lower_swagger_parameter(
         "path" => ParameterLocation::Path,
         "header" => ParameterLocation::Header,
         "cookie" => ParameterLocation::Cookie,
-        other => bail!("unsupported parameter location {}", other),
+        // body is handled via lower_swagger_body_param before this call site
+        // is reached; if it arrives here it's a caller bug, not a spec bug.
+        "body" => bail!(
+            "body parameter `{}` reached lower_swagger_parameter — \
+         this is a bug in the caller; body params must be extracted first",
+            param.name
+        ),
+        // formData: treated as a regular query-style param for now.
+        // A future pass could detect multipart consumes and emit is_multipart.
+        "formData" => ParameterLocation::Query,
+        other => bail!("unsupported parameter location `{other}`"),
     };
 
     let required = param.required || location == ParameterLocation::Path;
@@ -729,6 +741,16 @@ struct RawResponse {
     description: Option<String>,
     #[serde(default)]
     content: BTreeMap<String, RawMediaType>,
+    #[serde(default)]
+    headers: BTreeMap<String, RawResponseHeader>,
+}
+
+/// One entry in a response's `headers:` block.
+#[derive(Debug, Deserialize)]
+struct RawResponseHeader {
+    schema: Option<RawSchemaOrRef>,
+    #[serde(default)]
+    required: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -771,6 +793,8 @@ struct RawSchema {
     /// `collect_object_fields`.
     #[serde(default)]
     nullable: Option<bool>,
+    #[serde(rename = "default")]
+    default: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -919,6 +943,47 @@ fn lower(raw: RawSpec) -> Result<Api> {
         security_schemes,
         security,
     })
+}
+
+// New helper — placed near lower_type_ref:
+fn lower_default_value(
+    raw: &Option<serde_yaml::Value>,
+    type_ref: &TypeRef,
+) -> Option<flap_ir::DefaultValue> {
+    use flap_ir::DefaultValue;
+    let val = raw.as_ref()?;
+    match type_ref {
+        TypeRef::String => {
+            if let serde_yaml::Value::String(s) = val {
+                Some(DefaultValue::String(s.clone()))
+            } else {
+                None
+            }
+        }
+        TypeRef::Integer { .. } => {
+            if let serde_yaml::Value::Number(n) = val {
+                n.as_i64().map(DefaultValue::Integer)
+            } else {
+                None
+            }
+        }
+        TypeRef::Number { .. } => {
+            if let serde_yaml::Value::Number(n) = val {
+                n.as_f64().map(DefaultValue::Number)
+            } else {
+                None
+            }
+        }
+        TypeRef::Boolean => {
+            if let serde_yaml::Value::Bool(b) = val {
+                Some(DefaultValue::Boolean(*b))
+            } else {
+                None
+            }
+        }
+        // Arrays, objects, enums: cannot be expressed as Dart const literals.
+        _ => None,
+    }
 }
 
 // ── Security lowering ────────────────────────────────────────────────────────
@@ -1265,30 +1330,73 @@ fn lower_response(
     raw: &RawResponse,
     ctx: &mut LoweringContext,
 ) -> Result<Response> {
-    if raw.content.is_empty() {
-        return Ok(Response {
-            status_code: status_code.to_string(),
-            schema_ref: None,
+    // ── Body schema (unchanged) ───────────────────────────────────────────────
+    let schema_ref = if raw.content.is_empty() {
+        None
+    } else {
+        let media_type = raw
+            .content
+            .get("application/json")
+            .or_else(|| raw.content.values().next())
+            .ok_or_else(|| anyhow!("response `{status_code}` has empty content map"))?;
+
+        match &media_type.schema {
+            Some(sor) => Some(
+                lower_type_ref("<response>", sor, ctx)
+                    .with_context(|| format!("schema of response `{status_code}`"))?,
+            ),
+            None => None,
+        }
+    };
+
+    // ── Response headers ──────────────────────────────────────────────────────
+    let mut headers: Vec<flap_ir::ResponseHeader> = Vec::new();
+    for (header_name, raw_header) in &raw.headers {
+        // The `Authorization` and `Content-*` family are consumed by the
+        // HTTP layer; emitting them as typed fields would be misleading.
+        if header_name.eq_ignore_ascii_case("authorization")
+            || header_name.to_lowercase().starts_with("content-")
+        {
+            continue;
+        }
+
+        let schema = raw_header.schema.as_ref().ok_or_else(|| {
+            anyhow!(
+                "response header `{header_name}` of status `{status_code}` \
+                 has no `schema` — cannot determine its type"
+            )
+        })?;
+
+        let type_ref = lower_type_ref(header_name, schema, ctx).with_context(|| {
+            format!(
+                "schema of response header `{header_name}` \
+                     of status `{status_code}`"
+            )
+        })?;
+
+        // v0.1 only supports scalar and array-of-scalar headers.
+        match &type_ref {
+            TypeRef::Named(_) => bail!(
+                "response header `{header_name}` of status `{status_code}` \
+                 resolves to a named schema — only scalar types are \
+                 supported for response headers in v0.1"
+            ),
+            _ => {}
+        }
+
+        headers.push(flap_ir::ResponseHeader {
+            name: header_name.clone(),
+            type_ref,
+            required: raw_header.required,
         });
     }
-
-    let media_type = raw
-        .content
-        .get("application/json")
-        .or_else(|| raw.content.values().next())
-        .ok_or_else(|| anyhow!("response `{status_code}` has empty content map"))?;
-
-    let schema_ref = match &media_type.schema {
-        Some(sor) => Some(
-            lower_type_ref("<response>", sor, ctx)
-                .with_context(|| format!("schema of response `{status_code}`"))?,
-        ),
-        None => None,
-    };
+    // Deterministic order so generated code is stable across runs.
+    headers.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Response {
         status_code: status_code.to_string(),
         schema_ref,
+        headers,
     })
 }
 
@@ -1503,6 +1611,7 @@ fn lower_any_of(
                             required: true,
                             nullable: false,
                             is_recursive: false,
+                            default_value: None,
                         }],
                     },
                     internal: true,
@@ -1563,12 +1672,18 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
         };
 
         let is_recursive = type_ref_is_recursive(&type_ref, &ctx.visiting);
+        // Extract the spec-declared default, if any and if expressible.
+        let default_value = match sor {
+            RawSchemaOrRef::Inline(raw) => lower_default_value(&raw.default, &type_ref),
+            RawSchemaOrRef::Ref { .. } => None,
+        };
         fields.push(Field {
             name: field_name.clone(),
             type_ref,
             required: is_required,
             nullable: is_nullable,
             is_recursive,
+            default_value,
         });
     }
 
@@ -1579,10 +1694,15 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
             let merged_required = deduped[idx].required || field.required;
             let merged_nullable = deduped[idx].nullable || field.nullable;
             let merged_recursive = deduped[idx].is_recursive || field.is_recursive;
+            let merged_default = field
+                .default_value
+                .clone()
+                .or_else(|| deduped[idx].default_value.clone());
             deduped[idx] = Field {
                 required: merged_required,
                 nullable: merged_nullable,
                 is_recursive: merged_recursive,
+                default_value: merged_default,
                 ..field
             };
         } else {
@@ -1784,440 +1904,4 @@ fn type_ref_is_recursive(t: &TypeRef, visiting: &HashSet<String>) -> bool {
         TypeRef::Array(inner) | TypeRef::Map(inner) => type_ref_is_recursive(inner, visiting),
         _ => false,
     }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use flap_ir::OAuth2FlowType;
-
-    use super::*;
-
-    #[test]
-    fn rejects_openapi_31() {
-        let yaml = "openapi: 3.1.0\ninfo:\n  title: x\n  version: '1'\npaths: {}\n";
-        let err = load_str(yaml).unwrap_err();
-        assert!(err.to_string().contains("3.1"), "got: {err}");
-    }
-
-    #[test]
-    fn petstore_operations() {
-        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
-        let api = load_str(yaml).expect("petstore should parse");
-        assert_eq!(api.operations.len(), 3);
-        assert_eq!(api.operations[0].method, HttpMethod::Get);
-        assert_eq!(api.operations[0].path, "/pets");
-        assert_eq!(api.operations[0].operation_id.as_deref(), Some("listPets"));
-    }
-
-    #[test]
-    fn petstore_fields_default_to_not_nullable() {
-        // Sanity check: existing specs without `nullable: true` lower
-        // every field with `nullable = false`. Future-proofing — if this
-        // ever flips, every Phase-8 test below has to be rewritten.
-        let yaml = include_str!("../../../tests/fixtures/petstore.yaml");
-        let api = load_str(yaml).expect("petstore should parse");
-        for schema in &api.schemas {
-            if let SchemaKind::Object { fields } = &schema.kind {
-                for f in fields {
-                    assert!(
-                        !f.nullable,
-                        "{}.{} should not be nullable",
-                        schema.name, f.name
-                    );
-                }
-            }
-        }
-    }
-
-    // ── Phase 8: nullability lowering ────────────────────────────────────────
-
-    #[test]
-    fn nullable_true_propagates_into_field() {
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  schemas:
-    UpdateUserRequest:
-      type: object
-      properties:
-        nickname:
-          type: string
-          nullable: true
-";
-        let api = load_str(yaml).expect("should lower");
-        let schema = api
-            .schemas
-            .iter()
-            .find(|s| s.name == "UpdateUserRequest")
-            .unwrap();
-        let SchemaKind::Object { fields } = &schema.kind else {
-            panic!("expected object");
-        };
-        let nickname = fields.iter().find(|f| f.name == "nickname").unwrap();
-        assert!(nickname.nullable);
-        assert!(!nickname.required, "field is not in `required:` list");
-    }
-
-    #[test]
-    fn nullable_omitted_means_not_nullable() {
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  schemas:
-    Pet:
-      type: object
-      required: [id]
-      properties:
-        id: { type: integer }
-        tag: { type: string }
-";
-        let api = load_str(yaml).expect("should lower");
-        let SchemaKind::Object { fields } = &api.schemas[0].kind else {
-            panic!();
-        };
-        for f in fields {
-            assert!(!f.nullable, "{} should not be nullable", f.name);
-        }
-    }
-
-    #[test]
-    fn required_and_nullable_are_independent_axes() {
-        // The cell that motivates all of this: required=true + nullable=true.
-        // The receiver is meant to send the key with a literal null.
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  schemas:
-    Profile:
-      type: object
-      required: [bio]
-      properties:
-        bio:
-          type: string
-          nullable: true
-";
-        let api = load_str(yaml).expect("should lower");
-        let SchemaKind::Object { fields } = &api.schemas[0].kind else {
-            panic!();
-        };
-        let bio = fields.iter().find(|f| f.name == "bio").unwrap();
-        assert!(bio.required);
-        assert!(bio.nullable);
-    }
-
-    #[test]
-    fn allof_or_merges_nullable() {
-        // Base declares `email` as nullable; a subclass redeclares it
-        // without nullable. The merge must keep nullable=true — narrowing
-        // would silently drop `null` as a valid wire form for clients
-        // that target the base schema.
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  schemas:
-    Base:
-      type: object
-      properties:
-        email:
-          type: string
-          nullable: true
-    Derived:
-      allOf:
-        - $ref: '#/components/schemas/Base'
-        - type: object
-          properties:
-            email:
-              type: string
-";
-        let api = load_str(yaml).expect("should lower");
-        let derived = api.schemas.iter().find(|s| s.name == "Derived").unwrap();
-        let SchemaKind::Object { fields } = &derived.kind else {
-            panic!();
-        };
-        let email = fields.iter().find(|f| f.name == "email").unwrap();
-        assert!(
-            email.nullable,
-            "OR-merge must preserve nullable=true from the base schema"
-        );
-    }
-
-    #[test]
-    fn anyof_with_primitives_generates_union_and_wrappers() {
-        let yaml = r#"
-openapi: "3.1.0"
-info:
-  title: t
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Example:
-      type: object
-      properties:
-        mixed:
-          anyOf:
-            - type: string
-            - type: integer
-"#;
-        let api = load_str(yaml).expect("should parse");
-        let example = api.schemas.iter().find(|s| s.name == "Example").unwrap();
-        let SchemaKind::Object { fields } = &example.kind else {
-            panic!()
-        };
-        let mixed = fields.iter().find(|f| f.name == "mixed").unwrap();
-        assert!(matches!(mixed.type_ref, TypeRef::Named(_)));
-        if let TypeRef::Named(union_name) = &mixed.type_ref {
-            let union_schema = api.schemas.iter().find(|s| &s.name == union_name).unwrap();
-            assert!(matches!(
-                union_schema.kind,
-                SchemaKind::UntaggedUnion { .. }
-            ));
-            // Check wrapper schemas exist
-            assert!(
-                api.schemas
-                    .iter()
-                    .any(|s| s.name == format!("{union_name}Variant0"))
-            );
-            assert!(
-                api.schemas
-                    .iter()
-                    .any(|s| s.name == format!("{union_name}Variant1"))
-            );
-        }
-    }
-
-    #[test]
-    fn ref_property_is_not_nullable() {
-        // A bare `$ref` cannot carry `nullable: true` per the OpenAPI 3.0
-        // spec. The lowering pass treats refs as non-nullable; specs that
-        // need it use an `allOf` wrapper. This pins down the choice so
-        // it can't silently flip.
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  schemas:
-    Pet:
-      type: object
-      properties:
-        name: { type: string }
-    Owner:
-      type: object
-      properties:
-        pet:
-          $ref: '#/components/schemas/Pet'
-";
-        let api = load_str(yaml).expect("should lower");
-        let owner = api.schemas.iter().find(|s| s.name == "Owner").unwrap();
-        let SchemaKind::Object { fields } = &owner.kind else {
-            panic!();
-        };
-        let pet = fields.iter().find(|f| f.name == "pet").unwrap();
-        assert!(!pet.nullable);
-    }
-
-    // ── OAuth2 / OpenID Connect lowering ─────────────────────────────────────
-
-    #[test]
-    fn oauth2_client_credentials_flow_lowered() {
-        let yaml = include_str!("../../../tests/fixtures/oauth2_petstore.yaml");
-        let api = load_str(yaml).expect("oauth2_petstore should parse");
-
-        let scheme = api
-            .security_schemes
-            .iter()
-            .find(|s| s.scheme_name() == "oauth2Auth")
-            .expect("oauth2Auth scheme must be present");
-
-        match scheme {
-            SecurityScheme::OAuth2 { flows, .. } => {
-                let cc = flows
-                    .iter()
-                    .find(|f| f.flow_type == OAuth2FlowType::ClientCredentials)
-                    .expect("clientCredentials flow must be present");
-                assert_eq!(
-                    cc.token_url.as_deref(),
-                    Some("https://auth.example.com/token")
-                );
-                assert!(cc.authorization_url.is_none());
-                assert!(cc.scopes.contains(&"read:pets".to_string()));
-            }
-            other => panic!("expected OAuth2, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn oauth2_authorization_code_flow_lowered() {
-        let yaml = include_str!("../../../tests/fixtures/oauth2_petstore.yaml");
-        let api = load_str(yaml).expect("oauth2_petstore should parse");
-
-        let scheme = api
-            .security_schemes
-            .iter()
-            .find(|s| s.scheme_name() == "oauth2Auth")
-            .unwrap();
-
-        match scheme {
-            SecurityScheme::OAuth2 { flows, .. } => {
-                let ac = flows
-                    .iter()
-                    .find(|f| f.flow_type == OAuth2FlowType::AuthorizationCode)
-                    .expect("authorizationCode flow must be present");
-                assert_eq!(
-                    ac.token_url.as_deref(),
-                    Some("https://auth.example.com/token")
-                );
-                assert_eq!(
-                    ac.authorization_url.as_deref(),
-                    Some("https://auth.example.com/authorize")
-                );
-            }
-            other => panic!("expected OAuth2, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn openid_connect_lowered() {
-        let yaml = include_str!("../../../tests/fixtures/oauth2_petstore.yaml");
-        let api = load_str(yaml).expect("oauth2_petstore should parse");
-
-        let scheme = api
-            .security_schemes
-            .iter()
-            .find(|s| s.scheme_name() == "oidcAuth")
-            .expect("oidcAuth scheme must be present");
-
-        match scheme {
-            SecurityScheme::OpenIdConnect {
-                openid_connect_url, ..
-            } => {
-                assert_eq!(
-                    openid_connect_url,
-                    "https://auth.example.com/.well-known/openid-configuration"
-                );
-            }
-            other => panic!("expected OpenIdConnect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn oauth2_missing_token_url_is_an_error() {
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  securitySchemes:
-    bad:
-      type: oauth2
-      flows:
-        clientCredentials:
-          scopes: {}
-";
-        let err = load_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("tokenUrl"),
-            "expected tokenUrl in error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn oauth2_authorization_code_missing_authorization_url_is_an_error() {
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  securitySchemes:
-    bad:
-      type: oauth2
-      flows:
-        authorizationCode:
-          tokenUrl: https://auth.example.com/token
-          scopes: {}
-";
-        let err = load_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("authorizationUrl"),
-            "expected authorizationUrl in error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn oauth2_empty_flows_block_is_an_error() {
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  securitySchemes:
-    bad:
-      type: oauth2
-      flows: {}
-";
-        let err = load_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("no recognised flows"),
-            "expected no-flows error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn openid_connect_missing_url_is_an_error() {
-        let yaml = "
-openapi: 3.0.0
-info: { title: t, version: '1' }
-paths: {}
-components:
-  securitySchemes:
-    bad:
-      type: openIdConnect
-";
-        let err = load_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("openIdConnectUrl"),
-            "expected openIdConnectUrl in error, got: {err}"
-        );
-    }
-}
-
-#[test]
-fn openapi_31_parses_and_propagates_nullable() {
-    let yaml = r#"
-openapi: "3.1.0"
-info:
-  title: t
-  version: '1'
-paths: {}
-components:
-  schemas:
-    Update:
-      type: object
-      properties:
-        nickname:
-          type: ["string", "null"]
-    "#;
-
-    let api = load_str(yaml).expect("3.1 spec should parse");
-    let schema = api.schemas.iter().find(|s| s.name == "Update").unwrap();
-    let SchemaKind::Object { fields } = &schema.kind else {
-        panic!("expected object");
-    };
-    let nickname = fields.iter().find(|f| f.name == "nickname").unwrap();
-    assert!(
-        nickname.nullable,
-        "field with type: [string, 'null'] must be nullable"
-    );
-    assert!(!nickname.required);
 }

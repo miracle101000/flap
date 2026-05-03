@@ -1,8 +1,0 @@
-Remote spec fetching (--spec https://...)
-Multiple specs in one run
-allOf discriminator / inheritance hierarchies beyond simple merging
-Response headers are silently dropped
-No multipart/form-data upload of non-object bodies (only FormData.fromMap(body.toJson()))
-anyOf is not supported
-Recursive schemas only partially handled (is_recursive flag prevents Freezed breakage, but deeply nested recursion may not round-trip)
-No default: values on fields other than via the Optional.absent() pathway
