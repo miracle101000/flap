@@ -255,6 +255,9 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
     files.insert("flap_utils.dart".to_string(), emit_flap_utils());
 
     for schema in &api.schemas {
+        if schema.internal {
+            continue;
+        }
         let class_name = dart_class_name(&schema.name);
         let filename = format!("{}.dart", to_snake_case(&class_name));
         let source = emit_schema(schema, &class_name, &registry, &api.schemas);
@@ -389,7 +392,7 @@ fn emit_schema(
 ) -> String {
     match &schema.kind {
         SchemaKind::Object { fields } => {
-            emit_freezed_class(class_name, &schema.name, fields, registry)
+            emit_freezed_class(class_name, &schema.name, fields, schemas, registry)
         }
         SchemaKind::Array { item } => emit_array_typedef(class_name, item),
         SchemaKind::Map { value } => emit_map_typedef(class_name, value),
@@ -488,7 +491,7 @@ fn emit_freezed_union(
 
         out.push_str(&format!("  const factory {class_name}.{factory_name}({{\n"));
         for field in fields {
-            out.push_str(&emit_field(field, variant_name, registry));
+            out.push_str(&emit_field(field, variant_name, schemas, registry));
         }
         out.push_str(&format!("  }}) = {variant_class};\n\n"));
     }
@@ -504,7 +507,7 @@ fn emit_freezed_union(
 
 fn emit_untagged_union(
     class_name: &str,
-    schema_name: &str,
+    _schema_name: &str,
     variants: &[TypeRef],
     schemas: &[Schema],
     registry: &EnumRegistry,
@@ -512,34 +515,18 @@ fn emit_untagged_union(
     let snake = to_snake_case(class_name);
     let mut out = String::new();
 
-    out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
+    // ── Imports ─────────────────────────────────────────────────────
+    out.push_str("import 'dart:convert';\n"); // for jsonEncode in toJson
+    out.push_str("import 'package:flutter/foundation.dart';\n"); // for listEquals, mapEquals – if needed later; but for equality we'll implement manually. Actually we can just use `identical` and manual checks.
+    // We'll keep it simple: no extra imports for equality.
 
-    // Collect imports for variant constructors and wrapper fields
+    // Collect imports for named variant classes used in constructors.
     let mut imports: Vec<String> = Vec::new();
     for variant in variants {
-        let TypeRef::Named(variant_name) = variant else {
-            continue;
-        };
-        if let Some(variant_schema) = schemas.iter().find(|s| s.name == *variant_name) {
-            match &variant_schema.kind {
-                SchemaKind::Object { fields } => {
-                    for field in fields {
-                        collect_field_imports(
-                            &field.type_ref,
-                            &field.name,
-                            variant_name,
-                            variant_name,
-                            registry,
-                            &mut imports,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        // add import for the variant class itself
-        let cls = dart_class_name(variant_name);
-        if cls != class_name {
+        if let TypeRef::Named(variant_name) = variant
+            && !is_internal_wrapper(schemas, variant_name)
+        {
+            let cls = dart_class_name(variant_name);
             imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
         }
     }
@@ -551,97 +538,156 @@ fn emit_untagged_union(
     }
     out.push('\n');
 
-    out.push_str(&format!("part '{snake}.freezed.dart';\n"));
-    out.push_str(&format!("part '{snake}.g.dart';\n\n"));
+    // ── Sealed class definition ─────────────────────────────────────
+    out.push_str(&format!("sealed class {class_name} {{\n"));
+    out.push_str(&format!("  const {class_name}._();\n\n"));
 
-    // Define sealed class with one constructor per variant
-    out.push_str("@Freezed(toJson: false)\n"); // we provide custom toJson/fromJson
+    // Generate constructors for each variant.
+    for (i, variant) in variants.iter().enumerate() {
+        let (variant_dart_type, variant_param_name, is_primitive) =
+            resolve_untagged_variant_info(variant, schemas, registry);
+
+        let factory_name = format!("variant{}", i); // deterministic, not from spec name
+
+        let formal = if is_primitive {
+            format!("{variant_dart_type} value")
+        } else {
+            format!("{variant_dart_type} value")
+        };
+
+        out.push_str(&format!(
+            "  const factory {class_name}.{factory_name}({formal}) = _Variant{i};\n"
+        ));
+    }
+
     out.push_str(&format!(
-        "sealed class {class_name} with _${class_name} {{\n"
+        "\n  factory {class_name}.fromJson(dynamic json) {{\n"
     ));
 
+    // Try each variant in order.
     for (i, variant) in variants.iter().enumerate() {
-        let TypeRef::Named(variant_name) = variant else {
-            continue;
-        };
-        let variant_cls = dart_class_name(variant_name);
-        let factory_name = to_camel_case(variant_name);
-        // Determine whether this variant is a wrapper (single field "value") or normal object
-        let is_wrapper = is_anyof_wrapper(schemas, variant_name);
-        if is_wrapper {
-            // Unwrap: the wrapper class has a single field "value", so we generate:
-            // const factory ClassName.wrappedVariant(int value) = _WrappedClassName;
-            let inner_type = wrapper_inner_type(schemas, variant_name).unwrap();
-            let dart_inner = to_dart_type(inner_type, None);
+        let (variant_dart_type, _, is_primitive) =
+            resolve_untagged_variant_info(variant, schemas, registry);
+        let factory_name = format!("variant{}", i);
+
+        if is_primitive {
+            // Match on JSON type.
             out.push_str(&format!(
-                "  const factory {class_name}.{factory_name}({dart_inner} value) = _Wrapped{class_name}{factory_name};\n"
+                "    if (json is {variant_dart_type}) return {class_name}.{factory_name}(json);\n"
             ));
         } else {
+            // Named object: try to call its fromJson.
+            out.push_str(&format!("    if (json is Map<String, dynamic>) {{\n"));
+            out.push_str(&format!("      try {{\n"));
             out.push_str(&format!(
-                "  const factory {class_name}.{factory_name}() = {variant_cls};\n"
+                "        return {class_name}.{factory_name}({variant_dart_type}.fromJson(json));\n"
             ));
+            out.push_str(&format!("      }} catch (_) {{}}\n"));
+            out.push_str(&format!("    }}\n"));
         }
     }
 
-    // Private constructor (required by Freezed for custom methods)
-    out.push_str(&format!("\n  const {class_name}._();\n\n"));
-
-    // Custom fromJson
     out.push_str(&format!(
-        "  factory {class_name}.fromJson(Map<String, dynamic> json) =>\n"
+        "    throw ArgumentError('Cannot deserialize into {class_name}: $json');\n"
     ));
-    out.push_str(&format!("      _${class_name}UntaggedFromJson(json);\n\n"));
+    out.push_str(&format!("  }}\n\n"));
 
-    // Custom toJson
-    out.push_str("  @override\n");
-    out.push_str("  Map<String, dynamic> toJson();\n");
-    out.push_str("}\n");
+    // toJson method – dispatch to concrete subclass.
+    out.push_str(&format!("  Object? toJson();\n"));
+    out.push_str(&format!("}}\n\n"));
 
-    // Now we need to generate the actual deserialization logic as a top-level function.
-    // This function tries each variant in order.
-    out.push('\n');
-    out.push_str(&format!(
-        "{class_name} _${class_name}UntaggedFromJson(dynamic json) {{\n"
-    ));
-    out.push_str("  Map<String, dynamic>? map;\n");
-    out.push_str("  try {\n");
-    out.push_str("    map = json as Map<String, dynamic>;\n");
-    out.push_str("  } catch (_) {\n");
-    out.push_str("    map = null;\n");
-    out.push_str("  }\n\n");
-
+    // ── Emit private subclasses ─────────────────────────────────────
     for (i, variant) in variants.iter().enumerate() {
-        let TypeRef::Named(variant_name) = variant else {
-            continue;
-        };
-        let factory_name = to_camel_case(variant_name);
-        if is_anyof_wrapper(schemas, variant_name) {
-            let inner_type = wrapper_inner_type(schemas, variant_name).unwrap();
-            let dart_inner = to_dart_type(inner_type, None);
-            out.push_str(&format!(
-                "  // Try variant {factory_name} (inline primitive)\n"
-            ));
-            out.push_str(&format!("  try {{\n"));
-            // For primitives, json is the value itself, not a map
-            out.push_str(&format!("    final parsed = json as {dart_inner};\n"));
-            out.push_str(&format!(
-                "    return {class_name}.{factory_name}(parsed);\n"
-            ));
-            out.push_str(&format!("  }} catch (_) {{}}\n\n"));
+        let (variant_dart_type, _, _) = resolve_untagged_variant_info(variant, schemas, registry);
+
+        out.push_str(&format!("class _Variant{i} extends {class_name} {{\n"));
+        out.push_str(&format!("  final {variant_dart_type} value;\n"));
+        out.push_str(&format!("  const _Variant{i}(this.value) : super._();\n\n"));
+
+        // toJson for primitive: return the value itself; for object: return value.toJson()
+        if is_variant_primitive(variant, schemas) {
+            out.push_str(&format!("  @override\n"));
+            out.push_str(&format!("  Object? toJson() => value;\n"));
         } else {
-            out.push_str(&format!("  // Try variant {factory_name}\n"));
-            out.push_str(&format!("  try {{\n"));
-            out.push_str(&format!(
-                "    if (map != null) return {class_name}.{factory_name}.fromJson(map);\n"
-            ));
-            out.push_str(&format!("  }} catch (_) {{}}\n\n"));
+            out.push_str(&format!("  @override\n"));
+            out.push_str("  Object? toJson() => value.toJson();\n");
         }
+
+        // Equality
+        out.push_str(&format!("  @override\n"));
+        out.push_str(&"  bool operator ==(Object other) =>\n".to_string());
+        out.push_str(&format!(
+            "      other is _Variant{i} && other.value == value;\n"
+        ));
+
+        out.push_str(&format!("  @override\n"));
+        out.push_str(&format!(
+            "  int get hashCode => Object.hash(_Variant{i}, value);\n"
+        ));
+        out.push_str(&format!("}}\n\n"));
     }
 
-    out.push_str("  throw Exception('AnyOf deserialization failed');\n");
-    out.push_str("}\n");
+    // ── Emit a converter for use with @JsonKey on fields ────────────
+    // This allows the field to seamlessly serialize/deserialize the union.
+    let converter_name = format!("_{class_name}Converter");
+    out.push_str(&format!(
+        "class {converter_name} implements JsonConverter<{class_name}, Object?> {{\n"
+    ));
+    out.push_str(&format!("  const {converter_name}();\n\n"));
+    out.push_str(&format!(
+        "  @override\n  {class_name} fromJson(Object? json) =>\n      {class_name}.fromJson(json);\n\n"
+    ));
+    out.push_str(&format!(
+        "  @override\n  Object? toJson({class_name} object) => object.toJson();\n"
+    ));
+    out.push_str(&format!("}}\n"));
 
     out
+}
+
+/// Returns (dart_type_string, parameter_name, is_primitive).
+fn resolve_untagged_variant_info(
+    type_ref: &TypeRef,
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+) -> (String, String, bool) {
+    match type_ref {
+        TypeRef::Named(name) => {
+            // Check if this is an internal wrapper schema (primitive wrapper)
+            if let Some(wrapper_schema) = schemas.iter().find(|s| s.name == *name)
+                && wrapper_schema.internal
+            {
+                // This is a wrapper for a => primitive; extract the inner type.
+                if let SchemaKind::Object { fields } = &wrapper_schema.kind
+                    && fields.len() == 1
+                    && fields[0].name == "value"
+                {
+                    let inner_type = &fields[0].type_ref;
+                    let dart_inner = to_dart_type(inner_type, None);
+                    return (dart_inner, "value".to_string(), true);
+                }
+                // Fallback (shouldn't happen)
+                panic!("internal wrapper schema without a single 'value' field");
+            }
+            // Regular named schema
+            let cls = dart_class_name(name);
+            (cls, "value".to_string(), false)
+        }
+        // For any other TypeRef (shouldn't happen for untagged union variants)
+        _ => panic!("unexpected TypeRef in untagged union variant"),
+    }
+}
+
+fn is_internal_wrapper(schemas: &[Schema], variant_name: &str) -> bool {
+    schemas.iter().any(|s| s.name == variant_name && s.internal)
+}
+
+// Helper to check if a variant is a primitive (i.e., its named schema is an internal wrapper)
+fn is_variant_primitive(variant_type_ref: &TypeRef, schemas: &[Schema]) -> bool {
+    match variant_type_ref {
+        TypeRef::Named(name) => is_internal_wrapper(schemas, name),
+        _ => false,
+    }
 }
 
 fn is_anyof_wrapper(schemas: &[Schema], variant_name: &str) -> bool {
@@ -705,6 +751,7 @@ fn emit_freezed_class(
     class_name: &str,
     schema_name: &str,
     fields: &[Field],
+    schemas: &[Schema],
     registry: &EnumRegistry,
 ) -> String {
     let snake = to_snake_case(class_name);
@@ -752,7 +799,7 @@ fn emit_freezed_class(
 
     out.push_str(&format!("  const factory {class_name}({{\n"));
     for field in fields {
-        out.push_str(&emit_field(field, schema_name, registry));
+        out.push_str(&emit_field(field, schema_name, schemas, registry));
     }
     out.push_str(&format!("  }}) = _{class_name};\n"));
     out.push('\n');
@@ -793,7 +840,12 @@ fn type_ref_supports_optional_wrapper(type_ref: &TypeRef) -> bool {
     )
 }
 
-fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> String {
+fn emit_field(
+    field: &Field,
+    schema_name: &str,
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+) -> String {
     let synth = registry.lookup_field(schema_name, &field.name);
     let dart_type = to_dart_type(&field.type_ref, synth);
     let dart_name = to_camel_case(&field.name);
@@ -805,6 +857,14 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
         json_key_args.push(format!("name: '{}'", field.name));
     }
     let mut sibling_annotations: Vec<String> = Vec::new();
+
+    if let TypeRef::Named(name) = &field.type_ref {
+        if is_untagged_union(schemas, name) {
+            let converter = format!("_{name}Converter");
+            sibling_annotations.push(format!("@{converter}()"));
+            // Also ensure the import of that file exists (via collect_field_imports)
+        }
+    }
 
     // Optional leading comment line (currently only used for the
     // non-primitive Optional<T?> fallback, where we want a visible
@@ -1368,6 +1428,12 @@ fn deserialize_expr(
     }
 }
 
+fn is_untagged_union(schemas: &[Schema], name: &str) -> bool {
+    schemas
+        .iter()
+        .any(|s| s.name == name && matches!(s.kind, SchemaKind::UntaggedUnion { .. }))
+}
+
 fn named_schema_kind<'a>(name: &str, schemas: &'a [Schema]) -> Option<&'a SchemaKind> {
     schemas.iter().find(|s| s.name == name).map(|s| &s.kind)
 }
@@ -1539,6 +1605,7 @@ mod tests {
                     },
                 ],
             },
+            internal: false,
         }
     }
 
@@ -1548,6 +1615,7 @@ mod tests {
             kind: SchemaKind::Array {
                 item: TypeRef::Named("Pet".into()),
             },
+            internal: false,
         }
     }
 
@@ -1574,6 +1642,7 @@ mod tests {
                     },
                 ],
             },
+            internal: false,
         }
     }
 
@@ -1668,7 +1737,7 @@ mod tests {
     #[test]
     fn pet_emits_freezed_class() {
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &registry);
+        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &[], &registry);
         assert!(src.contains("@freezed"));
         assert!(src.contains("class Pet with _$Pet"));
         assert!(src.contains("required int id"));
@@ -1686,7 +1755,7 @@ mod tests {
         // None of Pet's fields are nullable, so no `flap_utils.dart`
         // import, no private constructor, no `toJson` override.
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &registry);
+        let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &[], &registry);
         assert!(!src.contains("flap_utils.dart"));
         assert!(!src.contains("const Pet._();"));
         assert!(!src.contains("Map<String, dynamic> toJson()"));
@@ -1715,9 +1784,10 @@ mod tests {
                     },
                 ],
             },
+            internal: false,
         };
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("User", "User", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("User", "User", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains("@JsonKey(name: 'first_name') required String firstName"),
             "missing camelCased property + JsonKey, got:\n{src}"
@@ -1733,6 +1803,7 @@ mod tests {
             kind: SchemaKind::Object {
                 fields: vec![field],
             },
+            internal: false,
         }
     }
 
@@ -1751,7 +1822,7 @@ mod tests {
             },
         );
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Profile", "Profile", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("Profile", "Profile", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains("required String? bio,"),
             "expected `required String? bio,`, got:\n{src}"
@@ -1780,7 +1851,7 @@ mod tests {
             },
         );
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Update", "Update", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("Update", "Update", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains("@JsonKey(includeIfNull: false) String? tag,"),
             "expected includeIfNull: false on optional non-nullable, got:\n{src}"
@@ -1809,6 +1880,7 @@ mod tests {
             "UpdateUserRequest",
             "UpdateUserRequest",
             &fields_of(&schema),
+            &[], // No additional imports needed
             &registry,
         );
 
@@ -1853,7 +1925,7 @@ mod tests {
             },
         );
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains(
                 "@OptionalConverter() @Default(Optional<int?>.absent()) Optional<int?> count,"
@@ -1879,7 +1951,7 @@ mod tests {
             },
         );
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains("// TODO(flap): nullable+optional non-primitive"),
             "expected fallback TODO comment, got:\n{src}"
@@ -1909,7 +1981,7 @@ mod tests {
             },
         );
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains("@JsonKey(name: 'display_name') @OptionalConverter() @Default(Optional<String?>.absent()) Optional<String?> displayName,"),
             "expected JsonKey + converter + default + camelCased dart name, got:\n{src}"
@@ -1990,9 +2062,16 @@ mod tests {
                     },
                 ],
             },
+            internal: false,
         };
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("PatchUser", "PatchUser", &fields_of(&schema), &registry);
+        let src = emit_freezed_class(
+            "PatchUser",
+            "PatchUser",
+            &fields_of(&schema),
+            &[],
+            &registry,
+        );
 
         // Required, non-nullable: untouched.
         assert!(src.contains("required String id,"));
@@ -2022,9 +2101,10 @@ mod tests {
                     is_recursive: false,
                 }],
             },
+            internal: false,
         };
         let registry = EnumRegistry::default();
-        let src = emit_freezed_class("ErrorModel", "Error", &fields_of(&schema), &registry);
+        let src = emit_freezed_class("ErrorModel", "Error", &fields_of(&schema), &[], &registry);
         assert!(
             src.contains("stripOptionalAbsent(_$ErrorModelToJson(this as _ErrorModel));"),
             "toJson cast must use the D7-renamed class, got:\n{src}"
@@ -2033,12 +2113,22 @@ mod tests {
 
     #[test]
     fn emit_anyof_union() {
-        // Build the IR manually to avoid YAML dependency in emitter tests.
         let union_name = "ExampleMixed";
+        // No wrapper schemas needed; just the union schema itself.
+        let union_schema = Schema {
+            name: union_name.into(),
+            kind: SchemaKind::UntaggedUnion {
+                variants: vec![
+                    TypeRef::Named("__internal_wrapper_string".into()), // dummy; we'll mock internal detection
+                    TypeRef::Named("__internal_wrapper_int".into()),
+                ],
+            },
+            internal: false,
+        };
 
-        // Wrapper schemas for primitive variants.
+        // We need the schemas to resolve internal wrappers; we'll add them as internal schemas.
         let wrapper_string = Schema {
-            name: format!("{union_name}Variant0"),
+            name: "__internal_wrapper_string".into(),
             kind: SchemaKind::Object {
                 fields: vec![Field {
                     name: "value".into(),
@@ -2048,9 +2138,10 @@ mod tests {
                     is_recursive: false,
                 }],
             },
+            internal: true,
         };
         let wrapper_int = Schema {
-            name: format!("{union_name}Variant1"),
+            name: "__internal_wrapper_int".into(),
             kind: SchemaKind::Object {
                 fields: vec![Field {
                     name: "value".into(),
@@ -2060,76 +2151,89 @@ mod tests {
                     is_recursive: false,
                 }],
             },
-        };
-        let wrapper_string_name = wrapper_string.name.clone();
-        let wrapper_int_name = wrapper_int.name.clone();
-
-        // The untagged union schema itself.
-        let union_schema = Schema {
-            name: union_name.into(),
-            kind: SchemaKind::UntaggedUnion {
-                variants: vec![
-                    TypeRef::Named(wrapper_string.name.clone()),
-                    TypeRef::Named(wrapper_int.name.clone()),
-                ],
-            },
-        };
-
-        // The outer schema that uses the union.
-        let example_schema = Schema {
-            name: "Example".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "mixed".into(),
-                    type_ref: TypeRef::Named(union_name.into()),
-                    required: true,
-                    nullable: false,
-                    is_recursive: false,
-                }],
-            },
+            internal: true,
         };
 
         let api = Api {
             title: "Test".into(),
             base_url: None,
             operations: vec![],
-            schemas: vec![example_schema, union_schema, wrapper_string, wrapper_int],
+            schemas: vec![union_schema, wrapper_string, wrapper_int],
             security_schemes: vec![],
             security: vec![],
         };
 
         let files = emit_models(&api);
+        // wrapper schemas should NOT be emitted
+        assert!(!files.contains_key("__internal_wrapper_string.dart"));
+        assert!(!files.contains_key("__internal_wrapper_int.dart"));
 
-        // The union should be emitted as its own file.
-        let union_file = files
-            .get(&format!("{}.dart", to_snake_case(union_name)))
-            .expect("union file missing");
+        let union_file = files.get("example_mixed.dart").expect("union file missing");
+        assert!(union_file.contains("sealed class ExampleMixed {"));
+        assert!(union_file.contains("factory ExampleMixed.fromJson(dynamic json)"));
+        assert!(union_file.contains(
+            "class _ExampleMixedConverter implements JsonConverter<ExampleMixed, Object?>"
+        ));
+        assert!(union_file.contains("if (json is String) return ExampleMixed.variant0(json);"));
+        assert!(union_file.contains("if (json is int) return ExampleMixed.variant1(json);"));
+        // The class should not have any Freezed annotations.
+        assert!(!union_file.contains("@Freezed"));
+        assert!(!union_file.contains("part '"));
+    }
 
+    #[test]
+    fn untagged_union_field_gets_converter_annotation() {
+        let union_name = "Mixed";
+        let union_schema = Schema {
+            name: union_name.into(),
+            kind: SchemaKind::UntaggedUnion {
+                variants: vec![TypeRef::Named("__internal_wrapper_string".into())],
+            },
+            internal: false,
+        };
+        let wrapper = Schema {
+            name: "__internal_wrapper_string".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "value".into(),
+                    type_ref: TypeRef::String,
+                    required: true,
+                    nullable: false,
+                    is_recursive: false,
+                }],
+            },
+            internal: true,
+        };
+        let container = Schema {
+            name: "Container".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "data".into(),
+                    type_ref: TypeRef::Named(union_name.into()),
+                    required: true,
+                    nullable: false,
+                    is_recursive: false,
+                }],
+            },
+            internal: false,
+        };
+        let api = Api {
+            title: "Test".into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![container, union_schema, wrapper],
+            security_schemes: vec![],
+            security: vec![],
+        };
+        let files = emit_models(&api);
+        let container_file = files.get("container.dart").unwrap();
         assert!(
-            union_file.contains(&format!("sealed class {union_name}")),
-            "missing sealed class"
+            container_file.contains("@_MixedConverter()"),
+            "Container.data should have the converter annotation"
         );
         assert!(
-            union_file.contains("_$ExampleMixedUntaggedFromJson"),
-            "missing untagged fromJson function"
-        );
-        assert!(
-            union_file.contains("try {"),
-            "missing variant attempt blocks"
-        );
-        assert!(
-            union_file.contains("throw Exception("),
-            "should have fallback exception"
-        );
-
-        // Wrapper schemas should also be emitted.
-        assert!(
-            files.contains_key(&format!("{}.dart", to_snake_case(&wrapper_string_name))),
-            "string wrapper file missing"
-        );
-        assert!(
-            files.contains_key(&format!("{}.dart", to_snake_case(&wrapper_int_name))),
-            "int wrapper file missing"
+            container_file.contains("Mixed data,"),
+            "field should be typed as the union class"
         );
     }
 

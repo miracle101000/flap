@@ -28,14 +28,134 @@ use flap_ir::{
     ParameterLocation, RequestBody, Response, Schema, SchemaKind, SecurityScheme, TypeRef,
 };
 use serde::Deserialize;
-
+pub mod swagger;
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn load(path: impl AsRef<Path>) -> Result<Api> {
     let path = path.as_ref();
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading spec file {}", path.display()))?;
-    load_str(&text).with_context(|| format!("in spec file {}", path.display()))
+
+    // Detect version from first line
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.trim().starts_with("swagger:") {
+        return load_swagger_str(&text).with_context(|| format!("in spec file {}", path.display()));
+    }
+
+    // existing 3.x path
+    reject_unsupported_version(&text)?;
+    let raw: RawSpec = serde_yaml::from_str(&text).context("parsing OpenAPI YAML")?;
+    lower(raw)
+}
+
+fn lower_swagger_inline_type(
+    ty: Option<&str>,
+    format: Option<&str>,
+    items: Option<&SwaggerItems>,
+    enum_values: &[serde_yaml::Value],
+) -> Result<TypeRef> {
+    if !enum_values.is_empty() {
+        let values = stringify_enum_values("anonymous_enum", enum_values)
+            .with_context(|| "invalid enum value")?;
+        return Ok(TypeRef::Enum(values));
+    }
+    match ty {
+        Some("string") => {
+            if format == Some("date-time") {
+                Ok(TypeRef::DateTime)
+            } else {
+                Ok(TypeRef::String)
+            }
+        }
+        Some("integer") => Ok(TypeRef::Integer {
+            format: format.map(|s| s.to_string()),
+        }),
+        Some("number") => Ok(TypeRef::Number {
+            format: format.map(|s| s.to_string()),
+        }),
+        Some("boolean") => Ok(TypeRef::Boolean),
+        Some("array") => {
+            let items = items.ok_or_else(|| anyhow!("array type missing items"))?;
+            let inner = lower_swagger_inline_type(
+                Some(&items.ty),
+                items.format.as_deref(),
+                None, // nested items rare, keep simple
+                &[],
+            )?;
+            Ok(TypeRef::Array(Box::new(inner)))
+        }
+        Some("file") => bail!("file parameters are not supported"),
+        _ => bail!("unsupported inline type {:?}", ty),
+    }
+}
+
+fn lower_swagger_schema_or_ref(
+    sor: &SwaggerSchemaOrRef,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    visiting: &HashSet<String>,
+) -> Result<TypeRef> {
+    match sor {
+        SwaggerSchemaOrRef::Ref { reference } => {
+            let name = parse_swagger_ref(reference)?; // extracts from "#/definitions/XXX"
+            if !definitions.contains_key(name) {
+                bail!("unknown definition {name}");
+            }
+            Ok(TypeRef::Named(name.to_string()))
+        }
+        SwaggerSchemaOrRef::Inline(raw) => {
+            // if it has type, format, items, enum → return primitive/array
+            if let Some(ty) = &raw.ty {
+                return lower_swagger_inline_type(
+                    Some(ty),
+                    raw.format.as_deref(),
+                    None,
+                    &raw.enum_values,
+                );
+            }
+            // otherwise it's an inline object/map/array, but those would become named schemas
+            // (unlikely at top-level)
+            bail!("inline schema without type not supported")
+        }
+    }
+}
+
+pub fn load_swagger_str(text: &str) -> Result<Api> {
+    let raw: SwaggerSpec = serde_yaml::from_str(text).context("parsing Swagger 2.0 YAML")?;
+    lower_swagger(raw)
+}
+/// Extracts the schema name from a Swagger‑style `$ref` pointer.
+///
+/// Example: `"#/definitions/Pet"` → `"Pet"`.
+fn parse_swagger_ref(reference: &str) -> Result<&str> {
+    let bare = reference.strip_prefix("#/definitions/").ok_or_else(|| {
+        anyhow!(
+            "`$ref` `{reference}` is not a definition reference – \
+             Swagger 2.0 only supports `#/definitions/*`"
+        )
+    })?;
+    if bare.is_empty() || bare.contains('/') {
+        bail!("malformed $ref pointer `{reference}`");
+    }
+    Ok(bare)
+}
+fn lower_swagger(spec: SwaggerSpec) -> Result<Api> {
+    let title = spec.info.title;
+    let base_url = build_swagger_base_url(&spec.host, &spec.base_path);
+
+    let mut ctx = SwaggerContext::new(&spec.definitions);
+    let operations = lower_swagger_operations(&spec.paths, &mut ctx)?;
+    let schemas = lower_swagger_schemas(&spec.definitions, &mut ctx)?;
+    let security_schemes = lower_swagger_security(&spec.security_definitions)?;
+    let security = flatten_security_requirements(&spec.security);
+
+    Ok(Api {
+        title,
+        base_url,
+        operations,
+        schemas,
+        security_schemes,
+        security,
+    })
 }
 
 /// Exposed for unit tests.
@@ -281,6 +401,8 @@ impl<'a> LoweringContext<'a> {
 }
 
 use serde::de;
+
+use crate::swagger::{SwaggerItems, SwaggerSchemaOrRef, SwaggerSpec};
 
 fn deserialize_openapi_type<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
@@ -737,6 +859,7 @@ fn lower_schemas(
         out.push(Schema {
             name: name.clone(),
             kind,
+            internal: false,
         });
     }
     out.append(&mut ctx.synthetic_schemas);
@@ -849,6 +972,7 @@ fn lower_any_of(
                             is_recursive: false,
                         }],
                     },
+                    internal: true,
                 };
                 wrapper_schemas.push(wrapper);
                 variants.push(TypeRef::Named(wrapper_name));

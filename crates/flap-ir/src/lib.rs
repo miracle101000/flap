@@ -135,6 +135,9 @@ pub struct Response {
 pub struct Schema {
     pub name: String,
     pub kind: SchemaKind,
+    /// When true the emitter skips this schema – it's an implementation
+    /// detail of the lowering (e.g. an anyOf wrapper for a primitive).
+    pub internal: bool,
 }
 
 #[derive(Debug)]
