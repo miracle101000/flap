@@ -1611,6 +1611,7 @@ mod tests {
                 ],
             },
             internal: false,
+            extends: None,
         }
     }
 
@@ -1621,6 +1622,7 @@ mod tests {
                 item: TypeRef::Named("Pet".into()),
             },
             internal: false,
+            extends: None,
         }
     }
 
@@ -1648,6 +1650,7 @@ mod tests {
                 ],
             },
             internal: false,
+            extends: None,
         }
     }
 
@@ -1790,6 +1793,7 @@ mod tests {
                 ],
             },
             internal: false,
+            extends: None,
         };
         let registry = EnumRegistry::default();
         let src = emit_freezed_class("User", "User", &fields_of(&schema), &[], &registry);
@@ -1809,6 +1813,8 @@ mod tests {
                 fields: vec![field],
             },
             internal: false,
+            extends: None,
+
         }
     }
 
@@ -2042,6 +2048,7 @@ mod tests {
         // enough by itself to add the class-level plumbing.
         let schema = Schema {
             name: "PatchUser".into(),
+            extends: None,
             kind: SchemaKind::Object {
                 fields: vec![
                     Field {
@@ -2107,6 +2114,8 @@ mod tests {
                 }],
             },
             internal: false,
+            extends: None,
+
         };
         let registry = EnumRegistry::default();
         let src = emit_freezed_class("ErrorModel", "Error", &fields_of(&schema), &[], &registry);
@@ -2129,6 +2138,8 @@ mod tests {
                 ],
             },
             internal: false,
+            extends: None,
+
         };
 
         // We need the schemas to resolve internal wrappers; we'll add them as internal schemas.
@@ -2144,6 +2155,8 @@ mod tests {
                 }],
             },
             internal: true,
+            extends: None,
+
         };
         let wrapper_int = Schema {
             name: "__internal_wrapper_int".into(),
@@ -2157,6 +2170,8 @@ mod tests {
                 }],
             },
             internal: true,
+            extends: None,
+
         };
 
         let api = Api {
@@ -2195,6 +2210,8 @@ mod tests {
                 variants: vec![TypeRef::Named("__internal_wrapper_string".into())],
             },
             internal: false,
+            extends: None,
+
         };
         let wrapper = Schema {
             name: "__internal_wrapper_string".into(),
@@ -2208,6 +2225,8 @@ mod tests {
                 }],
             },
             internal: true,
+            extends: None,
+
         };
         let container = Schema {
             name: "Container".into(),
@@ -2221,6 +2240,8 @@ mod tests {
                 }],
             },
             internal: false,
+            extends: None,
+
         };
         let api = Api {
             title: "Test".into(),

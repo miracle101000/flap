@@ -239,10 +239,27 @@ fn lower_swagger_schemas(
         ctx.visiting.insert(name.clone());
         let kind = lower_swagger_schema_kind(name, sor, definitions, ctx)?;
         ctx.visiting.remove(name);
+
+        // Detect allOf-based single inheritance: if the first allOf entry
+        // is a $ref, that target is the logical parent. Swagger 2.0 has no
+        // discriminator, so `extends` is purely informational for emitters.
+        let extends = if let SwaggerSchemaOrRef::Inline(raw) = sor {
+            raw.all_of.first().and_then(|first| {
+                if let SwaggerSchemaOrRef::Ref { reference } = first {
+                    parse_swagger_ref(reference).ok().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         out.push(Schema {
             name: name.clone(),
             kind,
             internal: false, // none are synthetic for Swagger
+            extends
         });
     }
     Ok(out)
@@ -883,12 +900,14 @@ fn lower(raw: RawSpec) -> Result<Api> {
     let title = raw.info.title;
     let base_url = raw.servers.into_iter().next().map(|s| s.url);
 
+    // Pre-pass: discover allOf-based inheritance so discriminator-only
+    // union parents can find their variants before main lowering starts.
     let extension_map = build_allof_extension_map(&raw.components.schemas);
+
     let mut ctx = LoweringContext::new(&raw.components, extension_map);
 
     let operations = lower_operations(&raw.paths, &mut ctx)?;
     let schemas = lower_schemas(&raw.components.schemas, &mut ctx)?;
-
     let security_schemes = lower_security_schemes(&raw.components.security_schemes)?;
     let security = flatten_security_requirements(&raw.security);
 
@@ -1285,12 +1304,26 @@ fn lower_schemas(
         let result = lower_schema_kind(name, schema_or_ref, ctx)
             .with_context(|| format!("in schema `{name}`"));
         ctx.visiting.remove(name);
-
         let kind = result?;
+
+        // Record allOf-inheritance so emitters understand the hierarchy.
+        let extends = if let RawSchemaOrRef::Inline(raw_schema) = schema_or_ref {
+            raw_schema.all_of.first().and_then(|first| {
+                if let RawSchemaOrRef::Ref { reference } = first {
+                    parse_schema_ref_pointer(reference).ok().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
         out.push(Schema {
             name: name.clone(),
             kind,
             internal: false,
+            extends,
         });
     }
     out.append(&mut ctx.synthetic_schemas);
@@ -1382,6 +1415,17 @@ fn lower_inline_schema(
         return lower_one_of(name, raw, ctx);
     }
 
+    // allOf-based discriminated union: the discriminator lives on the parent
+    // schema and children self-register by extending via allOf. This is the
+    // OpenAPI 3.0 alternative to the explicit oneOf+discriminator form.
+    if let Some(discriminator) = &raw.discriminator {
+        if raw.one_of.is_empty() && raw.any_of.is_empty() {
+            if let Some(children) = ctx.extension_map.get(name).cloned() {
+                return lower_allof_union(name, discriminator, &children, ctx);
+            }
+        }
+    }
+
     if !raw.all_of.is_empty() {
         let fields = collect_object_fields(raw, ctx)?;
         return Ok(SchemaKind::Object { fields });
@@ -1462,6 +1506,7 @@ fn lower_any_of(
                         }],
                     },
                     internal: true,
+                    extends: None,
                 };
                 wrapper_schemas.push(wrapper);
                 variants.push(TypeRef::Named(wrapper_name));
