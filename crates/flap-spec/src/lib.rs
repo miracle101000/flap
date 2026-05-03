@@ -23,8 +23,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flap_ir::{
-    Api, ApiKeyLocation, Field, HttpMethod, Operation, Parameter, ParameterLocation, RequestBody,
-    Response, Schema, SchemaKind, SecurityScheme, TypeRef,
+    Api, ApiKeyLocation, Field, HttpMethod, OAuth2Flow, OAuth2FlowType, Operation, Parameter,
+    ParameterLocation, RequestBody, Response, Schema, SchemaKind, SecurityScheme, TypeRef,
 };
 use serde::Deserialize;
 
@@ -80,6 +80,27 @@ struct RawSpec {
     security: Vec<BTreeMap<String, Vec<String>>>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RawOAuth2Flows {
+    implicit: Option<RawOAuth2Flow>,
+    password: Option<RawOAuth2Flow>,
+    #[serde(rename = "clientCredentials")]
+    client_credentials: Option<RawOAuth2Flow>,
+    #[serde(rename = "authorizationCode")]
+    authorization_code: Option<RawOAuth2Flow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOAuth2Flow {
+    #[serde(rename = "tokenUrl")]
+    token_url: Option<String>,
+    #[serde(rename = "authorizationUrl")]
+    authorization_url: Option<String>,
+    /// Keys are scope names; values are human-readable descriptions we discard.
+    #[serde(default)]
+    scopes: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawInfo {
     title: String,
@@ -108,6 +129,11 @@ struct RawSecurityScheme {
     scheme: Option<String>,
     #[serde(rename = "bearerFormat")]
     bearer_format: Option<String>,
+    // ── OAuth2 ──
+    flows: Option<RawOAuth2Flows>,
+    // ── OpenID Connect ──
+    #[serde(rename = "openIdConnectUrl")]
+    open_id_connect_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -345,13 +371,111 @@ fn lower_security_scheme(name: &str, raw: &RawSecurityScheme) -> Result<Security
                 )
             }
         }
-        "oauth2" | "openIdConnect" => bail!(
-            "security scheme type `{}` is not supported in v0.1 \
-             (apiKey and http-bearer only)",
-            raw.ty
-        ),
+        "oauth2" => {
+            let raw_flows = raw.flows.as_ref().ok_or_else(|| {
+                anyhow!("oauth2 security scheme `{name}` is missing the required `flows` block")
+            })?;
+            let flows = lower_oauth2_flows(name, raw_flows)
+                .with_context(|| format!("in oauth2 scheme `{name}`"))?;
+            Ok(SecurityScheme::OAuth2 {
+                scheme_name: name.to_string(),
+                flows,
+            })
+        }
+        "openIdConnect" => {
+            let openid_connect_url = raw.open_id_connect_url.clone().ok_or_else(|| {
+                anyhow!(
+                    "openIdConnect security scheme `{name}` is missing \
+                     the required `openIdConnectUrl` field"
+                )
+            })?;
+            Ok(SecurityScheme::OpenIdConnect {
+                scheme_name: name.to_string(),
+                openid_connect_url,
+            })
+        }
         other => bail!("unknown security scheme type `{other}`"),
     }
+}
+
+fn lower_oauth2_flows(scheme_name: &str, raw: &RawOAuth2Flows) -> Result<Vec<OAuth2Flow>> {
+    let mut flows = Vec::new();
+
+    if let Some(f) = &raw.implicit {
+        let authorization_url = f.authorization_url.clone().ok_or_else(|| {
+            anyhow!(
+                "`implicit` flow in oauth2 scheme `{scheme_name}` \
+                 requires `authorizationUrl`"
+            )
+        })?;
+        flows.push(OAuth2Flow {
+            flow_type: OAuth2FlowType::Implicit,
+            token_url: None,
+            authorization_url: Some(authorization_url),
+            scopes: f.scopes.keys().cloned().collect(),
+        });
+    }
+
+    if let Some(f) = &raw.password {
+        let token_url = f.token_url.clone().ok_or_else(|| {
+            anyhow!(
+                "`password` flow in oauth2 scheme `{scheme_name}` \
+                 requires `tokenUrl`"
+            )
+        })?;
+        flows.push(OAuth2Flow {
+            flow_type: OAuth2FlowType::Password,
+            token_url: Some(token_url),
+            authorization_url: None,
+            scopes: f.scopes.keys().cloned().collect(),
+        });
+    }
+
+    if let Some(f) = &raw.client_credentials {
+        let token_url = f.token_url.clone().ok_or_else(|| {
+            anyhow!(
+                "`clientCredentials` flow in oauth2 scheme `{scheme_name}` \
+                 requires `tokenUrl`"
+            )
+        })?;
+        flows.push(OAuth2Flow {
+            flow_type: OAuth2FlowType::ClientCredentials,
+            token_url: Some(token_url),
+            authorization_url: None,
+            scopes: f.scopes.keys().cloned().collect(),
+        });
+    }
+
+    if let Some(f) = &raw.authorization_code {
+        let token_url = f.token_url.clone().ok_or_else(|| {
+            anyhow!(
+                "`authorizationCode` flow in oauth2 scheme `{scheme_name}` \
+                 requires `tokenUrl`"
+            )
+        })?;
+        let authorization_url = f.authorization_url.clone().ok_or_else(|| {
+            anyhow!(
+                "`authorizationCode` flow in oauth2 scheme `{scheme_name}` \
+                 requires `authorizationUrl`"
+            )
+        })?;
+        flows.push(OAuth2Flow {
+            flow_type: OAuth2FlowType::AuthorizationCode,
+            token_url: Some(token_url),
+            authorization_url: Some(authorization_url),
+            scopes: f.scopes.keys().cloned().collect(),
+        });
+    }
+
+    if flows.is_empty() {
+        bail!(
+            "oauth2 scheme `{scheme_name}` defines no recognised flows \
+             (expected at least one of: implicit, password, \
+             clientCredentials, authorizationCode)"
+        );
+    }
+
+    Ok(flows)
 }
 
 fn flatten_security_requirements(reqs: &[BTreeMap<String, Vec<String>>]) -> Vec<String> {
@@ -912,6 +1036,8 @@ fn type_ref_is_recursive(t: &TypeRef, visiting: &HashSet<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use flap_ir::OAuth2FlowType;
+
     use super::*;
 
     #[test]
@@ -1100,5 +1226,169 @@ components:
         };
         let pet = fields.iter().find(|f| f.name == "pet").unwrap();
         assert!(!pet.nullable);
+    }
+
+    // ── OAuth2 / OpenID Connect lowering ─────────────────────────────────────
+
+    #[test]
+    fn oauth2_client_credentials_flow_lowered() {
+        let yaml = include_str!("../../../tests/fixtures/oauth2_petstore.yaml");
+        let api = load_str(yaml).expect("oauth2_petstore should parse");
+
+        let scheme = api
+            .security_schemes
+            .iter()
+            .find(|s| s.scheme_name() == "oauth2Auth")
+            .expect("oauth2Auth scheme must be present");
+
+        match scheme {
+            SecurityScheme::OAuth2 { flows, .. } => {
+                let cc = flows
+                    .iter()
+                    .find(|f| f.flow_type == OAuth2FlowType::ClientCredentials)
+                    .expect("clientCredentials flow must be present");
+                assert_eq!(
+                    cc.token_url.as_deref(),
+                    Some("https://auth.example.com/token")
+                );
+                assert!(cc.authorization_url.is_none());
+                assert!(cc.scopes.contains(&"read:pets".to_string()));
+            }
+            other => panic!("expected OAuth2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth2_authorization_code_flow_lowered() {
+        let yaml = include_str!("../../../tests/fixtures/oauth2_petstore.yaml");
+        let api = load_str(yaml).expect("oauth2_petstore should parse");
+
+        let scheme = api
+            .security_schemes
+            .iter()
+            .find(|s| s.scheme_name() == "oauth2Auth")
+            .unwrap();
+
+        match scheme {
+            SecurityScheme::OAuth2 { flows, .. } => {
+                let ac = flows
+                    .iter()
+                    .find(|f| f.flow_type == OAuth2FlowType::AuthorizationCode)
+                    .expect("authorizationCode flow must be present");
+                assert_eq!(
+                    ac.token_url.as_deref(),
+                    Some("https://auth.example.com/token")
+                );
+                assert_eq!(
+                    ac.authorization_url.as_deref(),
+                    Some("https://auth.example.com/authorize")
+                );
+            }
+            other => panic!("expected OAuth2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openid_connect_lowered() {
+        let yaml = include_str!("../../../tests/fixtures/oauth2_petstore.yaml");
+        let api = load_str(yaml).expect("oauth2_petstore should parse");
+
+        let scheme = api
+            .security_schemes
+            .iter()
+            .find(|s| s.scheme_name() == "oidcAuth")
+            .expect("oidcAuth scheme must be present");
+
+        match scheme {
+            SecurityScheme::OpenIdConnect {
+                openid_connect_url, ..
+            } => {
+                assert_eq!(
+                    openid_connect_url,
+                    "https://auth.example.com/.well-known/openid-configuration"
+                );
+            }
+            other => panic!("expected OpenIdConnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth2_missing_token_url_is_an_error() {
+        let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  securitySchemes:
+    bad:
+      type: oauth2
+      flows:
+        clientCredentials:
+          scopes: {}
+";
+        let err = load_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("tokenUrl"),
+            "expected tokenUrl in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth2_authorization_code_missing_authorization_url_is_an_error() {
+        let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  securitySchemes:
+    bad:
+      type: oauth2
+      flows:
+        authorizationCode:
+          tokenUrl: https://auth.example.com/token
+          scopes: {}
+";
+        let err = load_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("authorizationUrl"),
+            "expected authorizationUrl in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oauth2_empty_flows_block_is_an_error() {
+        let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  securitySchemes:
+    bad:
+      type: oauth2
+      flows: {}
+";
+        let err = load_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("no recognised flows"),
+            "expected no-flows error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn openid_connect_missing_url_is_an_error() {
+        let yaml = "
+openapi: 3.0.0
+info: { title: t, version: '1' }
+paths: {}
+components:
+  securitySchemes:
+    bad:
+      type: openIdConnect
+";
+        let err = load_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("openIdConnectUrl"),
+            "expected openIdConnectUrl in error, got: {err}"
+        );
     }
 }

@@ -275,6 +275,38 @@ impl fmt::Display for ApiKeyLocation {
     }
 }
 
+// ── OAuth2 ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuth2FlowType {
+    Implicit,
+    Password,
+    ClientCredentials,
+    AuthorizationCode,
+}
+
+impl fmt::Display for OAuth2FlowType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OAuth2FlowType::Implicit => f.write_str("implicit"),
+            OAuth2FlowType::Password => f.write_str("password"),
+            OAuth2FlowType::ClientCredentials => f.write_str("clientCredentials"),
+            OAuth2FlowType::AuthorizationCode => f.write_str("authorizationCode"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OAuth2Flow {
+    pub flow_type: OAuth2FlowType,
+    /// Present for: password, clientCredentials, authorizationCode.
+    pub token_url: Option<String>,
+    /// Present for: implicit, authorizationCode.
+    pub authorization_url: Option<String>,
+    /// Scope names declared by the flow (descriptions are dropped).
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum SecurityScheme {
     ApiKey {
@@ -286,6 +318,15 @@ pub enum SecurityScheme {
         scheme_name: String,
         bearer_format: Option<String>,
     },
+    OAuth2 {
+        scheme_name: String,
+        /// At least one flow is always present — lowering rejects empty `flows` blocks.
+        flows: Vec<OAuth2Flow>,
+    },
+    OpenIdConnect {
+        scheme_name: String,
+        openid_connect_url: String,
+    },
 }
 
 impl SecurityScheme {
@@ -293,6 +334,8 @@ impl SecurityScheme {
         match self {
             SecurityScheme::ApiKey { scheme_name, .. } => scheme_name,
             SecurityScheme::HttpBearer { scheme_name, .. } => scheme_name,
+            SecurityScheme::OAuth2 { scheme_name, .. } => scheme_name,
+            SecurityScheme::OpenIdConnect { scheme_name, .. } => scheme_name,
         }
     }
 }

@@ -55,19 +55,95 @@ use flap_ir::{
 // ── Identifier policy ────────────────────────────────────────────────────────
 
 const DART_CORE_COLLISIONS: &[&str] = &[
-    "bool", "DateTime", "double", "Duration", "Error", "Exception", "Function", "Future", "int",
-    "Iterable", "List", "Map", "num", "Object", "Pattern", "Record", "RegExp", "Set", "Stream",
-    "String", "Symbol", "Type", "Uri",
+    "bool",
+    "DateTime",
+    "double",
+    "Duration",
+    "Error",
+    "Exception",
+    "Function",
+    "Future",
+    "int",
+    "Iterable",
+    "List",
+    "Map",
+    "num",
+    "Object",
+    "Pattern",
+    "Record",
+    "RegExp",
+    "Set",
+    "Stream",
+    "String",
+    "Symbol",
+    "Type",
+    "Uri",
 ];
 
 const DART_RESERVED_KEYWORDS: &[&str] = &[
-    "abstract", "as", "assert", "async", "await", "break", "case", "catch", "class", "const",
-    "continue", "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
-    "extends", "extension", "external", "factory", "false", "final", "finally", "for", "get",
-    "hide", "if", "implements", "import", "in", "interface", "is", "late", "library", "mixin",
-    "new", "null", "of", "on", "operator", "part", "required", "rethrow", "return", "set", "show",
-    "static", "super", "switch", "sync", "this", "throw", "true", "try", "typedef", "var", "void",
-    "while", "with", "yield",
+    "abstract",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "dynamic",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extension",
+    "external",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "get",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "of",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "set",
+    "show",
+    "static",
+    "super",
+    "switch",
+    "sync",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
 ];
 
 fn dart_class_name(schema_name: &str) -> String {
@@ -552,10 +628,7 @@ fn emit_freezed_class(
 fn type_ref_supports_optional_wrapper(type_ref: &TypeRef) -> bool {
     matches!(
         type_ref,
-        TypeRef::String
-            | TypeRef::Integer { .. }
-            | TypeRef::Number { .. }
-            | TypeRef::Boolean
+        TypeRef::String | TypeRef::Integer { .. } | TypeRef::Number { .. } | TypeRef::Boolean
     )
 }
 
@@ -601,8 +674,7 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
         (false, true) => {
             if type_ref_supports_optional_wrapper(&field.type_ref) {
                 sibling_annotations.push("@OptionalConverter()".to_string());
-                sibling_annotations
-                    .push(format!("@Default(Optional<{dart_type}?>.absent())"));
+                sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
                 format!("Optional<{dart_type}?> {dart_name},\n")
             } else {
                 json_key_args.push("includeIfNull: false".to_string());
@@ -659,10 +731,24 @@ fn collect_field_imports(
             }
         }
         TypeRef::Map(inner) => {
-            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
+            collect_field_imports(
+                inner,
+                field_name,
+                schema_name,
+                class_name,
+                registry,
+                imports,
+            );
         }
         TypeRef::Array(inner) => {
-            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
+            collect_field_imports(
+                inner,
+                field_name,
+                schema_name,
+                class_name,
+                registry,
+                imports,
+            );
         }
         TypeRef::String
         | TypeRef::Integer { .. }
@@ -682,7 +768,11 @@ fn emit_synth_enum(synth: &SynthEnum) -> String {
     for (i, value) in synth.values.iter().enumerate() {
         let case = to_dart_enum_case(value);
         out.push_str(&format!("  @JsonValue('{value}')\n"));
-        let trailing = if i == synth.values.len() - 1 { ";" } else { "," };
+        let trailing = if i == synth.values.len() - 1 {
+            ";"
+        } else {
+            ","
+        };
         out.push_str(&format!("  {case}{trailing}\n"));
     }
     out.push_str("}\n");
@@ -832,6 +922,10 @@ fn emit_credential_injection(cred: &DartCredential) -> String {
                  ? cookie\n                : '$existing; $cookie';\n          }}\n"
             ),
         },
+        SecurityScheme::OAuth2 { .. } | SecurityScheme::OpenIdConnect { .. } => format!(
+            "          if ({dart} != null) {{\n            \
+             options.headers['Authorization'] = 'Bearer ${{{dart}}}';\n          }}\n"
+        ),
     }
 }
 
@@ -1473,7 +1567,9 @@ mod tests {
     fn schema_with_field(name: &str, field: Field) -> Schema {
         Schema {
             name: name.into(),
-            kind: SchemaKind::Object { fields: vec![field] },
+            kind: SchemaKind::Object {
+                fields: vec![field],
+            },
         }
     }
 
@@ -1596,7 +1692,9 @@ mod tests {
         let registry = EnumRegistry::default();
         let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
         assert!(
-            src.contains("@OptionalConverter() @Default(Optional<int?>.absent()) Optional<int?> count,"),
+            src.contains(
+                "@OptionalConverter() @Default(Optional<int?>.absent()) Optional<int?> count,"
+            ),
             "expected int wrapper, got:\n{src}"
         );
     }
@@ -1765,9 +1863,7 @@ mod tests {
         let registry = EnumRegistry::default();
         let src = emit_freezed_class("ErrorModel", "Error", &fields_of(&schema), &registry);
         assert!(
-            src.contains(
-                "stripOptionalAbsent(_$ErrorModelToJson(this as _ErrorModel));"
-            ),
+            src.contains("stripOptionalAbsent(_$ErrorModelToJson(this as _ErrorModel));"),
             "toJson cast must use the D7-renamed class, got:\n{src}"
         );
     }
@@ -1786,5 +1882,116 @@ mod tests {
         let (_, src) = emit_client(&petstore_api());
         assert!(src.contains("'/pets/${petId}',"));
         assert!(src.contains("return Pet.fromJson(data as Map<String, dynamic>);"));
+    }
+
+    // ── OAuth2 / OpenID Connect emission ─────────────────────────────────────
+
+    fn oauth2_api() -> Api {
+        use flap_ir::{OAuth2Flow, OAuth2FlowType};
+        Api {
+            title: "OAuth2 Petstore".into(),
+            base_url: Some("https://api.example.com/v1".into()),
+            operations: vec![],
+            schemas: vec![],
+            security_schemes: vec![SecurityScheme::OAuth2 {
+                scheme_name: "oauth2Auth".into(),
+                flows: vec![
+                    OAuth2Flow {
+                        flow_type: OAuth2FlowType::ClientCredentials,
+                        token_url: Some("https://auth.example.com/token".into()),
+                        authorization_url: None,
+                        scopes: vec!["read:pets".into()],
+                    },
+                    OAuth2Flow {
+                        flow_type: OAuth2FlowType::AuthorizationCode,
+                        token_url: Some("https://auth.example.com/token".into()),
+                        authorization_url: Some("https://auth.example.com/authorize".into()),
+                        scopes: vec!["read:pets".into()],
+                    },
+                ],
+            }],
+            security: vec!["oauth2Auth".into()],
+        }
+    }
+
+    fn oidc_api() -> Api {
+        Api {
+            title: "OIDC Petstore".into(),
+            base_url: Some("https://api.example.com/v1".into()),
+            operations: vec![],
+            schemas: vec![],
+            security_schemes: vec![SecurityScheme::OpenIdConnect {
+                scheme_name: "oidcAuth".into(),
+                openid_connect_url: "https://auth.example.com/.well-known/openid-configuration"
+                    .into(),
+            }],
+            security: vec!["oidcAuth".into()],
+        }
+    }
+
+    #[test]
+    fn oauth2_emits_access_token_constructor_param() {
+        let (_, src) = emit_client(&oauth2_api());
+        assert!(
+            src.contains("String? oauth2Auth,"),
+            "expected oauth2Auth param, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn oauth2_emits_bearer_interceptor_injection() {
+        let (_, src) = emit_client(&oauth2_api());
+        assert!(
+            src.contains("options.headers['Authorization'] = 'Bearer ${oauth2Auth}'"),
+            "expected Bearer injection, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn oidc_emits_access_token_constructor_param() {
+        let (_, src) = emit_client(&oidc_api());
+        assert!(
+            src.contains("String? oidcAuth,"),
+            "expected oidcAuth param, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn oidc_emits_bearer_interceptor_injection() {
+        let (_, src) = emit_client(&oidc_api());
+        assert!(
+            src.contains("options.headers['Authorization'] = 'Bearer ${oidcAuth}'"),
+            "expected Bearer injection, got:\n{src}"
+        );
+    }
+
+    #[test]
+    fn oauth2_and_bearer_can_coexist_in_constructor() {
+        use flap_ir::{OAuth2Flow, OAuth2FlowType};
+        let api = Api {
+            title: "Mixed".into(),
+            base_url: None,
+            operations: vec![],
+            schemas: vec![],
+            security_schemes: vec![
+                SecurityScheme::HttpBearer {
+                    scheme_name: "bearerAuth".into(),
+                    bearer_format: Some("JWT".into()),
+                },
+                SecurityScheme::OAuth2 {
+                    scheme_name: "oauth2Auth".into(),
+                    flows: vec![OAuth2Flow {
+                        flow_type: OAuth2FlowType::ClientCredentials,
+                        token_url: Some("https://auth.example.com/token".into()),
+                        authorization_url: None,
+                        scopes: vec![],
+                    }],
+                },
+            ],
+            security: vec!["bearerAuth".into(), "oauth2Auth".into()],
+        };
+        let (_, src) = emit_client(&api);
+        assert!(src.contains("String? bearerAuth,"));
+        assert!(src.contains("String? oauth2Auth,"));
     }
 }

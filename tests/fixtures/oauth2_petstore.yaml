@@ -1,0 +1,58 @@
+openapi: 3.0.0
+info:
+  title: OAuth2 Petstore
+  version: '1.0.0'
+servers:
+  - url: https://api.example.com/v1
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      summary: List all pets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pet'
+        '401':
+          description: Unauthorised
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+security:
+  - oauth2Auth: [read:pets]
+  - oidcAuth: []
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: integer, format: int32 }
+        message: { type: string }
+  securitySchemes:
+    oauth2Auth:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.example.com/token
+          scopes:
+            read:pets: Read access to pets
+            write:pets: Write access to pets
+        authorizationCode:
+          authorizationUrl: https://auth.example.com/authorize
+          tokenUrl: https://auth.example.com/token
+          scopes:
+            read:pets: Read access to pets
+    oidcAuth:
+      type: openIdConnect
+      openIdConnectUrl: https://auth.example.com/.well-known/openid-configuration
