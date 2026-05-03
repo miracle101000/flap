@@ -1,0 +1,55 @@
+openapi: 3.0.0
+info:
+  title: Patch Test
+  version: '1.0.0'
+paths:
+  /users/{id}:
+    patch:
+      operationId: updateUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '204':
+          description: ok
+components:
+  schemas:
+    UpdateUserRequest:
+      type: object
+      required: [id, bio]
+      properties:
+        # required + non-nullable    → required String id
+        id:
+          type: string
+        # required + nullable        → required String? bio
+        bio:
+          type: string
+          nullable: true
+        # optional + non-nullable    → @JsonKey(includeIfNull: false) String? tag
+        tag:
+          type: string
+        # optional + nullable + prim → Optional<String?> nickname (the PATCH cell)
+        nickname:
+          type: string
+          nullable: true
+        # snake_case + the PATCH cell → name rewrite + wrapper combined
+        display_name:
+          type: string
+          nullable: true
+        # optional + nullable + non-prim → fallback with TODO
+        avatar:
+          $ref: '#/components/schemas/Avatar'
+    Avatar:
+      type: object
+      properties:
+        url:
+          type: string
