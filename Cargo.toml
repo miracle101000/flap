@@ -15,4 +15,5 @@ flap-spec = { path = "crates/flap-spec" }
 [dev-dependencies]
 flap-emit-dart = { path = "crates/flap-emit-dart" }
 flap-spec = { path = "crates/flap-spec" }
-
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
