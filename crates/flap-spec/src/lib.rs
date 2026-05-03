@@ -759,7 +759,11 @@ enum RawSchemaOrRef {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawSchema {
-    #[serde(default, deserialize_with = "deserialize_openapi_type")]
+    #[serde(
+        default,
+        rename = "type",
+        deserialize_with = "deserialize_openapi_type"
+    )]
     ty: Vec<String>,
     format: Option<String>,
     #[serde(default)]

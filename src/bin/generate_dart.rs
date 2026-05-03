@@ -2,21 +2,20 @@
 //! to disk. Each spec gets its own subdirectory under the shared output root.
 //!
 //! Usage:
-//!   cargo run --example gen_dart -- --out <out-dir> <spec> [<spec> ...]
+//!   cargo run --bin generate_dart -- --out <out-dir> <spec> [<spec> ...]
 //!
 //! Examples:
-//!   # Single local file (unchanged behaviour)
-//!   cargo run --example gen_dart -- \
-//!     --out /tmp/sdks \
+//!   # Single local file output to an 'sdks' folder in the project root
+//!   cargo run --bin generate_dart -- \
+//!     --out ./sdks \
 //!     tests/fixtures/petstore.yaml
 //!
-//!   # Multiple specs in one run
-//!   cargo run --example gen_dart -- \
-//!     --out /tmp/sdks \
+//!   # Multiple specs in one run output to the project root
+//!   cargo run --bin generate_dart -- \
+//!     --out ./sdks \
 //!     tests/fixtures/petstore.yaml \
 //!     tests/fixtures/secure_petstore.yaml \
 //!     https://petstore3.swagger.io/api/v3/openapi.yaml
-
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -59,7 +58,7 @@ fn main() -> ExitCode {
 
         // Derive a safe directory name from the spec path or URL stem.
         let subdir_name = spec_to_dir_name(spec);
-        
+
         for (mode, suffix) in [
             (flap_emit_dart::NullSafety::Safe, "null_safe"),
             (flap_emit_dart::NullSafety::Unsafe, "null_unsafe"),
