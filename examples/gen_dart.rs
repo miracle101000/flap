@@ -1,12 +1,16 @@
 //! Generates a Dart SDK from an OpenAPI spec and writes every file to disk.
 //!
 //! Usage:
-//!   cargo run --example gen_dart -- <spec.yaml> <out-dir>
+//!   cargo run --example gen_dart -- <spec.yaml|https://...> <out-dir>
 //!
 //! Example:
 //!   cargo run --example gen_dart -- \
 //!     tests/fixtures/secure_petstore.yaml \
 //!     /tmp/secure_petstore_sdk
+//!
+//!   cargo run --example gen_dart -- \
+//!     https://petstore3.swagger.io/api/v3/openapi.yaml \
+//!     /tmp/petstore_sdk
 
 use std::env;
 use std::fs;
@@ -15,17 +19,19 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
+
     let Some(spec_path) = args.next() else {
-        eprintln!("usage: gen_dart <spec.yaml> <out-dir>");
+        eprintln!("usage: gen_dart <spec.yaml|https://...> <out-dir>");
         return ExitCode::from(2);
     };
     let Some(out_dir) = args.next() else {
-        eprintln!("usage: gen_dart <spec.yaml> <out-dir>");
+        eprintln!("usage: gen_dart <spec.yaml|https://...> <out-dir>");
         return ExitCode::from(2);
     };
+
     let out_dir = PathBuf::from(out_dir);
 
-    let api = match flap_spec::load(&spec_path) {
+    let api = match flap_spec::load_path_or_url(&spec_path) {
         Ok(api) => api,
         Err(e) => {
             eprintln!("error loading spec: {e:#}");
@@ -65,5 +71,6 @@ fn main() -> ExitCode {
         models.len(),
         out_dir.display()
     );
+
     ExitCode::SUCCESS
 }

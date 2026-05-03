@@ -1118,6 +1118,11 @@ fn emit_constructor(class_name: &str, credentials: &[DartCredential]) -> String 
 fn emit_credential_injection(cred: &DartCredential) -> String {
     let dart = &cred.dart_param_name;
     match cred.scheme {
+        SecurityScheme::HttpBasic { .. } => format!(
+            "          if ({dart} != null) {{\n            \
+     final basic = 'Basic ${{base64Encode(utf8.encode({dart})))}}';\n            \
+     options.headers['Authorization'] = basic;\n          }}\n"
+        ),
         SecurityScheme::HttpBearer { .. } => format!(
             "          if ({dart} != null) {{\n            \
              options.headers['Authorization'] = 'Bearer ${dart}';\n          }}\n"

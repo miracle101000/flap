@@ -138,6 +138,11 @@ pub struct Schema {
     /// When true the emitter skips this schema – it's an implementation
     /// detail of the lowering (e.g. an anyOf wrapper for a primitive).
     pub internal: bool,
+    /// Set to `Some(parent_name)` when this schema is defined as
+    ///   `allOf: [$ref: Parent, {type: object, properties: {...}}]`
+    /// i.e. classical OOP-style inheritance. Emitters can use this to
+    /// generate proper subtype relationships rather than flat objects.
+    pub extends: Option<String>,
 }
 
 #[derive(Debug)]
@@ -320,6 +325,9 @@ pub enum SecurityScheme {
         parameter_name: String,
         location: ApiKeyLocation,
     },
+    HttpBasic {
+        scheme_name: String,
+    },
     HttpBearer {
         scheme_name: String,
         bearer_format: Option<String>,
@@ -338,6 +346,7 @@ pub enum SecurityScheme {
 impl SecurityScheme {
     pub fn scheme_name(&self) -> &str {
         match self {
+            SecurityScheme::HttpBasic { scheme_name, .. } => scheme_name,
             SecurityScheme::ApiKey { scheme_name, .. } => scheme_name,
             SecurityScheme::HttpBearer { scheme_name, .. } => scheme_name,
             SecurityScheme::OAuth2 { scheme_name, .. } => scheme_name,

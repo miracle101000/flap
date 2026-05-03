@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Deserialize;
 
@@ -6,19 +6,33 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct SwaggerSpec {
     #[allow(dead_code)]
-    swagger: String, // "2.0"
+    pub swagger: String, // "2.0"
     pub(crate) info: SwaggerInfo,
-    host: Option<String>,
+    pub host: Option<String>,
     #[serde(rename = "basePath")]
-    base_path: Option<String>,
+    pub base_path: Option<String>,
     #[serde(default)]
-    paths: BTreeMap<String, SwaggerPathItem>,
+    pub paths: BTreeMap<String, SwaggerPathItem>,
     #[serde(default)]
-    definitions: BTreeMap<String, SwaggerSchemaOrRef>,
+    pub definitions: BTreeMap<String, SwaggerSchemaOrRef>,
     #[serde(default, rename = "securityDefinitions")]
-    security_definitions: BTreeMap<String, SwaggerSecurityDefinition>,
+    pub security_definitions: BTreeMap<String, SwaggerSecurityDefinition>,
     #[serde(default)]
-    security: Vec<BTreeMap<String, Vec<String>>>,
+    pub security: Vec<BTreeMap<String, Vec<String>>>,
+}
+
+pub struct SwaggerContext<'a> {
+    pub definitions: &'a BTreeMap<String, SwaggerSchemaOrRef>,
+    pub visiting: HashSet<String>,
+}
+
+impl<'a> SwaggerContext<'a> {
+    pub fn new(definitions: &'a BTreeMap<String, SwaggerSchemaOrRef>) -> Self {
+        Self {
+            definitions,
+            visiting: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,7 +52,7 @@ pub struct SwaggerPathItem {
     pub patch: Option<SwaggerOperation>,
     // Top‑level parameters (inherited by all operations)
     #[serde(default)]
-    parameters: Vec<SwaggerParameter>,
+    pub parameters: Vec<SwaggerParameter>,
 }
 
 // Operation
