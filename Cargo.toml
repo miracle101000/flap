@@ -11,9 +11,14 @@ edition = "2021"
 flap-ir = { path = "crates/flap-ir" }
 flap-emit-dart = { path = "crates/flap-emit-dart" }
 flap-spec = { path = "crates/flap-spec" }
+sha2 = "0.10" 
+anyhow = "1"
+clap = "4"
 
 [dev-dependencies]
 flap-emit-dart = { path = "crates/flap-emit-dart" }
 flap-spec = { path = "crates/flap-spec" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+sha2 = "0.10"          # ← add
+tempfile = "3"         # ← add

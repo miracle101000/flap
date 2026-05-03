@@ -71,19 +71,77 @@ Operations (1):
 Schemas (0):
 ```
 
-Generating Dart clients
+## Generating Dart clients
 
-- The workspace contains `crates/flap-emit-dart` — this is the Dart emitter that consumes the IR. Build it with:
+The workspace contains `crates/flap-emit-dart` — the Dart emitter that
+consumes the flap IR and materialises a complete Dart package. The
+`generate_dart` binary ties everything together.
+
+### Prerequisites
+
+- **Rust toolchain** (`rustup` + `cargo`) to build and run flap.
+- **Dart SDK ≥ 2.19** — the `dart` binary must be on your `$PATH`.
+  Install from <https://dart.dev/get-dart>. If you only want to inspect
+  generated source without compiling it, you can skip the Dart SDK and
+  pass `--no-build-runner` (see below).
+
+### Running the generator
 
 ```bash
-cargo build -p flap-emit-dart
+cargo run --bin generate_dart -- \
+  --spec path/to/your/spec.yaml \
+  --out  path/to/output/package
 ```
 
-- The emitter interface and invocation may change while the project is in development. Check `crates/flap-emit-dart` for the current API/CLI. The expected workflow is:
-  1. Lower an OpenAPI spec to the flap IR (this is handled by `flap-spec`).
-  2. Run the Dart emitter to materialize a Dart package (pubspec + lib) using idiomatic patterns (Freezed/json_serializable, preserving nullability semantics).
+The generator performs these steps automatically:
 
-Repository layout
+1. Loads and validates your OpenAPI 3.0 spec.
+2. Writes a complete Dart package to `--out` (`pubspec.yaml` + all
+   source files under `lib/`).
+3. Runs `dart pub get` inside the output directory.
+4. Runs `dart run build_runner build --delete-conflicting-outputs`
+   inside the output directory, producing the Freezed/json_serializable
+   implementation files (`.freezed.dart`, `.g.dart`).
+
+After step 4 the package is fully ready to import.
+
+### Skipping build_runner
+
+Pass `--no-build-runner` if the Dart SDK is not available in your
+current environment, or if you prefer to run code generation yourself:
+
+```bash
+cargo run --bin generate_dart -- \
+  --spec path/to/spec.yaml \
+  --out  /tmp/my_package \
+  --no-build-runner
+```
+
+flap will print a reminder with the exact commands to run manually:
+
+```
+dart pub get && dart run build_runner build --delete-conflicting-outputs
+```
+
+### Typical CI pattern
+
+```yaml
+- name: Generate Dart client
+  run: |
+    cargo run --bin generate_dart -- \
+      --spec api/openapi.yaml \
+      --out  generated/my_api_client
+
+- name: Analyse generated client
+  working-directory: generated/my_api_client
+  run: dart analyze
+```
+
+Because `--no-build-runner` is **not** set, the generated `.freezed.dart`
+and `.g.dart` files are produced in the same step and can be analysed
+immediately without a separate build_runner invocation.
+
+## Repository layout
 
 - Cargo.toml           — workspace + top-level package "flap" (CLI)
 - src/main.rs          — CLI entry point (summary printer)
@@ -93,29 +151,29 @@ Repository layout
   - flap-emit-dart/    — Dart emitter (produces Dart client packages)
 - examples/            — (placeholder) suggested place for sample specs and generated output
 
-Contributing
+## Contributing
 
 Contributions, issues, and suggestions are welcome. Useful first PRs:
 - Add a LICENSE (MIT or Apache-2.0 recommended)
 - Add example OpenAPI specs and the generated Dart outputs for those specs
 - Add CI (build + basic integration test that runs the emitter and checks generated code compiles)
 
-Development tips
+## Development tips
 - Run `cargo build --workspace` to compile everything.
 - Use `cargo run --package flap -- path/to/spec.yaml` to inspect a spec.
 - To iterate on the Dart emitter, work inside `crates/flap-emit-dart` and add small specs to `examples/`.
 
-License
+## License
 
 This repository does not include a LICENSE file yet. Please add one to make reuse and contribution clear (MIT or Apache-2.0 are common choices).
 
-Roadmap / Next steps
+## Roadmap / Next steps
 - Add example specs and generated Dart packages to `examples/` so users can try flap quickly.
 - Document the emitter invocation and make the emitter produce a ready-to-publish Dart package (including pubspec.yaml and readme).
 - Add a minimal Flutter demo that consumes a generated client to demonstrate integration.
 - Add CI to build the workspace and run a smoke test that the generated Dart package analyzes/compiles.
 
-Contact
+## Contact
 
 If you want help polishing the emitter or creating examples, I can:
 - Inspect `crates/flap-emit-dart` and draft a recommended emitter CLI and output layout
