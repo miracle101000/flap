@@ -754,22 +754,6 @@ fn is_variant_primitive(variant_type_ref: &TypeRef, schemas: &[Schema]) -> bool 
     }
 }
 
-fn is_anyof_wrapper(schemas: &[Schema], variant_name: &str) -> bool {
-    schemas.iter().any(|s| s.name == variant_name && matches!(s.kind, SchemaKind::Object { ref fields } if fields.len() == 1 && fields[0].name == "value"))
-}
-
-fn wrapper_inner_type<'a>(schemas: &'a [Schema], variant_name: &str) -> Option<&'a TypeRef> {
-    schemas
-        .iter()
-        .find(|s| s.name == variant_name)
-        .and_then(|s| match &s.kind {
-            SchemaKind::Object { fields } if fields.len() == 1 && fields[0].name == "value" => {
-                Some(&fields[0].type_ref)
-            }
-            _ => None,
-        })
-}
-
 // ── Top-level array / map → typedef ──────────────────────────────────────────
 
 fn emit_array_typedef(name: &str, item: &TypeRef) -> String {

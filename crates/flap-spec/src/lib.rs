@@ -342,7 +342,7 @@ fn collect_swagger_object_fields(
     }
 
     // deduplicate (same as in spec.rs)
-    let mut seen = BTreeMap::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut deduped: Vec<Field> = Vec::with_capacity(fields.len());
     for field in fields {
         if let Some(&idx) = seen.get(&field.name) {
