@@ -12,11 +12,11 @@
 //! wins, because narrowing later would silently drop wire forms a base
 //! schema legitimately accepts).
 //!
-//! OpenAPI 3.1's `type: [string, "null"]` is intentionally not parsed
-//! here. The `reject_unsupported_version` guard runs before serde, so a
-//! 3.1 document never reaches this layer. When the 3.1 ban drops, the
-//! type-array form will need translating into the same boolean before
-//! reaching `collect_object_fields`.
+//! OpenAPI 3.1's `type: [T, "null"]` is supported: `deserialize_openapi_type`
+//! already accepts both a bare string and an array of strings, `primary_type`
+//! filters out `"null"` to find the real type, and `is_nullable` detects it.
+//! The 3.0 `nullable: true` keyword and the 3.1 array form are OR-merged in
+//! `collect_object_fields`, so both formats produce identical IR.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -24,8 +24,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flap_ir::{
-    Api, ApiKeyLocation, Field, HttpMethod, OAuth2Flow, OAuth2FlowType, Operation, Parameter,
-    ParameterLocation, RequestBody, Response, Schema, SchemaKind, SecurityScheme, TypeRef,
+    Api, ApiKeyLocation, EnumValue, Field, HttpMethod, OAuth2Flow, OAuth2FlowType, Operation,
+    Parameter, ParameterLocation, RequestBody, Response, Schema, SchemaKind, SecurityScheme,
+    TypeRef,
 };
 use serde::Deserialize;
 pub mod swagger;
@@ -43,7 +44,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Api> {
     }
 
     // existing 3.x path
-    reject_unsupported_version(&text)?;
+    check_openapi_version(&text)?;
     let raw: RawSpec = serde_yaml::from_str(&text).context("parsing OpenAPI YAML")?;
     lower(raw)
 }
@@ -55,7 +56,7 @@ fn lower_swagger_inline_type(
     enum_values: &[serde_yaml::Value],
 ) -> Result<TypeRef> {
     if !enum_values.is_empty() {
-        let values = stringify_enum_values("anonymous_enum", enum_values)
+        let values = lower_enum_values("anonymous_enum", enum_values)
             .with_context(|| "invalid enum value")?;
         return Ok(TypeRef::Enum(values));
     }
@@ -76,12 +77,8 @@ fn lower_swagger_inline_type(
         Some("boolean") => Ok(TypeRef::Boolean),
         Some("array") => {
             let items = items.ok_or_else(|| anyhow!("array type missing items"))?;
-            let inner = lower_swagger_inline_type(
-                Some(&items.ty),
-                items.format.as_deref(),
-                None, // nested items rare, keep simple
-                &[],
-            )?;
+            let inner =
+                lower_swagger_inline_type(Some(&items.ty), items.format.as_deref(), None, &[])?;
             Ok(TypeRef::Array(Box::new(inner)))
         }
         Some("file") => bail!("file parameters are not supported"),
@@ -138,19 +135,20 @@ fn parse_swagger_ref(reference: &str) -> Result<&str> {
     }
     Ok(bare)
 }
+
 fn lower_swagger(spec: SwaggerSpec) -> Result<Api> {
     let title = spec.info.title;
-    let base_url = build_swagger_base_url(&spec.host, &spec.base_path);
-
+    let base_urls = build_swagger_base_url(&spec.host, &spec.base_path)
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut ctx = SwaggerContext::new(&spec.definitions);
     let operations = lower_swagger_operations(&spec.paths, &mut ctx)?;
     let schemas = lower_swagger_schemas(&spec.definitions, &mut ctx)?;
     let security_schemes = lower_swagger_security(&spec.security_definitions)?;
     let security = flatten_security_requirements(&spec.security);
-
     Ok(Api {
         title,
-        base_url,
+        base_urls,
         operations,
         schemas,
         security_schemes,
@@ -551,7 +549,7 @@ fn lower_swagger_body_param(
 
 /// Exposed for unit tests.
 pub fn load_str(text: &str) -> Result<Api> {
-    reject_unsupported_version(text)?;
+    check_openapi_version(text)?;
     let raw: RawSpec = serde_yaml::from_str(text).context("parsing OpenAPI YAML")?;
     lower(raw)
 }
@@ -583,7 +581,7 @@ pub fn load_url(url: &str) -> Result<Api> {
         return load_swagger_str(&text).with_context(|| format!("in remote spec {url}"));
     }
 
-    reject_unsupported_version(&text)?;
+    check_openapi_version(&text)?;
     let raw: RawSpec = serde_yaml::from_str(&text).context("parsing OpenAPI YAML")?;
     lower(raw)
 }
@@ -599,18 +597,14 @@ pub fn load_path_or_url(spec: &str) -> Result<Api> {
 }
 
 // ── Version guard ────────────────────────────────────────────────────────────
-
-fn reject_unsupported_version(text: &str) -> Result<()> {
+fn check_openapi_version(text: &str) -> Result<()> {
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("openapi:") {
             let v = rest.trim().trim_matches(|c: char| c == '"' || c == '\'');
             if v.starts_with("3.") {
                 return Ok(());
             }
-            if !v.starts_with("3.") {
-                bail!("unsupported OpenAPI version `{v}` — flap v0.1 requires 3.0.x");
-            }
-            return Ok(());
+            bail!("unsupported OpenAPI version `{v}` — flap supports OpenAPI 3.x");
         }
     }
     Ok(())
@@ -784,13 +778,11 @@ struct RawSchema {
     #[serde(default, rename = "oneOf")]
     one_of: Vec<RawSchemaOrRef>,
     discriminator: Option<RawDiscriminator>,
-    /// OpenAPI 3.0 `nullable: true`. Defaults to false. v0.1 rejects 3.1
-    /// up front (DECISIONS D5), so 3.1's type-array form
-    /// (`type: [string, "null"]`) is intentionally not modelled here —
-    /// the version guard runs before serde, so we'd never see one. When
-    /// we drop the 3.1 ban, lowering will need a small pass to translate
-    /// that shape into the same `nullable` boolean before reaching
-    /// `collect_object_fields`.
+    // AFTER
+    /// OpenAPI 3.0 `nullable: true`. In 3.1 this keyword was removed in
+    /// favour of `type: [T, "null"]`. Both forms are handled: this field
+    /// captures the 3.0 flag, and `is_nullable(&raw.ty)` detects the 3.1
+    /// array form. `collect_object_fields` ORs the two together.
     #[serde(default)]
     nullable: Option<bool>,
     #[serde(rename = "default")]
@@ -918,26 +910,39 @@ fn parse_schema_ref_pointer(reference: &str) -> Result<&str> {
     Ok(bare)
 }
 
+// ── 1. lower_enum_values ──────────────────────────────────────────────────────
+
+fn lower_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<Vec<EnumValue>> {
+    raw.iter()
+        .map(|v| match v {
+            serde_yaml::Value::String(s) => Ok(EnumValue::Str(s.clone())),
+            serde_yaml::Value::Number(n) => n.as_i64().map(EnumValue::Int).ok_or_else(|| {
+                anyhow!(
+                    "enum value `{n}` in `{field_name}` is not a 64-bit integer — \
+                         only string and integer enum values are supported"
+                )
+            }),
+            other => Err(anyhow!(
+                "enum value `{other:?}` in `{field_name}` is not a string or integer"
+            )),
+        })
+        .collect()
+}
+
 // ── Lowering pass (Raw* → IR) ─────────────────────────────────────────────────
 
 fn lower(raw: RawSpec) -> Result<Api> {
     let title = raw.info.title;
-    let base_url = raw.servers.into_iter().next().map(|s| s.url);
-
-    // Pre-pass: discover allOf-based inheritance so discriminator-only
-    // union parents can find their variants before main lowering starts.
+    let base_urls: Vec<String> = raw.servers.into_iter().map(|s| s.url).collect();
     let extension_map = build_allof_extension_map(&raw.components.schemas);
-
     let mut ctx = LoweringContext::new(&raw.components, extension_map);
-
     let operations = lower_operations(&raw.paths, &mut ctx)?;
     let schemas = lower_schemas(&raw.components.schemas, &mut ctx)?;
     let security_schemes = lower_security_schemes(&raw.components.security_schemes)?;
     let security = flatten_security_requirements(&raw.security);
-
     Ok(Api {
         title,
-        base_url,
+        base_urls,
         operations,
         schemas,
         security_schemes,
@@ -1502,10 +1507,19 @@ fn lower_schema_kind(
     ctx: &mut LoweringContext,
 ) -> Result<SchemaKind> {
     match sor {
-        RawSchemaOrRef::Ref { reference } => Err(anyhow!(
-            "top-level schema `{name}` is a bare $ref (`{reference}`); \
-             aliases are not yet supported in v0.1"
-        )),
+        RawSchemaOrRef::Ref { reference } => {
+            let target = parse_schema_ref_pointer(reference)
+                .with_context(|| format!("top-level schema `{name}` is a bare $ref"))?;
+            if !ctx.components.schemas.contains_key(target) {
+                bail!(
+                    "top-level schema `{name}` aliases `{target}` \
+                     which is not defined in components.schemas"
+                );
+            }
+            Ok(SchemaKind::Alias {
+                target: target.to_string(),
+            })
+        }
         RawSchemaOrRef::Inline(raw) => lower_inline_schema(name, raw, ctx),
     }
 }
@@ -1664,9 +1678,9 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
         // wrapper around the ref.
         let is_nullable = match sor {
             RawSchemaOrRef::Inline(raw) => {
-                let mut n = raw.nullable.unwrap_or(false);
-                n |= is_nullable(&raw.ty); // helper that checks if type array contains "null"
-                n
+                // 3.0: `nullable: true` keyword.
+                // 3.1: `type: ["string", "null"]` — is_nullable scans the array.
+                raw.nullable.unwrap_or(false) | is_nullable(&raw.ty)
             }
             RawSchemaOrRef::Ref { .. } => false,
         };
@@ -1715,16 +1729,41 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
 }
 
 fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Result<SchemaKind> {
-    let discriminator = raw.discriminator.as_ref().ok_or_else(|| {
-        anyhow!(
-            "schema `{name}` uses `oneOf` without a `discriminator` block. \
-             Per DECISIONS D6, only discriminated unions are supported in \
-             v0.1 — add a `discriminator: {{ propertyName: <field> }}` \
-             block alongside the `oneOf` list, or replace the `oneOf` \
-             with an `allOf` composition if the schemas share a base."
-        )
-    })?;
+    if raw.discriminator.is_none() {
+        // No discriminator: use untagged-union semantics, same as anyOf.
+        // The emitter tries each variant's fromJson in order.
+        let mut variants = Vec::with_capacity(raw.one_of.len());
+        let mut wrapper_schemas = Vec::new();
+        for (i, sor) in raw.one_of.iter().enumerate() {
+            let type_ref = lower_type_ref(&format!("{name}_variant_{i}"), sor, ctx)?;
+            match type_ref {
+                TypeRef::Named(n) => variants.push(TypeRef::Named(n)),
+                other => {
+                    let wrapper_name = format!("{name}Variant{i}");
+                    wrapper_schemas.push(Schema {
+                        name: wrapper_name.clone(),
+                        kind: SchemaKind::Object {
+                            fields: vec![Field {
+                                name: "value".to_string(),
+                                type_ref: other,
+                                required: true,
+                                nullable: false,
+                                is_recursive: false,
+                                default_value: None,
+                            }],
+                        },
+                        internal: true,
+                        extends: None,
+                    });
+                    variants.push(TypeRef::Named(wrapper_name));
+                }
+            }
+        }
+        ctx.synthetic_schemas.extend(wrapper_schemas);
+        return Ok(SchemaKind::UntaggedUnion { variants });
+    }
 
+    let discriminator = raw.discriminator.as_ref().unwrap();
     let property_name = discriminator.property_name.trim();
     if property_name.is_empty() {
         bail!(
@@ -1733,17 +1772,14 @@ fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Resul
              selects the variant."
         );
     }
-
     let mut tag_by_schema: BTreeMap<String, String> = BTreeMap::new();
     for (wire_tag, schema_ref) in &discriminator.mapping {
         let bare = parse_mapping_target(schema_ref)
             .with_context(|| format!("discriminator mapping entry `{wire_tag}` of `{name}`"))?;
         tag_by_schema.insert(bare.to_string(), wire_tag.clone());
     }
-
     let mut variants = Vec::with_capacity(raw.one_of.len());
     let mut variant_tags = Vec::with_capacity(raw.one_of.len());
-
     for (i, member) in raw.one_of.iter().enumerate() {
         let (variant, variant_name) = match member {
             RawSchemaOrRef::Ref { reference } => {
@@ -1757,20 +1793,16 @@ fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Resul
             RawSchemaOrRef::Inline(_) => bail!(
                 "oneOf[{i}] of `{name}` is an inline schema. \
                  v0.1 requires every `oneOf` variant to be a $ref into \
-                 `components.schemas` so each variant has a stable class \
-                 name. Lift the inline schema into a named component."
+                 `components.schemas` so each variant has a stable class name."
             ),
         };
-
         let wire_tag = tag_by_schema
             .get(&variant_name)
             .cloned()
             .unwrap_or_else(|| variant_name.clone());
-
         variants.push(variant);
         variant_tags.push(wire_tag);
     }
-
     Ok(SchemaKind::Union {
         variants,
         discriminator: property_name.to_string(),
@@ -1804,19 +1836,17 @@ fn collect_member_fields(sor: &RawSchemaOrRef, ctx: &mut LoweringContext) -> Res
                      (not present in components.schemas)"
                 )
             })?;
-            match target {
-                RawSchemaOrRef::Inline(target_raw) => {
-                    ctx.visiting.insert(bare.to_string());
-                    let result = collect_object_fields(target_raw, ctx)
-                        .with_context(|| format!("flattening `{bare}` for allOf"));
-                    ctx.visiting.remove(bare);
-                    result
-                }
-                RawSchemaOrRef::Ref { reference: inner } => Err(anyhow!(
-                    "`allOf` member `{bare}` is itself a $ref to `{inner}` — \
-                     ref chains are not supported in v0.1"
-                )),
-            }
+            ctx.visiting.insert(bare.to_string());
+            let result = match target {
+                RawSchemaOrRef::Inline(target_raw) => collect_object_fields(target_raw, ctx)
+                    .with_context(|| format!("flattening `{bare}` for allOf")),
+                // Follow the chain — A extends B extends C now works.
+                // `visiting` already contains `bare`, so cycles are caught next iteration.
+                RawSchemaOrRef::Ref { .. } => collect_member_fields(target, ctx)
+                    .with_context(|| format!("following ref chain through `{bare}`")),
+            };
+            ctx.visiting.remove(bare);
+            result
         }
         RawSchemaOrRef::Inline(raw) => collect_object_fields(raw, ctx),
     }
@@ -1842,16 +1872,14 @@ fn lower_type_ref(
         }
         RawSchemaOrRef::Inline(raw) => {
             if !raw.enum_values.is_empty() {
-                let values = stringify_enum_values(field_name, &raw.enum_values)?;
+                let values = lower_enum_values(field_name, &raw.enum_values)?;
                 return Ok(TypeRef::Enum(values));
             }
-
             if let Some(RawAdditionalProperties::Schema(inner)) = &raw.additional_properties {
                 let value = lower_type_ref("<additionalProperties>", inner, ctx)
                     .with_context(|| format!("additionalProperties of `{field_name}`"))?;
                 return Ok(TypeRef::Map(Box::new(value)));
             }
-
             match primary_type(&raw.ty) {
                 Some("string") => {
                     if raw.format.as_deref() == Some("date-time") {

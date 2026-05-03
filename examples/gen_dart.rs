@@ -45,7 +45,7 @@ fn main() -> ExitCode {
     }
 
     // Models: one file per schema, plus one per synthesised inline enum.
-    let models = flap_emit_dart::emit_models(&api);
+    let models = flap_emit_dart::emit_models(&api, mode);
     let mut filenames: Vec<&String> = models.keys().collect();
     filenames.sort();
     for filename in filenames {
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     }
 
     // Client.
-    let (client_filename, client_src) = flap_emit_dart::emit_client(&api);
+    let (client_filename, client_src) = flap_emit_dart::emit_client(&api, mode);
     let client_path = out_dir.join(&client_filename);
     if let Err(e) = fs::write(&client_path, &client_src) {
         eprintln!("error writing {}: {e}", client_path.display());

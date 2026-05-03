@@ -1,0 +1,5 @@
+Still not addressed:
+x- vendor extensions — entirely ignored; no hook points.
+Retries, interceptor config, cancellation tokens — constructor still only accepts auth credentials and baseUrl; no Dio option passthrough.
+Test stub generation — no mock/stub emitter exists.
+Spec validation — lowering is still structural only; a $ref to a missing schema isn't caught until lowering touches that field, and no JSON Schema validation runs before parsing.

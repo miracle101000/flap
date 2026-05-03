@@ -14,13 +14,31 @@ pub enum DefaultValue {
     Boolean(bool),
 }
 
+/// A single enum value. OpenAPI allows both string and integer enum values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EnumValue {
+    Str(String),
+    Int(i64),
+}
+
+impl fmt::Display for EnumValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EnumValue::Str(s) => f.write_str(s),
+            EnumValue::Int(n) => write!(f, "{n}"),
+        }
+    }
+}
+
 // ── Top-level ────────────────────────────────────────────────────────────────
 
 /// A fully-resolved API, ready for code generation.
 #[derive(Debug)]
 pub struct Api {
     pub title: String,
-    pub base_url: Option<String>,
+    /// All server URLs declared in `servers:`, in spec order.
+    /// Empty when no `servers:` block is present.
+    pub base_urls: Vec<String>,
     /// Ordered by path, then by HTTP method — deterministic output.
     pub operations: Vec<Operation>,
     /// Ordered by schema name — deterministic output.
@@ -189,6 +207,8 @@ pub enum SchemaKind {
     /// A union of forms where no single explicit discriminator field
     /// exists. Deserialization must attempt each variant in order.
     UntaggedUnion { variants: Vec<TypeRef> },
+    /// A top-level `$ref` alias — emitted as a Dart `typedef`.
+    Alias { target: String },
 }
 
 #[derive(Debug)]
@@ -212,10 +232,10 @@ pub struct Field {
     /// receiver of a PATCH must be able to distinguish "client did not
     /// send this key" from "client explicitly set this key to null".
     ///
-    /// OpenAPI 3.1's `type: [string, "null"]` is rejected at the version
-    /// guard (DECISIONS D5) so we never see it here; when the 3.1 ban
-    /// drops, lowering will need to translate that shape into this same
-    /// boolean.
+    /// OpenAPI 3.1's `type: [T, "null"]` is translated into this flag by
+    /// the lowering pass — the spec crate's `is_nullable` helper detects
+    /// `"null"` in the type array and the result is OR-merged with the 3.0
+    /// `nullable: true` keyword before being stored here.
     pub nullable: bool,
     /// True when this field's type (directly, or via `List<>` / `Map<>`)
     /// points at the schema currently being lowered — i.e. self-recursion
@@ -262,8 +282,9 @@ pub enum TypeRef {
     Boolean,
     /// `type: string, format: date-time` — emitted as Dart `DateTime`.
     DateTime,
-    /// A closed set of allowed string values (`enum: [...]`).
-    Enum(Vec<String>),
+    /// A closed set of allowed values (`enum: [...]`).
+    /// Supports both string and integer enum values.
+    Enum(Vec<EnumValue>),
     /// A homogeneous string-keyed dictionary value type.
     Map(Box<TypeRef>),
     /// An inline homogeneous list — `{ type: array, items: ... }`.
@@ -288,7 +309,7 @@ impl fmt::Display for TypeRef {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
-                    f.write_str(v)?;
+                    write!(f, "{v}")?;
                 }
                 f.write_str("]")
             }

@@ -59,43 +59,49 @@ fn main() -> ExitCode {
 
         // Derive a safe directory name from the spec path or URL stem.
         let subdir_name = spec_to_dir_name(spec);
-        let spec_out = out_dir.join(&subdir_name);
+        
+        for (mode, suffix) in [
+            (flap_emit_dart::NullSafety::Safe, "null_safe"),
+            (flap_emit_dart::NullSafety::Unsafe, "null_unsafe"),
+        ] {
+            let spec_out = out_dir.join(&subdir_name);
 
-        if let Err(e) = fs::create_dir_all(&spec_out) {
-            eprintln!("  error creating {}: {e}", spec_out.display());
-            any_failed = true;
-            continue;
-        }
-
-        // Models
-        let models = flap_emit_dart::emit_models(&api);
-        let mut filenames: Vec<&String> = models.keys().collect();
-        filenames.sort();
-        for filename in filenames {
-            let path = spec_out.join(filename);
-            if let Err(e) = fs::write(&path, &models[filename]) {
-                eprintln!("  error writing {}: {e}", path.display());
+            if let Err(e) = fs::create_dir_all(&spec_out) {
+                eprintln!("  error creating {}: {e}", spec_out.display());
                 any_failed = true;
                 continue;
             }
-            println!("  wrote {}", path.display());
-        }
 
-        // Client
-        let (client_filename, client_src) = flap_emit_dart::emit_client(&api);
-        let client_path = spec_out.join(&client_filename);
-        if let Err(e) = fs::write(&client_path, &client_src) {
-            eprintln!("  error writing {}: {e}", client_path.display());
-            any_failed = true;
-            continue;
-        }
-        println!("  wrote {}", client_path.display());
+            // Models
+            let models = flap_emit_dart::emit_models(&api, mode);
+            let mut filenames: Vec<&String> = models.keys().collect();
+            filenames.sort();
+            for filename in filenames {
+                let path = spec_out.join(filename);
+                if let Err(e) = fs::write(&path, &models[filename]) {
+                    eprintln!("  error writing {}: {e}", path.display());
+                    any_failed = true;
+                    continue;
+                }
+                println!("  wrote {}", path.display());
+            }
 
-        println!(
-            "  done — {} model file(s) + 1 client → {}",
-            models.len(),
-            spec_out.display()
-        );
+            // Client
+            let (client_filename, client_src) = flap_emit_dart::emit_client(&api, mode);
+            let client_path = spec_out.join(&client_filename);
+            if let Err(e) = fs::write(&client_path, &client_src) {
+                eprintln!("  error writing {}: {e}", client_path.display());
+                any_failed = true;
+                continue;
+            }
+            println!("  wrote {}", client_path.display());
+
+            println!(
+                "  [{suffix}] {} model file(s) + 1 client → {}",
+                models.len(),
+                spec_out.display()
+            );
+        }
     }
 
     if any_failed {
@@ -184,4 +190,3 @@ fn spec_to_dir_name(spec: &str) -> String {
         sanitised
     }
 }
-

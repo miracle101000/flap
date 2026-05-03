@@ -162,18 +162,39 @@ fn escape_dart_keyword(name: &str) -> String {
     }
 }
 
+/// Controls whether the emitted Dart code targets sound null safety (Dart ≥ 2.12)
+/// or the legacy null-unsafe dialect (Dart < 2.12).
+///
+/// The two modes share every lowering and IR pass — only the Dart surface
+/// syntax differs. Specifically:
+///
+/// | concern                  | Safe                  | Unsafe                    |
+/// |--------------------------|-----------------------|---------------------------|
+/// | optional type suffix     | `T?`                  | `T`                       |
+/// | required param keyword   | `required T name`     | `@required T name`        |
+/// | absent+nullable field    | `Optional<T?>`        | `T` (always nullable)     |
+/// | response-header return   | Dart 3 record `({…})` | body-only (records n/a)   |
+/// | flap_utils.dart          | emitted               | not emitted               |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullSafety {
+    Safe,
+    Unsafe,
+}
+
 // ── Synthetic enum registry ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct SynthEnum {
     name: String,
-    values: Vec<String>,
+    values: Vec<flap_ir::EnumValue>,
 }
 
 #[derive(Debug, Default)]
 struct EnumRegistry {
     field_enums: HashMap<(String, String), String>,
     param_enums: HashMap<(String, String), String>,
+    body_enums: HashMap<String, String>, // op_id → synth name
+    response_enums: HashMap<(String, String), String>, // (op_id, status_code) → synth name
     enums: BTreeMap<String, SynthEnum>,
 }
 
@@ -181,6 +202,7 @@ impl EnumRegistry {
     fn build(api: &Api) -> Self {
         let mut reg = Self::default();
 
+        // Schema field enums.
         for schema in &api.schemas {
             if let SchemaKind::Object { fields } = &schema.kind {
                 for field in fields {
@@ -205,11 +227,49 @@ impl EnumRegistry {
                 continue;
             };
             let op_pascal = to_pascal_case(op_id);
+
+            // Parameter enums.
             for param in &op.parameters {
                 if let TypeRef::Enum(values) = &param.type_ref {
                     let synth = format!("{}{}", op_pascal, to_pascal_case(&param.name));
                     reg.param_enums
                         .insert((op_id.clone(), param.name.clone()), synth.clone());
+                    reg.enums.insert(
+                        synth.clone(),
+                        SynthEnum {
+                            name: synth,
+                            values: values.clone(),
+                        },
+                    );
+                }
+            }
+
+            // Request body inline enum.
+            if let Some(body) = &op.request_body {
+                if let TypeRef::Enum(values) = &body.schema_ref {
+                    let synth = format!("{op_pascal}Body");
+                    reg.body_enums.insert(op_id.clone(), synth.clone());
+                    reg.enums.insert(
+                        synth.clone(),
+                        SynthEnum {
+                            name: synth,
+                            values: values.clone(),
+                        },
+                    );
+                }
+            }
+
+            // Response inline enums.
+            for resp in &op.responses {
+                if let Some(TypeRef::Enum(values)) = &resp.schema_ref {
+                    let code = resp
+                        .status_code
+                        .chars()
+                        .filter(|c| c.is_alphanumeric())
+                        .collect::<String>();
+                    let synth = format!("{op_pascal}{code}Response");
+                    reg.response_enums
+                        .insert((op_id.clone(), resp.status_code.clone()), synth.clone());
                     reg.enums.insert(
                         synth.clone(),
                         SynthEnum {
@@ -235,6 +295,16 @@ impl EnumRegistry {
             .get(&(op_id.to_string(), param.to_string()))
             .map(String::as_str)
     }
+
+    fn lookup_body(&self, op_id: &str) -> Option<&str> {
+        self.body_enums.get(op_id).map(String::as_str)
+    }
+
+    fn lookup_response(&self, op_id: &str, status_code: &str) -> Option<&str> {
+        self.response_enums
+            .get(&(op_id.to_string(), status_code.to_string()))
+            .map(String::as_str)
+    }
 }
 
 // ── Public entry point: models ────────────────────────────────────────────────
@@ -248,11 +318,13 @@ impl EnumRegistry {
 /// field) to keep the file set stable across spec edits — adding a
 /// nullable field to a previously-strict schema doesn't change which
 /// files exist, only their contents.
-pub fn emit_models(api: &Api) -> HashMap<String, String> {
+pub fn emit_models(api: &Api, mode: NullSafety) -> HashMap<String, String> {
     let registry = EnumRegistry::build(api);
     let mut files = HashMap::new();
 
-    files.insert("flap_utils.dart".to_string(), emit_flap_utils());
+    if mode == NullSafety::Safe {
+        files.insert("flap_utils.dart".to_string(), emit_flap_utils());
+    }
 
     for schema in &api.schemas {
         if schema.internal {
@@ -260,7 +332,7 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
         }
         let class_name = dart_class_name(&schema.name);
         let filename = format!("{}.dart", to_snake_case(&class_name));
-        let source = emit_schema(schema, &class_name, &registry, &api.schemas);
+        let source = emit_schema(schema, &class_name, &registry, &api.schemas, mode);
         files.insert(filename, source);
     }
 
@@ -276,11 +348,6 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
 // ── Phase 8: shared Optional<T> runtime ──────────────────────────────────────
 
 /// The shared `Optional<T>` + `OptionalConverter` runtime.
-///
-/// Generated as a single file imported by every model that has an
-/// `Optional`-wrapped field. The contents are static — the function
-/// returns a string literal rather than building from IR — because
-/// nothing in here depends on the spec.
 fn emit_flap_utils() -> String {
     r#"// GENERATED — do not edit by hand.
 // Shared runtime for fields whose absence and explicit-null forms must
@@ -389,10 +456,11 @@ fn emit_schema(
     class_name: &str,
     registry: &EnumRegistry,
     schemas: &[Schema],
+    mode: NullSafety,
 ) -> String {
     match &schema.kind {
         SchemaKind::Object { fields } => {
-            emit_freezed_class(class_name, &schema.name, fields, schemas, registry)
+            emit_freezed_class(class_name, &schema.name, fields, schemas, registry, mode)
         }
         SchemaKind::Array { item } => emit_array_typedef(class_name, item),
         SchemaKind::Map { value } => emit_map_typedef(class_name, value),
@@ -408,11 +476,25 @@ fn emit_schema(
             variant_tags,
             schemas,
             registry,
+            mode,
         ),
         SchemaKind::UntaggedUnion { variants } => {
-            emit_untagged_union(class_name, &schema.name, variants, schemas, registry)
+            emit_untagged_union(class_name, &schema.name, variants, schemas, registry, mode)
         }
+        SchemaKind::Alias { target } => emit_alias_typedef(class_name, target),
     }
+}
+
+// ── Alias → typedef ───────────────────────────────────────────────────────────
+
+fn emit_alias_typedef(alias_name: &str, target: &str) -> String {
+    let target_cls = dart_class_name(target);
+    let target_file = to_snake_case(&target_cls);
+    format!(
+        "// Generated from OpenAPI $ref alias `{alias_name}` → `{target}`.\n\
+         import '{target_file}.dart';\n\
+         typedef {alias_name} = {target_cls};\n"
+    )
 }
 
 // ── Union schemas → @Freezed union ───────────────────────────────────────────
@@ -425,6 +507,7 @@ fn emit_freezed_union(
     variant_tags: &[String],
     schemas: &[Schema],
     registry: &EnumRegistry,
+    mode: NullSafety,
 ) -> String {
     let snake = to_snake_case(class_name);
     let mut out = String::new();
@@ -447,7 +530,7 @@ fn emit_freezed_union(
                     registry,
                     &mut imports,
                 );
-                if field_uses_optional_wrapper(field) {
+                if field_uses_optional_wrapper(field, mode) {
                     needs_flap_utils = true;
                 }
             }
@@ -491,7 +574,7 @@ fn emit_freezed_union(
 
         out.push_str(&format!("  const factory {class_name}.{factory_name}({{\n"));
         for field in fields {
-            out.push_str(&emit_field(field, variant_name, schemas, registry));
+            out.push_str(&emit_field(field, variant_name, schemas, registry, mode));
         }
         out.push_str(&format!("  }}) = {variant_class};\n\n"));
     }
@@ -511,16 +594,14 @@ fn emit_untagged_union(
     variants: &[TypeRef],
     schemas: &[Schema],
     registry: &EnumRegistry,
+    mode: NullSafety,
 ) -> String {
     let snake = to_snake_case(class_name);
     let mut out = String::new();
 
-    // ── Imports ─────────────────────────────────────────────────────
-    out.push_str("import 'dart:convert';\n"); // for jsonEncode in toJson
-    out.push_str("import 'package:flutter/foundation.dart';\n"); // for listEquals, mapEquals – if needed later; but for equality we'll implement manually. Actually we can just use `identical` and manual checks.
-    // We'll keep it simple: no extra imports for equality.
+    out.push_str("import 'dart:convert';\n");
+    out.push_str("import 'package:flutter/foundation.dart';\n");
 
-    // Collect imports for named variant classes used in constructors.
     let mut imports: Vec<String> = Vec::new();
     for variant in variants {
         if let TypeRef::Named(variant_name) = variant
@@ -538,23 +619,13 @@ fn emit_untagged_union(
     }
     out.push('\n');
 
-    // ── Sealed class definition ─────────────────────────────────────
     out.push_str(&format!("sealed class {class_name} {{\n"));
     out.push_str(&format!("  const {class_name}._();\n\n"));
 
-    // Generate constructors for each variant.
     for (i, variant) in variants.iter().enumerate() {
-        let (variant_dart_type, variant_param_name, is_primitive) =
-            resolve_untagged_variant_info(variant, schemas, registry);
-
-        let factory_name = format!("variant{}", i); // deterministic, not from spec name
-
-        let formal = if is_primitive {
-            format!("{variant_dart_type} value")
-        } else {
-            format!("{variant_dart_type} value")
-        };
-
+        let (variant_dart_type, _, _) = resolve_untagged_variant_info(variant, schemas, registry);
+        let factory_name = format!("variant{}", i);
+        let formal = format!("{variant_dart_type} value");
         out.push_str(&format!(
             "  const factory {class_name}.{factory_name}({formal}) = _Variant{i};\n"
         ));
@@ -564,19 +635,16 @@ fn emit_untagged_union(
         "\n  factory {class_name}.fromJson(dynamic json) {{\n"
     ));
 
-    // Try each variant in order.
     for (i, variant) in variants.iter().enumerate() {
         let (variant_dart_type, _, is_primitive) =
             resolve_untagged_variant_info(variant, schemas, registry);
         let factory_name = format!("variant{}", i);
 
         if is_primitive {
-            // Match on JSON type.
             out.push_str(&format!(
                 "    if (json is {variant_dart_type}) return {class_name}.{factory_name}(json);\n"
             ));
         } else {
-            // Named object: try to call its fromJson.
             out.push_str(&format!("    if (json is Map<String, dynamic>) {{\n"));
             out.push_str(&format!("      try {{\n"));
             out.push_str(&format!(
@@ -592,11 +660,15 @@ fn emit_untagged_union(
     ));
     out.push_str(&format!("  }}\n\n"));
 
-    // toJson method – dispatch to concrete subclass.
-    out.push_str(&format!("  Object? toJson();\n"));
+    // Set up the mode-dependent nullability binding here
+    let obj_nullable = if mode == NullSafety::Safe {
+        "Object?"
+    } else {
+        "Object"
+    };
+    out.push_str(&format!("  {obj_nullable} toJson();\n"));
     out.push_str(&format!("}}\n\n"));
 
-    // ── Emit private subclasses ─────────────────────────────────────
     for (i, variant) in variants.iter().enumerate() {
         let (variant_dart_type, _, _) = resolve_untagged_variant_info(variant, schemas, registry);
 
@@ -604,16 +676,15 @@ fn emit_untagged_union(
         out.push_str(&format!("  final {variant_dart_type} value;\n"));
         out.push_str(&format!("  const _Variant{i}(this.value) : super._();\n\n"));
 
-        // toJson for primitive: return the value itself; for object: return value.toJson()
+        // Use the mode-dependent binding for both primitive and nested object types
         if is_variant_primitive(variant, schemas) {
             out.push_str(&format!("  @override\n"));
-            out.push_str(&format!("  Object? toJson() => value;\n"));
+            out.push_str(&format!("  {obj_nullable} toJson() => value;\n"));
         } else {
             out.push_str(&format!("  @override\n"));
-            out.push_str("  Object? toJson() => value.toJson();\n");
+            out.push_str(&format!("  {obj_nullable} toJson() => value.toJson();\n"));
         }
 
-        // Equality
         out.push_str(&format!("  @override\n"));
         out.push_str(&"  bool operator ==(Object other) =>\n".to_string());
         out.push_str(&format!(
@@ -627,18 +698,17 @@ fn emit_untagged_union(
         out.push_str(&format!("}}\n\n"));
     }
 
-    // ── Emit a converter for use with @JsonKey on fields ────────────
-    // This allows the field to seamlessly serialize/deserialize the union.
+    // Apply the binding to the converter generic args and method signatures
     let converter_name = format!("_{class_name}Converter");
     out.push_str(&format!(
-        "class {converter_name} implements JsonConverter<{class_name}, Object?> {{\n"
+        "class {converter_name} implements JsonConverter<{class_name}, {obj_nullable}> {{\n"
     ));
     out.push_str(&format!("  const {converter_name}();\n\n"));
     out.push_str(&format!(
-        "  @override\n  {class_name} fromJson(Object? json) =>\n      {class_name}.fromJson(json);\n\n"
+        "  @override\n  {class_name} fromJson({obj_nullable} json) =>\n      {class_name}.fromJson(json);\n\n"
     ));
     out.push_str(&format!(
-        "  @override\n  Object? toJson({class_name} object) => object.toJson();\n"
+        "  @override\n  {obj_nullable} toJson({class_name} object) => object.toJson();\n"
     ));
     out.push_str(&format!("}}\n"));
 
@@ -653,11 +723,9 @@ fn resolve_untagged_variant_info(
 ) -> (String, String, bool) {
     match type_ref {
         TypeRef::Named(name) => {
-            // Check if this is an internal wrapper schema (primitive wrapper)
             if let Some(wrapper_schema) = schemas.iter().find(|s| s.name == *name)
                 && wrapper_schema.internal
             {
-                // This is a wrapper for a => primitive; extract the inner type.
                 if let SchemaKind::Object { fields } = &wrapper_schema.kind
                     && fields.len() == 1
                     && fields[0].name == "value"
@@ -666,14 +734,11 @@ fn resolve_untagged_variant_info(
                     let dart_inner = to_dart_type(inner_type, None);
                     return (dart_inner, "value".to_string(), true);
                 }
-                // Fallback (shouldn't happen)
                 panic!("internal wrapper schema without a single 'value' field");
             }
-            // Regular named schema
             let cls = dart_class_name(name);
             (cls, "value".to_string(), false)
         }
-        // For any other TypeRef (shouldn't happen for untagged union variants)
         _ => panic!("unexpected TypeRef in untagged union variant"),
     }
 }
@@ -682,7 +747,6 @@ fn is_internal_wrapper(schemas: &[Schema], variant_name: &str) -> bool {
     schemas.iter().any(|s| s.name == variant_name && s.internal)
 }
 
-// Helper to check if a variant is a primitive (i.e., its named schema is an internal wrapper)
 fn is_variant_primitive(variant_type_ref: &TypeRef, schemas: &[Schema]) -> bool {
     match variant_type_ref {
         TypeRef::Named(name) => is_internal_wrapper(schemas, name),
@@ -727,24 +791,15 @@ fn emit_map_typedef(name: &str, value: &TypeRef) -> String {
 
 // ── Object schemas → @freezed class ──────────────────────────────────────────
 
-/// True when this field will be emitted with the `Optional<T?>` wrapper
-/// in `emit_field`. This is the predicate that decides whether the
-/// enclosing class needs the `flap_utils.dart` import, the private
-/// constructor, and the `toJson` override that strips absence sentinels.
-///
-/// Mirrors the (false, true, primitive) cell of the (required, nullable,
-/// supports-wrapper) decision matrix; if `emit_field` ever changes which
-/// cells produce the wrapper, this predicate must change in lockstep or
-/// the class-level plumbing falls out of sync with the field-level shape.
-fn field_uses_optional_wrapper(field: &Field) -> bool {
-    !field.required && field.nullable && type_ref_supports_optional_wrapper(&field.type_ref)
+fn field_uses_optional_wrapper(field: &Field, mode: NullSafety) -> bool {
+    mode == NullSafety::Safe
+        && !field.required
+        && field.nullable
+        && type_ref_supports_optional_wrapper(&field.type_ref)
 }
 
-/// True if any of the supplied fields will be emitted with the
-/// `Optional<T?>` wrapper. Drives both the `flap_utils.dart` import and
-/// the `toJson` override on the enclosing class.
-fn class_has_optional_wrapper_field(fields: &[Field]) -> bool {
-    fields.iter().any(field_uses_optional_wrapper)
+fn class_has_optional_wrapper_field(fields: &[Field], mode: NullSafety) -> bool {
+    fields.iter().any(|f| field_uses_optional_wrapper(f, mode))
 }
 
 fn emit_freezed_class(
@@ -753,12 +808,16 @@ fn emit_freezed_class(
     fields: &[Field],
     schemas: &[Schema],
     registry: &EnumRegistry,
+    mode: NullSafety,
 ) -> String {
     let snake = to_snake_case(class_name);
-    let has_optional = class_has_optional_wrapper_field(fields);
+    let has_optional = class_has_optional_wrapper_field(fields, mode);
     let mut out = String::new();
 
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
+    if mode == NullSafety::Unsafe {
+        out.push_str("import 'package:meta/meta.dart';\n");
+    }
     if has_optional {
         out.push_str("import 'flap_utils.dart';\n");
     }
@@ -789,17 +848,13 @@ fn emit_freezed_class(
     out.push_str("@freezed\n");
     out.push_str(&format!("class {class_name} with _${class_name} {{\n"));
 
-    // Freezed requires a private constructor `const ClassName._();` to
-    // attach custom methods like our `toJson` override. We only emit it
-    // when we actually need the override — keeps the output unchanged
-    // for specs that never touch nullability.
     if has_optional {
         out.push_str(&format!("  const {class_name}._();\n\n"));
     }
 
     out.push_str(&format!("  const factory {class_name}({{\n"));
     for field in fields {
-        out.push_str(&emit_field(field, schema_name, schemas, registry));
+        out.push_str(&emit_field(field, schema_name, schemas, registry, mode));
     }
     out.push_str(&format!("  }}) = _{class_name};\n"));
     out.push('\n');
@@ -809,10 +864,6 @@ fn emit_freezed_class(
     out.push_str(&format!("      _${class_name}FromJson(json);\n"));
 
     if has_optional {
-        // The cast `this as _ClassName` is needed because
-        // `_$ClassNameToJson` is generated against the concrete factory
-        // target (the `= _ClassName` on the factory), not the public
-        // sealed class itself.
         out.push('\n');
         out.push_str("  @override\n");
         out.push_str("  Map<String, dynamic> toJson() =>\n");
@@ -825,14 +876,6 @@ fn emit_freezed_class(
     out
 }
 
-/// Whether the canonical `OptionalConverter<T>` works for this `T`.
-///
-/// True for primitives whose JSON shape is `T` itself; false for types
-/// that need transformation (DateTime → String, Named → Map, Array →
-/// List, etc.). The `false` branch in `emit_field` falls back to `T?`
-/// semantics with a TODO so the silent loss of the absent/present-null
-/// distinction is at least loud — a future phase will emit per-field
-/// `fromJson`/`toJson` lambdas to restore round-trip parity.
 fn type_ref_supports_optional_wrapper(type_ref: &TypeRef) -> bool {
     matches!(
         type_ref,
@@ -845,16 +888,11 @@ fn emit_field(
     schema_name: &str,
     schemas: &[Schema],
     registry: &EnumRegistry,
+    mode: NullSafety, // ← new
 ) -> String {
     let synth = registry.lookup_field(schema_name, &field.name);
     let dart_type = to_dart_type(&field.type_ref, synth);
     let dart_name = to_camel_case(&field.name);
-
-    // A directly recursive Named field (e.g. `Node parent`) cannot be
-    // `required Node parent` in Freezed — Dart's type system requires the
-    // field to be nullable to break the infinite-size cycle.
-    // Array/Map wrappers already break the chain at the collection level,
-    // so only a bare Named reference needs this treatment.
     let force_nullable_for_recursion =
         field.is_recursive && matches!(&field.type_ref, TypeRef::Named(_));
 
@@ -867,58 +905,67 @@ fn emit_field(
     if let TypeRef::Named(name) = &field.type_ref
         && is_untagged_union(schemas, name)
     {
-        let converter = format!("_{name}Converter");
-        sibling_annotations.push(format!("@{converter}()"));
+        sibling_annotations.push(format!("@_{name}Converter()"));
     }
 
     let mut leading_comment: Option<String> = None;
 
-    let typed_fragment = if force_nullable_for_recursion {
-        // Required + directly recursive: force nullable so Freezed can
-        // represent the type. Null means "absent parent" / "leaf node".
-        // Non-required recursive fields already land in the (false, _) arms
-        // below and get `?` naturally.
-        if field.required {
-            // Keep required keyword so the factory constructor enforces
-            // callers explicitly pass null for leaf nodes rather than
-            // accidentally omitting the field.
-            format!("required {dart_type}? {dart_name},\n")
-        } else {
-            // Non-required recursive: same as (false, false) — omit null
-            // from the wire so leaf nodes don't serialise as `"child": null`.
-            json_key_args.push("includeIfNull: false".to_string());
-            format!("{dart_type}? {dart_name},\n")
-        }
-    } else {
-        match (field.required, field.nullable) {
-            (true, false) => format!("required {dart_type} {dart_name},\n"),
-            (true, true) => format!("required {dart_type}? {dart_name},\n"),
-            (false, false) => {
+    let typed_fragment = match mode {
+        // ── Null-unsafe: no `?`, no `required` keyword, `@required` annotation instead ──
+        NullSafety::Unsafe => {
+            // @required marks fields the caller must supply; everything is
+            // technically nullable at the Dart type level, so we don't append `?`.
+            let is_req = field.required && !force_nullable_for_recursion;
+            if is_req {
+                sibling_annotations.insert(0, "@required".to_string());
+            } else {
                 json_key_args.push("includeIfNull: false".to_string());
-                if let Some(default) = &field.default_value {
-                    // A spec-declared default lets us keep the field non-nullable in
-                    // the constructor — callers can omit it and get the documented
-                    // default rather than null. includeIfNull: false still suppresses
-                    // null if the field is somehow null at runtime.
-                    let default_expr = dart_default_expr(default);
-                    sibling_annotations.push(format!("@Default({default_expr})"));
-                    format!("{dart_type} {dart_name},\n")
-                } else {
-                    format!("{dart_type}? {dart_name},\n")
-                }
             }
-            (false, true) => {
-                if type_ref_supports_optional_wrapper(&field.type_ref) {
-                    sibling_annotations.push("@OptionalConverter()".to_string());
-                    sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
-                    format!("Optional<{dart_type}?> {dart_name},\n")
+            if let Some(default) = &field.default_value {
+                let default_expr = dart_default_expr(default);
+                sibling_annotations.push(format!("@Default({default_expr})"));
+            }
+            format!("{dart_type} {dart_name},\n")
+        }
+
+        // ── Null-safe: existing logic, unchanged ──────────────────────────────
+        NullSafety::Safe => {
+            if force_nullable_for_recursion {
+                if field.required {
+                    format!("required {dart_type}? {dart_name},\n")
                 } else {
                     json_key_args.push("includeIfNull: false".to_string());
-                    leading_comment = Some(format!(
-                        "// TODO(flap): nullable+optional non-primitive — \
-                         `Optional<{dart_type}?>` not yet supported for this type"
-                    ));
                     format!("{dart_type}? {dart_name},\n")
+                }
+            } else {
+                match (field.required, field.nullable) {
+                    (true, false) => format!("required {dart_type} {dart_name},\n"),
+                    (true, true) => format!("required {dart_type}? {dart_name},\n"),
+                    (false, false) => {
+                        json_key_args.push("includeIfNull: false".to_string());
+                        if let Some(default) = &field.default_value {
+                            let default_expr = dart_default_expr(default);
+                            sibling_annotations.push(format!("@Default({default_expr})"));
+                            format!("{dart_type} {dart_name},\n")
+                        } else {
+                            format!("{dart_type}? {dart_name},\n")
+                        }
+                    }
+                    (false, true) => {
+                        if type_ref_supports_optional_wrapper(&field.type_ref) {
+                            sibling_annotations.push("@OptionalConverter()".to_string());
+                            sibling_annotations
+                                .push(format!("@Default(Optional<{dart_type}?>.absent())"));
+                            format!("Optional<{dart_type}?> {dart_name},\n")
+                        } else {
+                            json_key_args.push("includeIfNull: false".to_string());
+                            leading_comment = Some(format!(
+                                "// TODO(flap): nullable+optional non-primitive — \
+                                 `Optional<{dart_type}?>` not yet supported for this type"
+                            ));
+                            format!("{dart_type}? {dart_name},\n")
+                        }
+                    }
                 }
             }
         }
@@ -996,28 +1043,41 @@ fn emit_synth_enum(synth: &SynthEnum) -> String {
     let mut out = String::new();
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
     out.push('\n');
+    // unknownValue routes any unrecognised wire value to the `unknown` sentinel
+    // instead of throwing, making the client resilient to new server-side enum
+    // additions that haven't been deployed to the client yet.
+    out.push_str(&format!(
+        "@JsonEnum(unknownValue: {}.unknown)\n",
+        synth.name
+    ));
     out.push_str(&format!("enum {} {{\n", synth.name));
-    for (i, value) in synth.values.iter().enumerate() {
-        let case = to_dart_enum_case(value);
-        out.push_str(&format!("  @JsonValue('{value}')\n"));
-        let trailing = if i == synth.values.len() - 1 {
-            ";"
-        } else {
-            ","
+    for value in &synth.values {
+        let (dart_case, json_annotation) = match value {
+            flap_ir::EnumValue::Str(s) => {
+                let escaped = s.replace('\'', "\\'");
+                (to_dart_enum_case(s), format!("@JsonValue('{escaped}')"))
+            }
+            flap_ir::EnumValue::Int(n) => {
+                // Prefix with 'v' so the Dart identifier never starts with a digit.
+                (format!("v{n}"), format!("@JsonValue({n})"))
+            }
         };
-        out.push_str(&format!("  {case}{trailing}\n"));
+        out.push_str(&format!("  {json_annotation}\n"));
+        out.push_str(&format!("  {dart_case},\n"));
     }
+    out.push_str("  @JsonValue(null)\n");
+    out.push_str("  unknown;\n");
     out.push_str("}\n");
     out
 }
 
 // ── Public entry point: client ────────────────────────────────────────────────
 
-pub fn emit_client(api: &Api) -> (String, String) {
+pub fn emit_client(api: &Api, mode: NullSafety) -> (String, String) {
     let registry = EnumRegistry::build(api);
     let class_name = api_client_name(&api.title);
     let filename = format!("{}.dart", to_snake_case(&class_name));
-    let source = emit_client_source(api, &class_name, &registry);
+    let source = emit_client_source(api, &class_name, &registry, mode);
     (filename, source)
 }
 
@@ -1036,11 +1096,31 @@ fn api_client_name(title: &str) -> String {
     format!("{pascal}Client")
 }
 
-fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> String {
+fn emit_client_source(
+    api: &Api,
+    class_name: &str,
+    registry: &EnumRegistry,
+    mode: NullSafety,
+) -> String {
     let mut out = String::new();
 
+    // dart:convert needed for jsonEncode (inline enum bodies).
+    out.push_str("import 'dart:convert';\n");
     out.push_str("import 'package:dio/dio.dart';\n");
+    if mode == NullSafety::Unsafe {
+        out.push_str("import 'package:meta/meta.dart';\n");
+    }
     out.push('\n');
+
+    // When the spec declares multiple servers, emit named constants so
+    // callers can switch between them without hard-coding URLs.
+    if api.base_urls.len() > 1 {
+        out.push_str(&format!("abstract final class {class_name}Urls {{\n"));
+        for (i, url) in api.base_urls.iter().enumerate() {
+            out.push_str(&format!("  static const String server{i} = '{url}';\n"));
+        }
+        out.push_str("}\n\n");
+    }
 
     let mut imports: Vec<String> = Vec::new();
     for schema in &api.schemas {
@@ -1065,13 +1145,13 @@ fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> S
         .collect();
 
     out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str(&emit_constructor(class_name, &credentials));
+    out.push_str(&emit_constructor(class_name, &credentials, &api.base_urls));
     out.push('\n');
     out.push_str("  final Dio _dio;\n");
 
     for op in &api.operations {
         out.push('\n');
-        out.push_str(&emit_method(op, &api.schemas, registry));
+        out.push_str(&emit_method(op, &api.schemas, registry, mode));
     }
 
     out.push_str("}\n");
@@ -1095,17 +1175,27 @@ impl<'a> DartCredential<'a> {
     }
 }
 
-fn emit_constructor(class_name: &str, credentials: &[DartCredential]) -> String {
+fn emit_constructor(
+    class_name: &str,
+    credentials: &[DartCredential],
+    base_urls: &[String],
+) -> String {
+    let default_url = base_urls
+        .first()
+        .map(|u| format!("'{u}'"))
+        .unwrap_or_else(|| "''".to_string());
+
     let mut out = String::new();
 
     if credentials.is_empty() {
-        out.push_str(&format!("  {class_name}({{required String baseUrl}})\n"));
-        out.push_str("      : _dio = Dio(BaseOptions(baseUrl: baseUrl));\n");
+        out.push_str(&format!("  {class_name}({{\n"));
+        out.push_str(&format!("    String baseUrl = {default_url},\n"));
+        out.push_str("  }}) : _dio = Dio(BaseOptions(baseUrl: baseUrl));\n");
         return out;
     }
 
     out.push_str(&format!("  {class_name}({{\n"));
-    out.push_str("    required String baseUrl,\n");
+    out.push_str(&format!("    String baseUrl = {default_url},\n"));
     for cred in credentials {
         out.push_str(&format!("    String? {},\n", cred.dart_param_name));
     }
@@ -1176,7 +1266,12 @@ struct DartParam<'a> {
     required: bool,
 }
 
-fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> String {
+fn emit_method(
+    op: &Operation,
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+    mode: NullSafety,
+) -> String {
     let mut out = String::new();
 
     if let Some(summary) = &op.summary {
@@ -1186,7 +1281,7 @@ fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> S
 
     let method_name = op_method_name(op);
     let dart_params = build_dart_params(op, registry);
-    let return_type = success_return_type(&op.responses);
+    let return_type = success_return_type(&op.responses, mode);
 
     if dart_params.is_empty() && op.request_body.is_none() {
         out.push_str(&format!(
@@ -1207,7 +1302,9 @@ fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> S
             ));
         }
         if let Some(body) = &op.request_body {
-            let body_type = to_dart_type(&body.schema_ref, None);
+            let op_id = op.operation_id.as_deref().unwrap_or("");
+            let body_synth = registry.lookup_body(op_id);
+            let body_type = to_dart_type(&body.schema_ref, body_synth);
             if body.required {
                 out.push_str(&format!("    required {body_type} body,\n"));
             } else {
@@ -1220,7 +1317,7 @@ fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> S
         out.push_str("  }) async {\n");
     }
 
-    out.push_str(&emit_method_body(op, &dart_params, schemas, registry));
+    out.push_str(&emit_method_body(op, &dart_params, schemas, registry, mode));
     out.push_str("  }\n");
     out
 }
@@ -1257,37 +1354,23 @@ fn build_dart_params<'a>(op: &'a Operation, registry: &EnumRegistry) -> Vec<Dart
     out
 }
 
-/// The Dart return type for a response that has declared headers.
-///
-/// When headers are present the method returns a named Dart record:
-///   `({BodyType body, HeaderType xRateLimitRemaining, ...})`
-///
-/// When no headers are declared the method returns the body type directly,
-/// preserving the existing API for the common case.
-fn success_return_type(responses: &[Response]) -> String {
+fn success_return_type(responses: &[Response], mode: NullSafety) -> String {
     let Some(resp) = success_response(responses) else {
         return "void".into();
     };
 
-    let body_type = match &resp.schema_ref {
-        Some(t) => to_dart_type(t, None),
-        None => {
-            if resp.headers.is_empty() {
-                return "void".into();
-            }
-            // No body but headers — return a record with only headers.
-            "void".into() // placeholder; record built below
-        }
-    };
-
-    if resp.headers.is_empty() {
+    if mode == NullSafety::Unsafe || resp.headers.is_empty() {
         return match &resp.schema_ref {
             Some(t) => to_dart_type(t, None),
             None => "void".into(),
         };
     }
 
-    // Build `({BodyType body, T? headerName, ...})` record.
+    let body_type = match &resp.schema_ref {
+        Some(t) => to_dart_type(t, None),
+        None => "void".into(),
+    };
+
     let mut fields: Vec<String> = Vec::new();
     if resp.schema_ref.is_some() {
         fields.push(format!("{body_type} body"));
@@ -1304,25 +1387,34 @@ fn success_return_type(responses: &[Response]) -> String {
     format!("({{{}}})", fields.join(", "))
 }
 
-/// Emit the return statement for a successful response, extracting declared
-/// headers from `response.headers` in addition to the body.
-fn emit_success_return(resp: &Response, schemas: &[Schema], registry: &EnumRegistry) -> String {
-    let has_body = resp.schema_ref.is_some();
-    let has_headers = !resp.headers.is_empty();
-
-    if !has_headers {
-        // Original code path — no record wrapper needed.
+fn emit_success_return(
+    resp: &Response,
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+    mode: NullSafety,
+) -> String {
+    // In unsafe mode, records don't exist — return body only, skip headers.
+    if mode == NullSafety::Unsafe {
         if let Some(schema) = &resp.schema_ref {
             let expr = deserialize_expr(schema, schemas, registry, "response.data");
             return format!("    return {expr};\n");
         }
-        return String::new(); // void
+        return String::new();
+    }
+
+    let has_body = resp.schema_ref.is_some();
+    let has_headers = !resp.headers.is_empty();
+
+    if !has_headers {
+        if let Some(schema) = &resp.schema_ref {
+            let expr = deserialize_expr(schema, schemas, registry, "response.data");
+            return format!("    return {expr};\n");
+        }
+        return String::new();
     }
 
     let mut out = String::new();
 
-    // Extract each declared header from Dio's response.headers map.
-    // Dio stores all header values as List<String>; we take the first.
     for hdr in &resp.headers {
         let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
         let raw_expr = format!("response.headers.value('{}')", hdr.name.to_lowercase());
@@ -1330,7 +1422,6 @@ fn emit_success_return(resp: &Response, schemas: &[Schema], registry: &EnumRegis
         if hdr.required {
             out.push_str(&format!("    final {dart_name} = {typed_expr};\n"));
         } else {
-            // `Dio.Headers.value()` returns null when the header is absent.
             out.push_str(&format!("    final {dart_name}Raw = {raw_expr};\n"));
             let null_guarded =
                 header_deserialize_expr_nullable(&hdr.type_ref, &format!("{dart_name}Raw"));
@@ -1338,7 +1429,6 @@ fn emit_success_return(resp: &Response, schemas: &[Schema], registry: &EnumRegis
         }
     }
 
-    // Build the record literal.
     let mut record_fields: Vec<String> = Vec::new();
     if has_body {
         let body_expr = resp
@@ -1356,7 +1446,6 @@ fn emit_success_return(resp: &Response, schemas: &[Schema], registry: &EnumRegis
     out
 }
 
-/// Deserialize a response header value (a raw `String`) into the declared type.
 fn header_deserialize_expr(type_ref: &TypeRef, raw: &str) -> String {
     match type_ref {
         TypeRef::String | TypeRef::DateTime => raw.to_string(),
@@ -1364,15 +1453,13 @@ fn header_deserialize_expr(type_ref: &TypeRef, raw: &str) -> String {
         TypeRef::Number { .. } => format!("num.parse({raw})"),
         TypeRef::Boolean => format!("({raw} == 'true')"),
         TypeRef::Array(inner) => {
-            // Headers may be comma-separated lists.
             let item_expr = header_deserialize_expr(inner, "e");
             format!("{raw}.split(',').map((e) => {item_expr}).toList()")
         }
-        _ => raw.to_string(), // unreachable for validated types
+        _ => raw.to_string(),
     }
 }
 
-/// Like `header_deserialize_expr` but guards on a nullable raw value.
 fn header_deserialize_expr_nullable(type_ref: &TypeRef, raw_var: &str) -> String {
     match type_ref {
         TypeRef::String | TypeRef::DateTime => raw_var.to_string(),
@@ -1402,6 +1489,7 @@ fn emit_method_body(
     dart_params: &[DartParam],
     schemas: &[Schema],
     registry: &EnumRegistry,
+    mode: NullSafety,
 ) -> String {
     let mut body = String::new();
 
@@ -1455,7 +1543,6 @@ fn emit_method_body(
 
     let data_expr = op.request_body.as_ref().map(body_data_expression);
 
-    // We need `final response = ...` whenever we read body OR headers from it.
     let needs_response_var = success_response(&op.responses)
         .map(|r| r.schema_ref.is_some() || !r.headers.is_empty())
         .unwrap_or(false);
@@ -1488,10 +1575,8 @@ fn emit_method_body(
     }
     body.push_str("    );\n");
 
-    // Emit body deserialization + header extraction via emit_success_return.
-    // This replaces the old `final data = response.data; return ...;` block.
     if let Some(resp) = success_response(&op.responses) {
-        body.push_str(&emit_success_return(resp, schemas, registry));
+        body.push_str(&emit_success_return(resp, schemas, registry, mode));
     }
 
     body
@@ -1501,29 +1586,18 @@ fn body_data_expression(body: &RequestBody) -> String {
     if !body.is_multipart {
         return match &body.schema_ref {
             TypeRef::Named(_) => "body.toJson()".into(),
+            // json_serializable can encode an annotated enum directly via jsonEncode.
+            TypeRef::Enum(_) => "jsonEncode(body)".into(),
             _ => "body".into(),
         };
     }
 
     match &body.schema_ref {
-        // Named object: has a toJson() we can spread into FormData.
         TypeRef::Named(_) => "FormData.fromMap(body.toJson())".into(),
-
-        // Map<String, T>: already key-value shaped, pass directly.
         TypeRef::Map(_) => "FormData.fromMap(body)".into(),
-
-        // Array: wrap under a conventional 'file' key — Dio accepts
-        // List<MultipartFile> or List<String> as a field value.
         TypeRef::Array(_) => "FormData.fromMap({'file': body})".into(),
-
-        // DateTime must be serialised to a string before going on the wire.
         TypeRef::DateTime => "FormData.fromMap({'data': body.toIso8601String()})".into(),
-
-        // Enum: use the wire value via .name (works for json_annotation enums).
-        TypeRef::Enum(_) => "FormData.fromMap({'data': body.name})".into(),
-
-        // Primitives (String, int, num, bool): Dio's FormData.fromMap
-        // accepts these directly as field values.
+        TypeRef::Enum(_) => "FormData.fromMap({'data': jsonEncode(body)})".into(),
         TypeRef::String | TypeRef::Integer { .. } | TypeRef::Number { .. } | TypeRef::Boolean => {
             "FormData.fromMap({'data': body})".into()
         }
@@ -1587,8 +1661,11 @@ fn deserialize_expr(
             }
             Some(SchemaKind::UntaggedUnion { .. }) => {
                 let cls = dart_class_name(name);
-                // Untagged union fromJson accepts `dynamic`, so no cast.
                 format!("{cls}.fromJson({data_var})")
+            }
+            Some(SchemaKind::Alias { target }) => {
+                let cls = dart_class_name(target);
+                format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
             }
             None => {
                 let cls = dart_class_name(name);
@@ -1721,13 +1798,11 @@ fn dart_default_expr(default: &flap_ir::DefaultValue) -> String {
     use flap_ir::DefaultValue;
     match default {
         DefaultValue::String(s) => {
-            // Escape single quotes inside the string.
             let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
             format!("'{escaped}'")
         }
         DefaultValue::Integer(n) => n.to_string(),
         DefaultValue::Number(n) => {
-            // Dart requires a decimal point for double literals.
             if n.fract() == 0.0 {
                 format!("{n:.1}")
             } else {
