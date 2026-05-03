@@ -76,29 +76,14 @@ pub struct Operation {
     ///
     /// Ordered deterministically: numeric status codes ascending first,
     /// then `default` last (so "200", "201", "404", "default"). Empty when
-    /// no responses are declared (rare — OpenAPI requires at least one,
-    /// but we don't enforce that here).
+    /// no responses are declared.
     pub responses: Vec<Response>,
     /// Per-operation security override.
-    ///
-    /// - `None` means "use the API-level default" (`Api.security`).
-    /// - `Some(empty)` means an explicit override to *no* security —
-    ///   the OpenAPI sentinel for marking an endpoint public even when
-    ///   the rest of the API requires auth.
-    /// - `Some(non-empty)` means use these specific scheme names instead
-    ///   of the API default.
-    ///
-    /// The Dart emitter currently treats credentials globally (any
-    /// configured credential gets sent on every request via the Dio
-    /// interceptor), so this field is captured for fidelity but not yet
-    /// used to gate per-operation injection. A future phase can refine
-    /// the interceptor to consult per-operation requirements.
     pub security: Option<Vec<String>>,
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
 
-/// Where a parameter is transmitted in the HTTP request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterLocation {
     Cookie,
@@ -123,48 +108,21 @@ pub struct Parameter {
     pub name: String,
     pub location: ParameterLocation,
     pub type_ref: TypeRef,
-    /// Path parameters are always required (OpenAPI §4.7.12).
-    /// Query/header/cookie parameters use the value from the spec.
     pub required: bool,
 }
 
 // ── Request body ─────────────────────────────────────────────────────────────
 
-/// The body sent with a POST / PUT / PATCH request.
-///
-/// Only the first (preferred) content type is modelled — typically
-/// `application/json`, with `multipart/form-data` accepted as a second
-/// preference for file-upload endpoints. Multi-body operations beyond
-/// the chosen pair are a post-v0.1 concern.
 #[derive(Debug)]
 pub struct RequestBody {
-    /// The MIME type of the body, e.g. `"application/json"` or
-    /// `"multipart/form-data"`.
     pub content_type: String,
-    /// The schema of the body payload.
     pub schema_ref: TypeRef,
-    /// Whether the caller must supply this body. OpenAPI defaults to false,
-    /// but `required: true` is strongly encouraged and common in real specs.
     pub required: bool,
-    /// True when `content_type` is `multipart/form-data`. The Dart emitter
-    /// uses this to choose between sending a JSON-encoded body and building
-    /// a Dio `FormData` (which is also what enables file uploads).
     pub is_multipart: bool,
 }
 
 // ── Responses ────────────────────────────────────────────────────────────────
 
-/// A single response entry of an operation, keyed by status code.
-///
-/// `status_code` is kept as a `String` so we can carry both numeric codes
-/// (`"200"`, `"404"`) and the OpenAPI sentinel `"default"` without adding
-/// an enum that the emitter would just have to map back to a string. The
-/// upstream parser is the authority on what counts as a valid key.
-///
-/// `schema_ref` is `None` when the response declares no body — for example
-/// `204 No Content`, or PetStore's `POST /pets` returning `201` with just a
-/// `description`. Emitters use this to decide between `Future<T>` and
-/// `Future<void>`-shaped return types.
 #[derive(Debug)]
 pub struct Response {
     pub status_code: String,
@@ -185,41 +143,9 @@ pub enum SchemaKind {
     Object { fields: Vec<Field> },
     /// A homogeneous list — e.g. OpenAPI `type: array`.
     Array { item: TypeRef },
-    /// A homogeneous string-keyed dictionary at the top level — e.g. an
-    /// OpenAPI schema declared as
-    /// `{ type: object, additionalProperties: { ... } }` with no concrete
-    /// properties of its own. Emitters render this as a type alias rather
-    /// than a class (the same shape as `SchemaKind::Array`), so a
-    /// top-level `UnitsMap` becomes
-    /// `typedef UnitsMap = Map<String, String>;`. The boxed value type
-    /// follows the same rules as `TypeRef::Map`'s inner.
+    /// A homogeneous string-keyed dictionary at the top level.
     Map { value: TypeRef },
-    /// A discriminated union — OpenAPI `oneOf` with a `discriminator` block.
-    ///
-    /// Per DECISIONS D6, structural unions (no discriminator) are a hard
-    /// error during lowering. Each entry in `variants` is a `TypeRef::Named`
-    /// pointing at a top-level schema in `components.schemas`.
-    ///
-    /// `discriminator` is the wire-side property name carrying the variant
-    /// tag (e.g. `"petType"` from `discriminator: { propertyName: petType }`).
-    /// The Dart emitter wires this directly into Freezed's
-    /// `@Freezed(unionKey: '<name>')` so `fromJson` automatically routes
-    /// payloads to the correct variant.
-    ///
-    /// `variant_tags` holds the wire-side value that selects each variant,
-    /// parallel to `variants` (same length, same order). Population rules
-    /// during lowering:
-    /// - If `discriminator.mapping` lists the variant explicitly, that tag
-    ///   wins — `mapping: { "v1.dog": "#/components/schemas/Dog" }` produces
-    ///   the tag `"v1.dog"` for the `Dog` variant.
-    /// - Otherwise the OpenAPI default applies and the tag is the variant's
-    ///   schema name verbatim (PascalCase).
-    ///
-    /// The emitter compares each tag against the camelCased factory name
-    /// derived from the schema name and emits `@FreezedUnionValue('<tag>')`
-    /// only when they differ. The `Vec<String>` shape (rather than
-    /// `Vec<Option<String>>`) keeps the IR fully self-describing — you
-    /// don't need to remember the default-derivation rule to consume it.
+    /// A discriminated union — OpenAPI `oneOf` with a `discriminator`.
     Union {
         variants: Vec<TypeRef>,
         discriminator: String,
@@ -236,35 +162,39 @@ pub struct Field {
     /// wire — set by lowering when the schema declares `nullable: true`
     /// (OpenAPI 3.0). Orthogonal to `required`:
     ///
-    /// | `required` | `nullable` | wire semantics                            |
-    /// |------------|------------|-------------------------------------------|
-    /// | true       | false      | key MUST be present, value non-null       |
-    /// | true       | true       | key MUST be present, value MAY be null    |
+    /// | `required` | `nullable` | wire semantics                              |
+    /// |------------|------------|---------------------------------------------|
+    /// | true       | false      | key MUST be present, value non-null         |
+    /// | true       | true       | key MUST be present, value MAY be null      |
     /// | false      | false      | key MAY be omitted, never null when present |
-    /// | false      | true       | key MAY be omitted, value MAY be null     |
+    /// | false      | true       | key MAY be omitted, value MAY be null       |
     ///
-    /// The last row is the one that motivates the `Optional<T?>` wrapper
-    /// in the Dart emitter — it's the only case where the receiver of a
-    /// PATCH must be able to distinguish "client did not send this key"
-    /// from "client explicitly set this key to null".
+    /// The last row is the one that motivates the Dart `Optional<T?>`
+    /// wrapper in `flap_emit_dart` — it's the only case where the
+    /// receiver of a PATCH must be able to distinguish "client did not
+    /// send this key" from "client explicitly set this key to null".
+    ///
+    /// OpenAPI 3.1's `type: [string, "null"]` is rejected at the version
+    /// guard (DECISIONS D5) so we never see it here; when the 3.1 ban
+    /// drops, lowering will need to translate that shape into this same
+    /// boolean.
     pub nullable: bool,
     /// True when this field's type (directly, or via `List<>` / `Map<>`)
     /// points at the schema currently being lowered — i.e. self-recursion
     /// (`Node.children: List<Node>`) or a back-edge through an `allOf`
     /// chain. Set by the lowering pass; downstream emitters use this as
-    /// an explicit signal that:
-    ///   - the field type must be rendered as the bare class name,
-    ///   - inline typedef wrappers would break Freezed's generator,
-    ///   - no cross-file `import` is required (Freezed's `part` files
-    ///     handle the cycle naturally).
+    /// an explicit signal that the field type must be rendered as the
+    /// bare class name (no inline typedef wrapping that would break
+    /// Freezed's generator).
     pub is_recursive: bool,
 }
 
 impl Field {
-    /// Construct a non-recursive field — the common case for hand-written
-    /// IR (test fixtures, golden builders, etc.). The lowering pass in
-    /// `flap_spec` constructs `Field` directly because it computes
-    /// `is_recursive` from the visiting set; everywhere else, prefer this.
+    /// Construct a non-recursive, non-nullable field — the common case
+    /// for hand-written IR (test fixtures, golden builders, etc.). The
+    /// lowering pass in `flap_spec` constructs `Field` directly because
+    /// it computes `is_recursive` and `nullable` from the source spec;
+    /// everywhere else, prefer this.
     pub fn new(name: impl Into<String>, type_ref: TypeRef, required: bool) -> Self {
         Self {
             name: name.into(),
@@ -277,12 +207,6 @@ impl Field {
 }
 
 /// A reference to a concrete type, either primitive or a named schema.
-///
-/// Phase 2 additions: `DateTime`, `Enum`, and `Map`. These extend the set
-/// of in-place types that may appear as a field type, parameter schema, or
-/// request-body schema. Top-level schemas continue to be either `Object`
-/// or `Array` (`SchemaKind`); a top-level enum or map is currently lowered
-/// as an inline `TypeRef` only when it appears nested inside a property.
 #[derive(Debug, Clone)]
 pub enum TypeRef {
     String,
@@ -294,27 +218,12 @@ pub enum TypeRef {
     },
     Boolean,
     /// `type: string, format: date-time` — emitted as Dart `DateTime`.
-    /// Kept as its own variant rather than `String { format: "date-time" }`
-    /// because almost every emitter wants to special-case it (parsing,
-    /// `toIso8601String()`, JSON converters, etc.).
     DateTime,
     /// A closed set of allowed string values (`enum: [...]`).
-    /// Values are stored in spec order — emitters typically preserve that
-    /// order in the generated language-level enum so existing serialised
-    /// payloads keep working when new values are appended.
-    ///
-    /// v0.1 only models string enums; non-string enum entries are rejected
-    /// during lowering.
     Enum(Vec<String>),
-    /// A homogeneous string-keyed dictionary, e.g. an object schema with
-    /// `additionalProperties: { type: string }`. The boxed inner `TypeRef`
-    /// is the value type; the key is always `String` per JSON semantics.
+    /// A homogeneous string-keyed dictionary value type.
     Map(Box<TypeRef>),
-    /// An inline homogeneous list — `{ type: array, items: ... }` appearing
-    /// as a field type, parameter type, request/response body, or nested
-    /// inside another `Array`/`Map`. Top-level array schemas continue to
-    /// be modelled by `SchemaKind::Array`; this variant covers the cases
-    /// where an array shows up as part of a larger type.
+    /// An inline homogeneous list — `{ type: array, items: ... }`.
     Array(Box<TypeRef>),
     /// Reference to a named component schema (the bare name, not the $ref path).
     Named(String),
@@ -349,12 +258,6 @@ impl fmt::Display for TypeRef {
 
 // ── Security ─────────────────────────────────────────────────────────────────
 
-/// Where an API key parameter is sent on the wire.
-///
-/// Distinct from [`ParameterLocation`] because OpenAPI does not permit
-/// `apiKey` schemes in path position — only header, query, or cookie. Keeping
-/// this as its own enum stops emitters from having to handle a `Path` arm
-/// that can never legitimately occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyLocation {
     Cookie,
@@ -372,48 +275,20 @@ impl fmt::Display for ApiKeyLocation {
     }
 }
 
-/// A security scheme declared in `components.securitySchemes`.
-///
-/// v0.1 supports the two most common shapes:
-///
-/// - `apiKey` — a credential transmitted as a header, query parameter, or
-///   cookie under a fixed wire-side name.
-/// - `http` with `scheme: bearer` — RFC 6750 bearer tokens, sent as
-///   `Authorization: Bearer <token>`.
-///
-/// `oauth2` and `openIdConnect` flows are out of scope for v0.1 — the
-/// generated client would need a token-acquisition step that doesn't
-/// belong in a single-method interceptor. They will be modelled in a
-/// future phase that adds a real auth-flow IR.
 #[derive(Debug, Clone)]
 pub enum SecurityScheme {
-    /// `type: apiKey` — a static credential the caller supplies once.
     ApiKey {
-        /// The key under which this scheme is registered in
-        /// `components.securitySchemes`. Used as a stable handle by both
-        /// `Api.security` / `Operation.security` references and as the
-        /// basis for the emitted Dart constructor parameter name.
         scheme_name: String,
-        /// The wire-side name of the header / query parameter / cookie,
-        /// e.g. `"X-API-Key"` or `"api_key"`.
         parameter_name: String,
         location: ApiKeyLocation,
     },
-    /// `type: http`, `scheme: bearer` — a bearer token sent in the
-    /// `Authorization` header.
     HttpBearer {
         scheme_name: String,
-        /// Optional hint about the token format (e.g. `"JWT"`). Carried
-        /// through unchanged for documentation; v0.1 emitters do not vary
-        /// behaviour on it.
         bearer_format: Option<String>,
     },
 }
 
 impl SecurityScheme {
-    /// Returns the registry key under `components.securitySchemes`.
-    /// Common to every variant — handy for cross-referencing with
-    /// `Api.security` / `Operation.security`.
     pub fn scheme_name(&self) -> &str {
         match self {
             SecurityScheme::ApiKey { scheme_name, .. } => scheme_name,

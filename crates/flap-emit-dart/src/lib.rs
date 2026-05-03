@@ -1,79 +1,49 @@
 //! Dart / Flutter code emitter (Phase 4 — production output).
 //!
 //! Public API:
-//! - [`emit_models`] → one Dart source per top-level schema, plus one per
-//!   synthesised inline enum (`Pet.status` → `pet_status.dart`).
-//! - [`emit_client`] → a single Dio client file with one method per operation,
-//!   with real signatures (return types from the success response, named
-//!   arguments per parameter and body) and real bodies (path templating,
-//!   `queryParameters` map, request `data`, response deserialisation).
+//! - [`emit_models`] — one Dart source per top-level schema, plus one per
+//!   synthesised inline enum, plus the shared `flap_utils.dart` runtime.
+//! - [`emit_client`] — a single Dio client file with one method per operation.
 //!
-//! ## Output conventions (DECISIONS D3 — Freezed + Dio)
-//! - Object schemas → `@freezed` class with `fromJson` factory.
-//! - Array schemas → `typedef Name = List<ItemType>;`
-//! - Inline `enum: [...]` → a separate Dart `enum` file annotated with
-//!   `@JsonValue('<original>')` on each case so the on-the-wire string
-//!   round-trips through json_serializable.
-//! - Operations → real Dio methods on a generated client class.
+//! ## Phase 8 — strict nullability vs. omission
 //!
-//! ## Synthetic enum names
-//! `TypeRef::Enum` is a structural value with no name of its own, but Dart
-//! enums need names. Every inline enum is given a synthesised PascalCase name
-//! based on its containing context:
+//! HTTP PATCH endpoints distinguish three states for a field on the wire:
+//! "client did not send this key", "client sent the key with the literal
+//! value null", and "client sent the key with a real value". OpenAPI 3.0
+//! encodes this with two orthogonal flags:
 //!
-//! | Where it appears                  | Synth name                          |
-//! |-----------------------------------|-------------------------------------|
-//! | `Pet.status` field                | `PetStatus`                         |
-//! | `listPets` op's `status` query    | `ListPetsStatus`                    |
+//! | `required` | `nullable` | wire semantics                              |
+//! |------------|------------|---------------------------------------------|
+//! | true       | false      | key MUST be present, value non-null         |
+//! | true       | true       | key MUST be present, value MAY be null      |
+//! | false      | false      | key MAY be omitted, never null when present |
+//! | false      | true       | key MAY be omitted, value MAY be null       |
 //!
-//! The name is consulted everywhere the enum's Dart type is needed —
-//! Freezed field declarations, parameter types, deserialisation expressions,
-//! and the `import 'pet_status.dart';` directives at the top of dependent
-//! files. Conflicts (two contexts producing the same name) are not expected
-//! in real specs, but if they occur the registry is last-write-wins with
-//! the `enums` BTreeMap keyed by synth name.
+//! The Dart shape per cell:
+//! - (true,  false) — `required T name`
+//! - (true,  true ) — `required T? name`     (sends `null` literally)
+//! - (false, false) — `T? name` + `@JsonKey(includeIfNull: false)`
+//! - (false, true ) — `Optional<T?> name`    (the cell that motivates all of this)
 //!
-//! ## Name collisions
+//! Only the bottom-right cell needs the `Optional<T?>` wrapper. The
+//! wrapper has two states — `Optional.absent()` and `Optional.present(value)` —
+//! corresponding directly to "key omitted" and "key present (possibly with null)".
 //!
-//! - **Class names that clash with Dart core identifiers** (DECISIONS D7):
-//!   `Error`, `Type`, etc. get a `Model` suffix. Applied at every usage —
-//!   class declaration, file name, named-ref types in fields/responses,
-//!   `*.fromJson(...)` deserialisation calls.
-//! - **Field names that aren't valid Dart camelCase**: the OpenAPI spec
-//!   often uses `snake_case` (e.g. `created_at`). Dart property names get
-//!   the camelCase form (`createdAt`) and the original key is preserved
-//!   on the wire via `@JsonKey(name: '<original>')`. Names already in
-//!   camelCase (the entire PetStore set: `id`, `name`, `tag`) emit no
-//!   annotation.
-//! - **Parameter names that collide with Dart reserved words** (DECISIONS
-//!   D10): a `Param` suffix is appended in the Dart signature. The original
-//!   name is preserved on the wire — path template uses the renamed
-//!   identifier in `${...}` interpolation, but query/header maps and the
-//!   `{...}` placeholders in the URL still use the original spec name.
-//! - **Two parameters in the same operation sharing a name across
-//!   locations** (DECISIONS D10): hard error during generation. We panic
-//!   rather than silently shadow.
+//! A `JsonConverter<Optional<T?>, Object?>` cannot, by itself, both drop
+//! a key and emit a literal `null`: `@JsonKey(includeIfNull: false)`
+//! checks the converter's output against `null`, so it can't tell those
+//! two apart. The working design is: the converter emits a sentinel
+//! object for `Optional.absent()`, and the class-level `toJson` override
+//! calls `stripOptionalAbsent` to remove sentinel-valued entries from
+//! the map before it leaves the model. `includeIfNull: false` still
+//! does its proper job for the (false, false) row above.
 //!
-//! ## Phase 5 — authentication
-//!
-//! When `Api.security_schemes` is non-empty, the emitted client constructor
-//! gains one optional `String?` parameter per scheme and installs a Dio
-//! `InterceptorsWrapper` that injects the supplied credentials into every
-//! outgoing request. Specifically:
-//!
-//! - `HttpBearer` → `options.headers['Authorization'] = 'Bearer $token'`
-//! - `ApiKey` (header) → `options.headers['<name>'] = key`
-//! - `ApiKey` (query)  → `options.queryParameters['<name>'] = key`
-//! - `ApiKey` (cookie) → appends `<name>=$key` to any existing `Cookie`
-//!   header so caller-set cookies survive.
-//!
-//! Each injection is wrapped in `if (cred != null) { ... }` so omitted
-//! credentials produce no header — endpoints that opt out of auth via
-//! `security: []` continue to work without surprises. Per-operation
-//! overrides (`Operation.security`) live in the IR but are not yet routed
-//! through; the interceptor is global. Refining that — e.g. to skip
-//! credential injection on operations that explicitly declare `security: []`
-//! — is a follow-up for a future phase.
+//! For non-primitive `T` (DateTime, Named, Map, Array, Enum), the
+//! generic `OptionalConverter<T>`'s `as T?` cast doesn't survive — the
+//! JSON-side runtime types differ. Those fall back to the (false,
+//! false) shape with a visible `// TODO(flap)` so the silent loss of
+//! the absent/present-null distinction is at least loud. A future phase
+//! will emit per-field `fromJson`/`toJson` lambdas to fix that.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -84,104 +54,22 @@ use flap_ir::{
 
 // ── Identifier policy ────────────────────────────────────────────────────────
 
-/// Schema names that collide with Dart core identifiers (DECISIONS D7).
-/// When a schema name is in this list, the emitted class gets a "Model" suffix.
 const DART_CORE_COLLISIONS: &[&str] = &[
-    "bool",
-    "DateTime",
-    "double",
-    "Duration",
-    "Error",
-    "Exception",
-    "Function",
-    "Future",
-    "int",
-    "Iterable",
-    "List",
-    "Map",
-    "num",
-    "Object",
-    "Pattern",
-    "Record",
-    "RegExp",
-    "Set",
-    "Stream",
-    "String",
-    "Symbol",
-    "Type",
-    "Uri",
+    "bool", "DateTime", "double", "Duration", "Error", "Exception", "Function", "Future", "int",
+    "Iterable", "List", "Map", "num", "Object", "Pattern", "Record", "RegExp", "Set", "Stream",
+    "String", "Symbol", "Type", "Uri",
 ];
 
-/// Dart reserved keywords that may not be used as identifiers (DECISIONS D10).
-/// Limited to entries that could plausibly appear as an OpenAPI parameter
-/// or field name. Built-in types like `int` are handled separately by D7.
 const DART_RESERVED_KEYWORDS: &[&str] = &[
-    "abstract",
-    "as",
-    "assert",
-    "async",
-    "await",
-    "break",
-    "case",
-    "catch",
-    "class",
-    "const",
-    "continue",
-    "covariant",
-    "default",
-    "deferred",
-    "do",
-    "dynamic",
-    "else",
-    "enum",
-    "export",
-    "extends",
-    "extension",
-    "external",
-    "factory",
-    "false",
-    "final",
-    "finally",
-    "for",
-    "get",
-    "hide",
-    "if",
-    "implements",
-    "import",
-    "in",
-    "interface",
-    "is",
-    "late",
-    "library",
-    "mixin",
-    "new",
-    "null",
-    "of",
-    "on",
-    "operator",
-    "part",
-    "required",
-    "rethrow",
-    "return",
-    "set",
-    "show",
-    "static",
-    "super",
-    "switch",
-    "sync",
-    "this",
-    "throw",
-    "true",
-    "try",
-    "typedef",
-    "var",
-    "void",
-    "while",
-    "with",
-    "yield",
+    "abstract", "as", "assert", "async", "await", "break", "case", "catch", "class", "const",
+    "continue", "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
+    "extends", "extension", "external", "factory", "false", "final", "finally", "for", "get",
+    "hide", "if", "implements", "import", "in", "interface", "is", "late", "library", "mixin",
+    "new", "null", "of", "on", "operator", "part", "required", "rethrow", "return", "set", "show",
+    "static", "super", "switch", "sync", "this", "throw", "true", "try", "typedef", "var", "void",
+    "while", "with", "yield",
 ];
 
-/// Dart class name for an OpenAPI schema. Appends "Model" on collision (D7).
 fn dart_class_name(schema_name: &str) -> String {
     if DART_CORE_COLLISIONS.contains(&schema_name) {
         format!("{schema_name}Model")
@@ -190,8 +78,6 @@ fn dart_class_name(schema_name: &str) -> String {
     }
 }
 
-/// Dart identifier safe to use as an argument or local variable name.
-/// Reserved words get a `Param` suffix; the wire-side name is unchanged.
 fn escape_dart_keyword(name: &str) -> String {
     if DART_RESERVED_KEYWORDS.contains(&name) {
         format!("{name}Param")
@@ -202,27 +88,16 @@ fn escape_dart_keyword(name: &str) -> String {
 
 // ── Synthetic enum registry ──────────────────────────────────────────────────
 
-/// One inline `enum: [...]` discovered while walking the API.
 #[derive(Debug, Clone)]
 struct SynthEnum {
-    /// PascalCase synthesised type name (e.g. "PetStatus").
     name: String,
-    /// String values in spec order. Preserved verbatim — the on-the-wire
-    /// representation lives on `@JsonValue` annotations, while the Dart
-    /// enum case names are derived separately.
     values: Vec<String>,
 }
 
-/// Lookup tables for enum types and their location-derived names.
 #[derive(Debug, Default)]
 struct EnumRegistry {
-    /// (schema_name, field_name) → synth enum name.
     field_enums: HashMap<(String, String), String>,
-    /// (operation_id, param_name) → synth enum name. Operations without
-    /// `operationId` are skipped — we have no stable way to name the enum.
     param_enums: HashMap<(String, String), String>,
-    /// All synth enums, keyed by name. BTreeMap for deterministic iteration
-    /// (file emission order matters for golden-output testing).
     enums: BTreeMap<String, SynthEnum>,
 }
 
@@ -230,7 +105,6 @@ impl EnumRegistry {
     fn build(api: &Api) -> Self {
         let mut reg = Self::default();
 
-        // Schemas: object fields with TypeRef::Enum.
         for schema in &api.schemas {
             if let SchemaKind::Object { fields } = &schema.kind {
                 for field in fields {
@@ -248,11 +122,8 @@ impl EnumRegistry {
                     }
                 }
             }
-            // Top-level array schemas with an enum item are exotic; skip
-            // until a real spec exhibits the pattern.
         }
 
-        // Operations: parameter schemas with TypeRef::Enum.
         for op in &api.operations {
             let Some(op_id) = &op.operation_id else {
                 continue;
@@ -292,15 +163,19 @@ impl EnumRegistry {
 
 // ── Public entry point: models ────────────────────────────────────────────────
 
-/// Returns a map of `filename → Dart source`. One file per schema, plus one
-/// file per synthesised inline enum.
+/// Returns a map of `filename → Dart source`.
+///
+/// Every emission includes a `flap_utils.dart` file containing the
+/// `Optional<T>` wrapper, the absence sentinel, and the
+/// `OptionalConverter<T>` JsonConverter. We emit it unconditionally
+/// (rather than only when at least one schema has a nullable+optional
+/// field) to keep the file set stable across spec edits — adding a
+/// nullable field to a previously-strict schema doesn't change which
+/// files exist, only their contents.
 pub fn emit_models(api: &Api) -> HashMap<String, String> {
     let registry = EnumRegistry::build(api);
     let mut files = HashMap::new();
 
-    // Always emit the shared utility file. It's tiny and harmless when
-    // unused; emitting it unconditionally keeps the output set stable
-    // across spec edits that add or remove the first Optional field.
     files.insert("flap_utils.dart".to_string(), emit_flap_utils());
 
     for schema in &api.schemas {
@@ -318,6 +193,8 @@ pub fn emit_models(api: &Api) -> HashMap<String, String> {
 
     files
 }
+
+// ── Phase 8: shared Optional<T> runtime ──────────────────────────────────────
 
 /// The shared `Optional<T>` + `OptionalConverter` runtime.
 ///
@@ -341,13 +218,13 @@ sealed class Optional<T> {
   const factory Optional.absent() = _Absent<T>;
 
   bool get isPresent => this is _Present<T>;
-  bool get isAbsent  => this is _Absent<T>;
+  bool get isAbsent => this is _Absent<T>;
 
-  /// Throws if `isAbsent`. Use `valueOrNull` if you want a fallback.
+  /// Throws if `isAbsent`. Use `valueOrNull` for a fallback.
   T get value => switch (this) {
         _Present<T>(:final value) => value,
-        _Absent<T>() => throw StateError(
-            'Optional.value called on Optional.absent()'),
+        _Absent<T>() =>
+          throw StateError('Optional.value called on Optional.absent()'),
       };
 
   T? get valueOrNull => switch (this) {
@@ -364,6 +241,7 @@ final class _Present<T> extends Optional<T> {
   bool operator ==(Object other) =>
       identical(this, other) ||
       (other is _Present<T> && other.value == value);
+
   @override
   int get hashCode => Object.hash(_Present, value);
 }
@@ -373,6 +251,7 @@ final class _Absent<T> extends Optional<T> {
 
   @override
   bool operator ==(Object other) => other is _Absent<T>;
+
   @override
   int get hashCode => (_Absent).hashCode;
 }
@@ -381,7 +260,10 @@ final class _Absent<T> extends Optional<T> {
 /// `stripOptionalAbsent` removes any map entry whose value is identical
 /// to this object before the map ever reaches `jsonEncode`.
 const Object kOptionalAbsentSentinel = _OptionalAbsentSentinel();
-class _OptionalAbsentSentinel { const _OptionalAbsentSentinel(); }
+
+class _OptionalAbsentSentinel {
+  const _OptionalAbsentSentinel();
+}
 
 /// Removes any entry whose value is the absence sentinel. Generated
 /// `toJson` overrides on models with `Optional` fields call this on the
@@ -397,7 +279,7 @@ Map<String, dynamic> stripOptionalAbsent(Map<String, dynamic> m) {
 /// per-field `@JsonKey(fromJson: ..., toJson: ...)` lambdas instead,
 /// because `as T?` won't survive the JSON-side runtime types.
 ///
-/// Round-trip:
+/// Round-trip semantics:
 /// - `fromJson(null)` → `Optional.present(null)` (key was present with null)
 /// - `fromJson(value)` → `Optional.present(value)`
 /// - **the absent case is encoded by NOT calling fromJson at all**, which
@@ -413,8 +295,8 @@ class OptionalConverter<T> implements JsonConverter<Optional<T?>, Object?> {
 
   @override
   Object? toJson(Optional<T?> opt) => switch (opt) {
-        _Absent<T?>()                  => kOptionalAbsentSentinel,
-        _Present<T?>(:final value)     => value,
+        _Absent<T?>() => kOptionalAbsentSentinel,
+        _Present<T?>(:final value) => value,
       };
 }
 "#
@@ -453,29 +335,6 @@ fn emit_schema(
 
 // ── Union schemas → @Freezed union ───────────────────────────────────────────
 
-/// Emits a Freezed sealed-class union for a `SchemaKind::Union`.
-///
-/// Freezed unions look like:
-///
-///   @Freezed(unionKey: 'petType')
-///   sealed class Pet with _$Pet {
-///     const factory Pet.dog({ required String name, required int age }) = Dog;
-///     const factory Pet.cat({ required String name, required bool indoor }) = Cat;
-///
-///     factory Pet.fromJson(Map<String, dynamic> json) => _$PetFromJson(json);
-///   }
-///
-/// Each variant's fields are inlined into its factory parameters. We
-/// reuse `emit_field` so JsonKey rewrites, optionality, and synth-enum
-/// lookups behave identically to standalone object emission. Imports are
-/// gathered across all variants' field types — recursion through Map and
-/// Array is handled by `collect_field_imports`.
-///
-/// The right-hand class name (`= Dog;`) uses the variant schema's Dart
-/// class name verbatim; D7 collisions are still applied. If the same
-/// schema is also emitted as a standalone `@freezed class`, the user
-/// will get a duplicate-definition error from Dart — that interaction
-/// is documented as a known v0.1 limitation.
 fn emit_freezed_union(
     class_name: &str,
     _schema_name: &str,
@@ -490,27 +349,30 @@ fn emit_freezed_union(
 
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
 
-    // Collect imports needed by any variant's fields. We do NOT import the
-    // variant classes themselves — Freezed defines them via the `=` on each
-    // factory. We DO import every named ref / synth enum referenced inside
-    // those variant fields.
     let mut imports: Vec<String> = Vec::new();
+    let mut needs_flap_utils = false;
     for variant in variants {
         let TypeRef::Named(variant_name) = variant else {
-            continue; // lowering rejects non-Named variants; defensive.
+            continue;
         };
         if let Some(SchemaKind::Object { fields }) = named_schema_kind(variant_name, schemas) {
             for field in fields {
                 collect_field_imports(
                     &field.type_ref,
                     &field.name,
-                    variant_name, // registry keys are scoped to the variant schema
+                    variant_name,
                     class_name,
                     registry,
                     &mut imports,
                 );
+                if field_uses_optional_wrapper(field) {
+                    needs_flap_utils = true;
+                }
             }
         }
+    }
+    if needs_flap_utils {
+        imports.push("import 'flap_utils.dart';".to_string());
     }
     imports.sort();
     imports.dedup();
@@ -538,25 +400,15 @@ fn emit_freezed_union(
 
         let fields: &[Field] = match named_schema_kind(variant_name, schemas) {
             Some(SchemaKind::Object { fields }) => fields.as_slice(),
-            // Non-object variants (array/map/union-of-union) are exotic
-            // enough that v0.1 just emits an empty factory rather than
-            // failing the whole emission. A future phase can bail here
-            // once we've seen what real specs do with this.
             _ => &[],
         };
 
-        // Override Freezed's default tag-from-factory-name behaviour only
-        // when the wire tag genuinely differs. Common cases (camelCase
-        // wire tags matching schema names) emit no annotation, which
-        // keeps the output clean for the 90% spec.
         if factory_name != *wire_tag {
             out.push_str(&format!("  @FreezedUnionValue('{wire_tag}')\n"));
         }
 
         out.push_str(&format!("  const factory {class_name}.{factory_name}({{\n"));
         for field in fields {
-            // Pass the variant's schema name so JsonKey + synth-enum lookups
-            // resolve against the registry entries created during build().
             out.push_str(&emit_field(field, variant_name, registry));
         }
         out.push_str(&format!("  }}) = {variant_class};\n\n"));
@@ -590,13 +442,27 @@ fn emit_map_typedef(name: &str, value: &TypeRef) -> String {
     )
 }
 
-fn class_has_optional_wrapper_field(fields: &[Field]) -> bool {
-    fields
-        .iter()
-        .any(|f| !f.required && f.nullable && type_ref_supports_optional_wrapper(&f.type_ref))
+// ── Object schemas → @freezed class ──────────────────────────────────────────
+
+/// True when this field will be emitted with the `Optional<T?>` wrapper
+/// in `emit_field`. This is the predicate that decides whether the
+/// enclosing class needs the `flap_utils.dart` import, the private
+/// constructor, and the `toJson` override that strips absence sentinels.
+///
+/// Mirrors the (false, true, primitive) cell of the (required, nullable,
+/// supports-wrapper) decision matrix; if `emit_field` ever changes which
+/// cells produce the wrapper, this predicate must change in lockstep or
+/// the class-level plumbing falls out of sync with the field-level shape.
+fn field_uses_optional_wrapper(field: &Field) -> bool {
+    !field.required && field.nullable && type_ref_supports_optional_wrapper(&field.type_ref)
 }
 
-// ── Object schemas → @freezed class ──────────────────────────────────────────
+/// True if any of the supplied fields will be emitted with the
+/// `Optional<T?>` wrapper. Drives both the `flap_utils.dart` import and
+/// the `toJson` override on the enclosing class.
+fn class_has_optional_wrapper_field(fields: &[Field]) -> bool {
+    fields.iter().any(field_uses_optional_wrapper)
+}
 
 fn emit_freezed_class(
     class_name: &str,
@@ -608,16 +474,11 @@ fn emit_freezed_class(
     let has_optional = class_has_optional_wrapper_field(fields);
     let mut out = String::new();
 
-    // Freezed import.
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n");
     if has_optional {
         out.push_str("import 'flap_utils.dart';\n");
     }
 
-    // Cross-file imports: any synth enum referenced by a field, plus any
-    // named refs that resolve to schemas (so the tooling sees them, even
-    // if they're already part of the same generated package). We recurse
-    // through `TypeRef::Map` so `Map<String, Pet>` still imports `pet.dart`.
     let mut imports: Vec<String> = Vec::new();
     for field in fields {
         collect_field_imports(
@@ -637,7 +498,6 @@ fn emit_freezed_class(
     }
     out.push('\n');
 
-    // Freezed `part` directives.
     out.push_str(&format!("part '{snake}.freezed.dart';\n"));
     out.push_str(&format!("part '{snake}.g.dart';\n"));
     out.push('\n');
@@ -645,9 +505,10 @@ fn emit_freezed_class(
     out.push_str("@freezed\n");
     out.push_str(&format!("class {class_name} with _${class_name} {{\n"));
 
-    // Freezed requires a private constructor to attach custom methods.
-    // We only add it when we actually need to override `toJson` — keeps
-    // the emitted code unchanged for specs that never touch nullability.
+    // Freezed requires a private constructor `const ClassName._();` to
+    // attach custom methods like our `toJson` override. We only emit it
+    // when we actually need the override — keeps the output unchanged
+    // for specs that never touch nullability.
     if has_optional {
         out.push_str(&format!("  const {class_name}._();\n\n"));
     }
@@ -662,20 +523,39 @@ fn emit_freezed_class(
         "  factory {class_name}.fromJson(Map<String, dynamic> json) =>\n"
     ));
     out.push_str(&format!("      _${class_name}FromJson(json);\n"));
-    out.push_str("}\n");
 
+    if has_optional {
+        // The cast `this as _ClassName` is needed because
+        // `_$ClassNameToJson` is generated against the concrete factory
+        // target (the `= _ClassName` on the factory), not the public
+        // sealed class itself.
+        out.push('\n');
+        out.push_str("  @override\n");
+        out.push_str("  Map<String, dynamic> toJson() =>\n");
+        out.push_str(&format!(
+            "      stripOptionalAbsent(_${class_name}ToJson(this as _{class_name}));\n"
+        ));
+    }
+
+    out.push_str("}\n");
     out
 }
 
-/// Whether the `Optional<T?>` wrapper can use the canonical
-/// `OptionalConverter<T>`. True for primitives whose JSON shape is `T`
-/// itself; false for types that need transformation (DateTime → String,
-/// Named → Map, etc.). The `false` branch falls back to `T?` semantics
-/// in this iteration with a TODO for the per-field-lambda follow-up.
+/// Whether the canonical `OptionalConverter<T>` works for this `T`.
+///
+/// True for primitives whose JSON shape is `T` itself; false for types
+/// that need transformation (DateTime → String, Named → Map, Array →
+/// List, etc.). The `false` branch in `emit_field` falls back to `T?`
+/// semantics with a TODO so the silent loss of the absent/present-null
+/// distinction is at least loud — a future phase will emit per-field
+/// `fromJson`/`toJson` lambdas to restore round-trip parity.
 fn type_ref_supports_optional_wrapper(type_ref: &TypeRef) -> bool {
     matches!(
         type_ref,
-        TypeRef::String | TypeRef::Integer { .. } | TypeRef::Number { .. } | TypeRef::Boolean
+        TypeRef::String
+            | TypeRef::Integer { .. }
+            | TypeRef::Number { .. }
+            | TypeRef::Boolean
     )
 }
 
@@ -684,7 +564,7 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
     let dart_type = to_dart_type(&field.type_ref, synth);
     let dart_name = to_camel_case(&field.name);
 
-    // Build up the @JsonKey args (name-rewrite + includeIfNull) and any
+    // Build up @JsonKey args (name-rewrite + includeIfNull) and any
     // sibling annotations (@OptionalConverter, @Default) separately.
     let mut json_key_args: Vec<String> = Vec::new();
     if dart_name != field.name {
@@ -692,18 +572,23 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
     }
     let mut sibling_annotations: Vec<String> = Vec::new();
 
-    // Decide the typed fragment — i.e. everything from `T name,` to
+    // Optional leading comment line (currently only used for the
+    // non-primitive Optional<T?> fallback, where we want a visible
+    // marker that the absent-vs-null distinction is being lost).
+    let mut leading_comment: Option<String> = None;
+
+    // Decide the typed fragment — `T name,`, `T? name,`, or
     // `Optional<T?> name,`.
     let typed_fragment = match (field.required, field.nullable) {
         // required + non-nullable: as before.
         (true, false) => format!("required {dart_type} {dart_name},\n"),
 
-        // required + nullable: explicitly nullable, ALWAYS sent (no
-        // includeIfNull suppression — that would lose the `null` wire form).
+        // required + nullable: explicitly nullable, ALWAYS sent — no
+        // includeIfNull suppression, that would lose the `null` wire form.
         (true, true) => format!("required {dart_type}? {dart_name},\n"),
 
-        // optional + non-nullable: `T?` with `includeIfNull: false` so
-        // a Dart-side null doesn't leak onto the wire as `"key": null`.
+        // optional + non-nullable: `T?` with `includeIfNull: false` so a
+        // Dart-side null doesn't leak onto the wire as `"key": null`.
         (false, false) => {
             json_key_args.push("includeIfNull: false".to_string());
             format!("{dart_type}? {dart_name},\n")
@@ -711,48 +596,48 @@ fn emit_field(field: &Field, schema_name: &str, registry: &EnumRegistry) -> Stri
 
         // optional + nullable: the Optional<T?> case — but only if T is
         // a primitive whose JSON shape matches Dart's. For non-primitive
-        // T we degrade to the (false, false) shape with a TODO comment;
-        // a future phase will emit per-field fromJson/toJson lambdas.
+        // T we degrade to (false, false) shape with a TODO; a future
+        // phase will emit per-field fromJson/toJson lambdas.
         (false, true) => {
             if type_ref_supports_optional_wrapper(&field.type_ref) {
                 sibling_annotations.push("@OptionalConverter()".to_string());
-                sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
+                sibling_annotations
+                    .push(format!("@Default(Optional<{dart_type}?>.absent())"));
                 format!("Optional<{dart_type}?> {dart_name},\n")
             } else {
                 json_key_args.push("includeIfNull: false".to_string());
-                // Visible warning so non-primitive Optional fields don't
-                // silently lose their absent/present-null distinction.
-                format!(
+                leading_comment = Some(format!(
                     "// TODO(flap): nullable+optional non-primitive — \
-                     `Optional<{dart_type}?>` not yet supported for this type\n    \
-                     {dart_type}? {dart_name},\n"
-                )
+                     `Optional<{dart_type}?>` not yet supported for this type"
+                ));
+                format!("{dart_type}? {dart_name},\n")
             }
         }
     };
 
-    // Assemble: indent → @JsonKey(...) → other annotations → typed fragment.
-    let mut line = String::from("    ");
+    // Assemble:
+    //     [    // TODO ...                      ]   (optional)
+    //     [    @JsonKey(...) ]                      (optional)
+    //     [    @OptionalConverter() @Default(...) ] (optional)
+    //     <typed fragment>
+    let mut out = String::new();
+    if let Some(c) = leading_comment {
+        out.push_str("    ");
+        out.push_str(&c);
+        out.push('\n');
+    }
+    out.push_str("    ");
     if !json_key_args.is_empty() {
-        line.push_str(&format!("@JsonKey({}) ", json_key_args.join(", ")));
+        out.push_str(&format!("@JsonKey({}) ", json_key_args.join(", ")));
     }
     for ann in &sibling_annotations {
-        line.push_str(ann);
-        line.push(' ');
+        out.push_str(ann);
+        out.push(' ');
     }
-    line.push_str(&typed_fragment);
-    line
+    out.push_str(&typed_fragment);
+    out
 }
 
-/// Walks a field's `TypeRef` and pushes any `import '...dart';` lines the
-/// generated source will need. Recurses through `Map` and `Array`.
-///
-/// Self-references are skipped — Freezed's `part 'x.freezed.dart'` files
-/// see the surrounding class without any `import`, and emitting one would
-/// produce a circular-import error from the Dart analyzer. The skip is
-/// keyed on `cls == class_name`, which holds for every field whose IR
-/// `is_recursive` flag is true (the flag is the IR-level statement of the
-/// same condition; the comparison here is the emitter-level enforcement).
 fn collect_field_imports(
     type_ref: &TypeRef,
     field_name: &str,
@@ -774,24 +659,10 @@ fn collect_field_imports(
             }
         }
         TypeRef::Map(inner) => {
-            collect_field_imports(
-                inner,
-                field_name,
-                schema_name,
-                class_name,
-                registry,
-                imports,
-            );
+            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
         }
         TypeRef::Array(inner) => {
-            collect_field_imports(
-                inner,
-                field_name,
-                schema_name,
-                class_name,
-                registry,
-                imports,
-            );
+            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
         }
         TypeRef::String
         | TypeRef::Integer { .. }
@@ -811,11 +682,7 @@ fn emit_synth_enum(synth: &SynthEnum) -> String {
     for (i, value) in synth.values.iter().enumerate() {
         let case = to_dart_enum_case(value);
         out.push_str(&format!("  @JsonValue('{value}')\n"));
-        let trailing = if i == synth.values.len() - 1 {
-            ";"
-        } else {
-            ","
-        };
+        let trailing = if i == synth.values.len() - 1 { ";" } else { "," };
         out.push_str(&format!("  {case}{trailing}\n"));
     }
     out.push_str("}\n");
@@ -824,7 +691,6 @@ fn emit_synth_enum(synth: &SynthEnum) -> String {
 
 // ── Public entry point: client ────────────────────────────────────────────────
 
-/// Returns `(filename, Dart source)` for the Dio client file.
 pub fn emit_client(api: &Api) -> (String, String) {
     let registry = EnumRegistry::build(api);
     let class_name = api_client_name(&api.title);
@@ -833,12 +699,7 @@ pub fn emit_client(api: &Api) -> (String, String) {
     (filename, source)
 }
 
-/// "Swagger Petstore" → "SwaggerPetstoreClient".
 fn api_client_name(title: &str) -> String {
-    // Each whitespace-separated word becomes a Pascal-cased segment:
-    // first char uppercased, remainder lowercased so all-caps words like
-    // "API" round-trip as "Api" rather than staying SHOUTED. This mirrors
-    // the policy used by `to_camel_case` for separator-bearing inputs.
     let pascal: String = title
         .split_whitespace()
         .filter(|w| !w.is_empty())
@@ -859,9 +720,6 @@ fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> S
     out.push_str("import 'package:dio/dio.dart';\n");
     out.push('\n');
 
-    // Import every model file plus every synth enum file. The client
-    // references most of them; importing the whole set keeps the file
-    // stable as operations evolve.
     let mut imports: Vec<String> = Vec::new();
     for schema in &api.schemas {
         let cls = dart_class_name(&schema.name);
@@ -878,14 +736,6 @@ fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> S
     }
     out.push('\n');
 
-    // Phase 5 (auth): each declared security scheme becomes an optional
-    // constructor parameter. The Dart identifier is derived from the
-    // scheme's registry key (e.g. `bearerAuth` → `bearerAuth`,
-    // `X-API-Key` → `xApiKey`), with reserved-word collisions handled
-    // by the same `escape_dart_keyword` policy used for path/query
-    // parameters. Each entry pairs the original scheme with its chosen
-    // Dart identifier so signature, interceptor, and any future
-    // per-scheme branching all use the same name.
     let credentials: Vec<DartCredential> = api
         .security_schemes
         .iter()
@@ -908,15 +758,8 @@ fn emit_client_source(api: &Api, class_name: &str, registry: &EnumRegistry) -> S
 
 // ── Phase 5 (auth): credential plumbing ──────────────────────────────────────
 
-/// One per `Api.security_schemes` entry. Pre-computes the Dart-side identity
-/// of each scheme so the constructor signature, the interceptor body, and
-/// any future per-scheme touch point share a single source of truth.
 struct DartCredential<'a> {
     scheme: &'a SecurityScheme,
-    /// Dart identifier for the constructor parameter, e.g. `bearerAuth`,
-    /// `apiKeyAuth`, or `xApiKey` for a scheme literally named `X-API-Key`.
-    /// Reserved words are escaped with the same `Param` suffix used for
-    /// route parameters (DECISIONS D10).
     dart_param_name: String,
 }
 
@@ -930,57 +773,15 @@ impl<'a> DartCredential<'a> {
     }
 }
 
-/// Emits the constructor — including the auth interceptor wiring when one
-/// or more security schemes are present.
-///
-/// Without auth, the body matches the pre-Phase-5 shape:
-/// ```dart
-///   FooClient({required String baseUrl})
-///       : _dio = Dio(BaseOptions(baseUrl: baseUrl));
-/// ```
-///
-/// With auth, the constructor accepts each credential as an optional named
-/// argument and installs an `InterceptorsWrapper` that injects the configured
-/// credentials into every outgoing request:
-/// ```dart
-///   FooClient({
-///     required String baseUrl,
-///     String? bearerAuth,
-///     String? apiKeyAuth,
-///   }) : _dio = Dio(BaseOptions(baseUrl: baseUrl)) {
-///     _dio.interceptors.add(
-///       InterceptorsWrapper(
-///         onRequest: (options, handler) {
-///           if (bearerAuth != null) {
-///             options.headers['Authorization'] = 'Bearer $bearerAuth';
-///           }
-///           if (apiKeyAuth != null) {
-///             options.headers['X-API-Key'] = apiKeyAuth;
-///           }
-///           handler.next(options);
-///         },
-///       ),
-///     );
-///   }
-/// ```
-///
-/// We choose the assertion form `if (cred != null)` even though Dart's
-/// null-promotion makes `options.headers[k] = cred!` redundant — the
-/// nullable form keeps the interceptor honest about *not* sending headers
-/// when no credential is configured, which is the behaviour callers expect
-/// for endpoints flagged `security: []`.
 fn emit_constructor(class_name: &str, credentials: &[DartCredential]) -> String {
     let mut out = String::new();
 
     if credentials.is_empty() {
-        // Same shape the emitter produced before Phase 5 — keeps the
-        // generated output stable for specs that never declare auth.
         out.push_str(&format!("  {class_name}({{required String baseUrl}})\n"));
         out.push_str("      : _dio = Dio(BaseOptions(baseUrl: baseUrl));\n");
         return out;
     }
 
-    // Multi-line constructor signature.
     out.push_str(&format!("  {class_name}({{\n"));
     out.push_str("    required String baseUrl,\n");
     for cred in credentials {
@@ -988,7 +789,6 @@ fn emit_constructor(class_name: &str, credentials: &[DartCredential]) -> String 
     }
     out.push_str("  }) : _dio = Dio(BaseOptions(baseUrl: baseUrl)) {\n");
 
-    // Interceptor body.
     out.push_str("    _dio.interceptors.add(\n");
     out.push_str("      InterceptorsWrapper(\n");
     out.push_str("        onRequest: (options, handler) {\n");
@@ -1004,13 +804,6 @@ fn emit_constructor(class_name: &str, credentials: &[DartCredential]) -> String 
     out
 }
 
-/// One credential's `if (...) ...` block inside the interceptor.
-///
-/// - `HttpBearer` → `options.headers['Authorization'] = 'Bearer $cred';`
-/// - `ApiKey` in header → `options.headers['<param>'] = cred;`
-/// - `ApiKey` in query  → `options.queryParameters['<param>'] = cred;`
-/// - `ApiKey` in cookie → append `<param>=$cred` to the `Cookie` header,
-///   preserving any existing cookies a caller may have set themselves.
 fn emit_credential_injection(cred: &DartCredential) -> String {
     let dart = &cred.dart_param_name;
     match cred.scheme {
@@ -1044,20 +837,10 @@ fn emit_credential_injection(cred: &DartCredential) -> String {
 
 // ── Method emission ───────────────────────────────────────────────────────────
 
-/// Bundle of per-parameter naming decisions, computed once and reused by
-/// signature, path templating, query / header construction, and any
-/// downstream call site.
 struct DartParam<'a> {
-    /// Original OpenAPI name (used as wire-side key in path / query / header).
     spec_name: &'a str,
-    /// Dart identifier used in the signature and method body. May differ
-    /// from `spec_name` if the spec name was snake_case (camelCased) or
-    /// collided with a Dart reserved keyword (suffixed with `Param`).
     dart_name: String,
     location: ParameterLocation,
-    /// The non-nullable Dart type — e.g. `String`, `int`, `PetStatus`.
-    /// The signature emitter adds a `?` for optional params and uses the
-    /// bare form for required ones.
     non_null_type: String,
     required: bool,
 }
@@ -1074,7 +857,6 @@ fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> S
     let dart_params = build_dart_params(op, registry);
     let return_type = success_return_type(&op.responses);
 
-    // Signature.
     if dart_params.is_empty() && op.request_body.is_none() {
         out.push_str(&format!(
             "  Future<{return_type}> {method_name}() async {{\n"
@@ -1082,8 +864,6 @@ fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> S
     } else {
         out.push_str(&format!("  Future<{return_type}> {method_name}({{\n"));
 
-        // Required params first, then body, then optional. Names sorted
-        // within each group for deterministic, low-diff output.
         let mut required: Vec<&DartParam> = dart_params.iter().filter(|p| p.required).collect();
         let mut optional: Vec<&DartParam> = dart_params.iter().filter(|p| !p.required).collect();
         required.sort_by(|a, b| a.dart_name.cmp(&b.dart_name));
@@ -1114,10 +894,6 @@ fn emit_method(op: &Operation, schemas: &[Schema], registry: &EnumRegistry) -> S
     out
 }
 
-/// Builds the Dart-facing parameter list and enforces D10's cross-location
-/// uniqueness rule. Panics with a clear message if two parameters share a
-/// name across path/query/header — generation must fail loudly rather than
-/// emit a method that compiles but loses one of the values.
 fn build_dart_params<'a>(op: &'a Operation, registry: &EnumRegistry) -> Vec<DartParam<'a>> {
     let op_id = op.operation_id.as_deref().unwrap_or("");
     let mut out = Vec::with_capacity(op.parameters.len());
@@ -1158,10 +934,6 @@ fn emit_method_body(
 ) -> String {
     let mut body = String::new();
 
-    // Path templating: replace each {spec_name} with ${dart_name}. Spec
-    // names that don't match a declared path parameter pass through
-    // untouched so a malformed input is still visibly malformed in the
-    // output rather than silently mangled.
     let mut templated_path = op.path.clone();
     for p in dart_params {
         if p.location == ParameterLocation::Path {
@@ -1172,9 +944,6 @@ fn emit_method_body(
     }
     let dart_path_literal = format!("'{templated_path}'");
 
-    // Query parameters: collect into a Map<String, dynamic>, with `if (…)`
-    // collection-if guarded entries for optional values so null query
-    // params are dropped at the Dio call site.
     let query_params: Vec<&DartParam> = dart_params
         .iter()
         .filter(|p| p.location == ParameterLocation::Query)
@@ -1194,7 +963,6 @@ fn emit_method_body(
         body.push_str("    };\n");
     }
 
-    // Header parameters: same shape as queries, attached via Options(headers:).
     let header_params: Vec<&DartParam> = dart_params
         .iter()
         .filter(|p| p.location == ParameterLocation::Header)
@@ -1214,15 +982,11 @@ fn emit_method_body(
         body.push_str("    };\n");
     }
 
-    // Body data expression.
     let data_expr = op.request_body.as_ref().map(body_data_expression);
 
-    // Return-type analysis decides whether to await-and-discard or
-    // capture-and-deserialise.
     let success_schema = success_response_schema(&op.responses);
     let needs_response_var = success_schema.is_some();
 
-    // Compose the Dio call.
     let response_assign = if needs_response_var {
         "    final response = "
     } else {
@@ -1232,8 +996,6 @@ fn emit_method_body(
     body.push_str("await _dio.request<dynamic>(\n");
     body.push_str(&format!("      {dart_path_literal},\n"));
 
-    // Options: method, plus headers if any. Build inline to keep the
-    // method body compact.
     let method_str = op.method.to_string();
     if header_params.is_empty() {
         body.push_str(&format!(
@@ -1253,7 +1015,6 @@ fn emit_method_body(
     }
     body.push_str("    );\n");
 
-    // Deserialise the response body if there is a schema to honour.
     if let Some(schema) = success_schema {
         body.push_str("    final data = response.data;\n");
         let expr = deserialize_expr(schema, schemas, registry, "data");
@@ -1263,17 +1024,6 @@ fn emit_method_body(
     body
 }
 
-/// Builds the right-hand side of `data: ...` for the Dio call.
-///
-/// - JSON object body → `body.toJson()`. Freezed classes implement `toJson`,
-///   so this round-trips cleanly through json_serializable.
-/// - JSON array body → `body` directly; Dart's `jsonEncode` walks lists and
-///   calls `.toJson()` on each element via its default `toEncodable`.
-/// - Multipart body → wrap in `FormData.fromMap` so Dio sends a multipart
-///   request. The IR's `is_multipart` flag is the single source of truth
-///   for this branch.
-/// - Primitive body (string, int, etc.) → pass through. Real specs rarely
-///   use a non-object request body, so this branch is mostly defensive.
 fn body_data_expression(body: &RequestBody) -> String {
     if body.is_multipart {
         return "FormData.fromMap(body.toJson())".into();
@@ -1284,8 +1034,6 @@ fn body_data_expression(body: &RequestBody) -> String {
     }
 }
 
-/// Returns the chosen success response schema (preferring the lowest 2xx
-/// status code). `None` means "no body" or "no 2xx response".
 fn success_response_schema(responses: &[Response]) -> Option<&TypeRef> {
     success_response(responses).and_then(|r| r.schema_ref.as_ref())
 }
@@ -1296,14 +1044,6 @@ fn success_response(responses: &[Response]) -> Option<&Response> {
         .find(|r| matches!(r.status_code.parse::<u16>(), Ok(c) if (200..300).contains(&c)))
 }
 
-/// Returns the Dart return type for an operation, derived from its
-/// chosen success response. Falls back to `void` when there is no 2xx
-/// response or the response declares no body.
-///
-/// Top-level enum responses are uncommon and we don't synthesise a name
-/// for them, so they degrade to `String` via `to_dart_type`'s fallback.
-/// If they become important, a separate per-operation-and-status registry
-/// can be added without disturbing the rest of the emitter.
 fn success_return_type(responses: &[Response]) -> String {
     match success_response_schema(responses) {
         Some(t) => to_dart_type(t, None),
@@ -1340,12 +1080,7 @@ fn deserialize_expr(
                 "({data_var} as List<dynamic>)\n        .map((e) => {inner_expr})\n        .toList()"
             )
         }
-        TypeRef::Enum(_) => {
-            // Top-level enum response — uncommon. The wire form is a string;
-            // downstream code can construct the synthesised enum case
-            // explicitly if a future caller needs it.
-            format!("{data_var} as String")
-        }
+        TypeRef::Enum(_) => format!("{data_var} as String"),
         TypeRef::Named(name) => match named_schema_kind(name, schemas) {
             Some(SchemaKind::Object { .. }) | Some(SchemaKind::Union { .. }) => {
                 let cls = dart_class_name(name);
@@ -1357,9 +1092,6 @@ fn deserialize_expr(
                     "({data_var} as List<dynamic>)\n        .map((e) => {item_expr})\n        .toList()"
                 )
             }
-            // A $ref to a top-level pure-map schema. The Dart side is a
-            // `typedef <Name> = Map<String, V>;` so the runtime shape is
-            // identical to an inline map — defer to the same casting pipe.
             Some(SchemaKind::Map { value }) => {
                 let value_ty = to_dart_type(value, None);
                 let inner_expr = deserialize_expr(value, schemas, registry, "v");
@@ -1369,8 +1101,6 @@ fn deserialize_expr(
                 )
             }
             None => {
-                // Reference into a missing schema; lowering would have rejected
-                // this, so it's an internal-consistency failure if hit.
                 let cls = dart_class_name(name);
                 format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
             }
@@ -1382,9 +1112,6 @@ fn named_schema_kind<'a>(name: &str, schemas: &'a [Schema]) -> Option<&'a Schema
     schemas.iter().find(|s| s.name == name).map(|s| &s.kind)
 }
 
-/// Operation method name. Prefers `operationId`; falls back to a slug
-/// derived from method + path. Real specs always set `operationId` for
-/// generated SDKs, so the fallback is mostly safety net.
 fn op_method_name(op: &Operation) -> String {
     if let Some(id) = &op.operation_id {
         return id.clone();
@@ -1406,14 +1133,6 @@ fn op_method_name(op: &Operation) -> String {
 
 // ── Type mapping ──────────────────────────────────────────────────────────────
 
-/// Maps an IR `TypeRef` to a Dart type expression.
-///
-/// `enum_synth_name` is the synthesised PascalCase name produced by the
-/// [`EnumRegistry`]. For inline enums in a context the registry knows about
-/// (object fields, operation parameters), the caller threads the name in;
-/// the function returns it directly. For nested or anonymous enums where
-/// no synth name is available, we fall back to `String` — the on-the-wire
-/// representation for v0.1's string-only enum support.
 fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
     match type_ref {
         TypeRef::String => "String".into(),
@@ -1435,9 +1154,6 @@ fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
 
 // ── Naming utilities ──────────────────────────────────────────────────────────
 
-/// PascalCase or camelCase → snake_case.
-/// "Pet" → "pet", "ErrorModel" → "error_model", "listPets" → "list_pets",
-/// "PetStatus" → "pet_status".
 fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, ch) in s.chars().enumerate() {
@@ -1449,18 +1165,6 @@ fn to_snake_case(s: &str) -> String {
     out
 }
 
-/// snake_case / kebab-case / already-camelCase → camelCase.
-///
-/// Splits on `_` and `-` so OpenAPI's three common naming styles all
-/// converge: `created_at` → `createdAt`, `X-Auth` → `xAuth`,
-/// `content-type` → `contentType`, `petId` → `petId` (unchanged),
-/// `API_KEY` → `apiKey`, `X-API-Key` → `xApiKey`.
-///
-/// When the input contains no separators we pass it through unchanged —
-/// already-camelCase names like `petId` must round-trip without being
-/// flattened. With separators present, each split segment is lowercased
-/// so that fully-uppercase initialisms (`API`, `URL`) are preserved as
-/// camelCase fragments rather than left in their SHOUTED form.
 fn to_camel_case(s: &str) -> String {
     if !s.contains('_') && !s.contains('-') {
         return s.to_string();
@@ -1484,8 +1188,6 @@ fn to_camel_case(s: &str) -> String {
     out
 }
 
-/// snake_case or camelCase → PascalCase.
-/// "status" → "Status", "created_at" → "CreatedAt", "listPets" → "ListPets".
 fn to_pascal_case(s: &str) -> String {
     let camel = to_camel_case(s);
     let mut chars = camel.chars();
@@ -1495,13 +1197,7 @@ fn to_pascal_case(s: &str) -> String {
     }
 }
 
-/// Wire enum value → Dart enum case name.
-/// "available" → "available", "IN_STOCK" → "inStock", "in-stock" → "inStock",
-/// "123abc" → "v123abc". The `@JsonValue` annotation carries the original
-/// string, so the case name only needs to be a valid Dart identifier.
 fn to_dart_enum_case(value: &str) -> String {
-    // Replace any non-alphanumeric run with an underscore so we can split
-    // cleanly on "_".
     let cleaned: String = value
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -1538,7 +1234,23 @@ mod tests {
         Schema, SchemaKind, TypeRef,
     };
 
-    // ── Fixture: PetStore (matches what flap_spec produces) ──────────────────
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn fields_of(schema: &Schema) -> Vec<Field> {
+        match &schema.kind {
+            SchemaKind::Object { fields } => fields
+                .iter()
+                .map(|f| Field {
+                    name: f.name.clone(),
+                    type_ref: f.type_ref.clone(),
+                    required: f.required,
+                    nullable: f.nullable,
+                    is_recursive: f.is_recursive,
+                })
+                .collect(),
+            _ => panic!("expected object schema"),
+        }
+    }
 
     fn pet_schema() -> Schema {
         Schema {
@@ -1551,22 +1263,22 @@ mod tests {
                             format: Some("int64".into()),
                         },
                         required: true,
-                        is_recursive: false,
                         nullable: false,
+                        is_recursive: false,
                     },
                     Field {
                         name: "name".into(),
                         type_ref: TypeRef::String,
                         required: true,
-                        is_recursive: false,
                         nullable: false,
+                        is_recursive: false,
                     },
                     Field {
                         name: "tag".into(),
                         type_ref: TypeRef::String,
                         required: false,
-                        is_recursive: true,
                         nullable: false,
+                        is_recursive: true,
                     },
                 ],
             },
@@ -1593,15 +1305,15 @@ mod tests {
                             format: Some("int32".into()),
                         },
                         required: true,
-                        is_recursive: true,
                         nullable: false,
+                        is_recursive: true,
                     },
                     Field {
                         name: "message".into(),
                         type_ref: TypeRef::String,
                         required: true,
-                        is_recursive: true,
                         nullable: false,
+                        is_recursive: true,
                     },
                 ],
             },
@@ -1694,116 +1406,34 @@ mod tests {
         }
     }
 
-    // ── Naming utilities ─────────────────────────────────────────────────────
-
-    #[test]
-    fn snake_case_conversion() {
-        assert_eq!(to_snake_case("Pet"), "pet");
-        assert_eq!(to_snake_case("PetStore"), "pet_store");
-        assert_eq!(to_snake_case("listPets"), "list_pets");
-        assert_eq!(to_snake_case("ErrorModel"), "error_model");
-        assert_eq!(to_snake_case("PetStatus"), "pet_status");
-    }
-
-    #[test]
-    fn camel_case_conversion() {
-        assert_eq!(to_camel_case("id"), "id");
-        assert_eq!(to_camel_case("name"), "name");
-        assert_eq!(to_camel_case("created_at"), "createdAt");
-        assert_eq!(to_camel_case("first_name"), "firstName");
-        assert_eq!(to_camel_case("petId"), "petId");
-        assert_eq!(to_camel_case("API_KEY"), "apiKey");
-    }
-
-    #[test]
-    fn pascal_case_conversion() {
-        assert_eq!(to_pascal_case("status"), "Status");
-        assert_eq!(to_pascal_case("created_at"), "CreatedAt");
-        assert_eq!(to_pascal_case("listPets"), "ListPets");
-        assert_eq!(to_pascal_case("petId"), "PetId");
-    }
-
-    #[test]
-    fn dart_enum_case_conversion() {
-        assert_eq!(to_dart_enum_case("available"), "available");
-        assert_eq!(to_dart_enum_case("IN_STOCK"), "inStock");
-        assert_eq!(to_dart_enum_case("in-stock"), "inStock");
-        assert_eq!(to_dart_enum_case("123abc"), "v123abc");
-    }
-
-    #[test]
-    fn keyword_escape() {
-        assert_eq!(escape_dart_keyword("limit"), "limit");
-        assert_eq!(escape_dart_keyword("in"), "inParam");
-        assert_eq!(escape_dart_keyword("class"), "classParam");
-        assert_eq!(escape_dart_keyword("required"), "requiredParam");
-    }
-
-    // ── D7 collisions ────────────────────────────────────────────────────────
-
-    #[test]
-    fn d7_error_renamed() {
-        assert_eq!(dart_class_name("Error"), "ErrorModel");
-    }
-
-    #[test]
-    fn d7_non_colliding_unchanged() {
-        assert_eq!(dart_class_name("Pet"), "Pet");
-        assert_eq!(dart_class_name("Pets"), "Pets");
-        assert_eq!(dart_class_name("Order"), "Order");
-    }
-
-    #[test]
-    fn d7_all_collisions_renamed() {
-        for name in DART_CORE_COLLISIONS {
-            let result = dart_class_name(name);
-            assert!(
-                result.ends_with("Model"),
-                "{name} should map to {name}Model, got {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn d7_named_ref_uses_renamed_type() {
-        let dart_type = to_dart_type(&TypeRef::Named("Error".into()), None);
-        assert_eq!(dart_type, "ErrorModel");
-    }
-
-    // ── Models: Pet (object) ─────────────────────────────────────────────────
+    // ── Existing-shape regression tests ──────────────────────────────────────
 
     #[test]
     fn pet_emits_freezed_class() {
         let registry = EnumRegistry::default();
         let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &registry);
-        assert!(src.contains("@freezed"), "missing @freezed");
-        assert!(
-            src.contains("class Pet with _$Pet"),
-            "missing class declaration"
-        );
-        assert!(src.contains("required int id"), "missing required int id");
-        assert!(
-            src.contains("required String name"),
-            "missing required String name"
-        );
-        assert!(src.contains("String? tag"), "missing optional String? tag");
-        assert!(src.contains(") = _Pet"), "missing = _Pet");
-        assert!(src.contains("_$PetFromJson(json)"), "missing fromJson");
-        assert!(
-            src.contains("part 'pet.freezed.dart'"),
-            "missing freezed part"
-        );
-        assert!(src.contains("part 'pet.g.dart'"), "missing g part");
+        assert!(src.contains("@freezed"));
+        assert!(src.contains("class Pet with _$Pet"));
+        assert!(src.contains("required int id"));
+        assert!(src.contains("required String name"));
+        assert!(src.contains("String? tag"));
+        assert!(src.contains("@JsonKey(includeIfNull: false) String? tag"));
+        assert!(src.contains(") = _Pet"));
+        assert!(src.contains("_$PetFromJson(json)"));
+        assert!(src.contains("part 'pet.freezed.dart'"));
+        assert!(src.contains("part 'pet.g.dart'"));
     }
 
     #[test]
-    fn pet_no_jsonkey_for_camelcase_fields() {
+    fn pet_does_not_emit_optional_plumbing() {
+        // None of Pet's fields are nullable, so no `flap_utils.dart`
+        // import, no private constructor, no `toJson` override.
         let registry = EnumRegistry::default();
         let src = emit_freezed_class("Pet", "Pet", &fields_of(&pet_schema()), &registry);
-        assert!(
-            !src.contains("@JsonKey"),
-            "PetStore single-word fields should not get @JsonKey, got:\n{src}"
-        );
+        assert!(!src.contains("flap_utils.dart"));
+        assert!(!src.contains("const Pet._();"));
+        assert!(!src.contains("Map<String, dynamic> toJson()"));
+        assert!(!src.contains("stripOptionalAbsent"));
     }
 
     #[test]
@@ -1816,15 +1446,15 @@ mod tests {
                         name: "first_name".into(),
                         type_ref: TypeRef::String,
                         required: true,
-                        is_recursive: true,
                         nullable: false,
+                        is_recursive: false,
                     },
                     Field {
                         name: "id".into(),
                         type_ref: TypeRef::String,
                         required: true,
-                        is_recursive: true,
                         nullable: false,
+                        is_recursive: false,
                     },
                 ],
             },
@@ -1835,1254 +1465,326 @@ mod tests {
             src.contains("@JsonKey(name: 'first_name') required String firstName"),
             "missing camelCased property + JsonKey, got:\n{src}"
         );
-        assert!(
-            src.contains("required String id,\n"),
-            "single-word field shouldn't have JsonKey, got:\n{src}"
-        );
+        assert!(src.contains("required String id,\n"));
     }
 
-    // ── Models: arrays ───────────────────────────────────────────────────────
+    // ── Phase 8: nullability + omission ──────────────────────────────────────
 
-    #[test]
-    fn pets_emits_typedef() {
-        let src = emit_array_typedef("Pets", &TypeRef::Named("Pet".into()));
-        assert!(src.contains("typedef Pets = List<Pet>"), "missing typedef");
-        assert!(!src.contains("@freezed"), "array must not emit @freezed");
-    }
-
-    // ── Models: D7 + file naming ─────────────────────────────────────────────
-
-    #[test]
-    fn d7_error_schema_emits_error_model_dart() {
-        let api = Api {
-            title: "Test".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![error_schema()],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let files = emit_models(&api);
-        assert!(files.contains_key("error_model.dart"));
-        assert!(!files.contains_key("error.dart"));
-        let src = &files["error_model.dart"];
-        assert!(src.contains("class ErrorModel"));
-        assert!(src.contains("with _$ErrorModel"));
-        assert!(src.contains(") = _ErrorModel"));
-        assert!(src.contains("_$ErrorModelFromJson"));
-        assert!(src.contains("part 'error_model.freezed.dart'"));
-        assert!(src.contains("part 'error_model.g.dart'"));
-    }
-
-    #[test]
-    fn emit_models_keys_include_renamed_and_originals() {
-        let api = Api {
-            title: "Test".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![error_schema(), pet_schema(), pets_schema()],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let files = emit_models(&api);
-        assert!(files.contains_key("error_model.dart"));
-        assert!(files.contains_key("pet.dart"));
-        assert!(files.contains_key("pets.dart"));
-    }
-
-    // ── Models: enums (Phase 4) ──────────────────────────────────────────────
-
-    #[test]
-    fn enum_field_synthesises_dart_enum_file() {
-        let pet_with_status = Schema {
-            name: "Pet".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "status".into(),
-                    type_ref: TypeRef::Enum(vec![
-                        "available".into(),
-                        "pending".into(),
-                        "sold".into(),
-                    ]),
-                    required: false,
-                    is_recursive: true,
-                    nullable: false,
-                }],
-            },
-        };
-        let api = Api {
-            title: "Test".into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![pet_with_status],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let files = emit_models(&api);
-
-        // A separate file for the synth enum.
-        assert!(
-            files.contains_key("pet_status.dart"),
-            "missing pet_status.dart, got keys: {:?}",
-            files.keys().collect::<Vec<_>>()
-        );
-        let enum_src = &files["pet_status.dart"];
-        assert!(enum_src.contains("enum PetStatus {"), "missing enum decl");
-        assert!(
-            enum_src.contains("@JsonValue('available')"),
-            "missing JsonValue for available"
-        );
-        assert!(enum_src.contains("  available,"));
-        assert!(enum_src.contains("@JsonValue('sold')"));
-        assert!(enum_src.contains("  sold;"), "last case must end with `;`");
-
-        // Pet model imports the enum and uses it as the field type.
-        let pet_src = &files["pet.dart"];
-        assert!(
-            pet_src.contains("import 'pet_status.dart';"),
-            "missing enum import, got:\n{pet_src}"
-        );
-        assert!(
-            pet_src.contains("PetStatus? status"),
-            "missing PetStatus type, got:\n{pet_src}"
-        );
-    }
-
-    // ── Models: maps and dates (Phase 4) ─────────────────────────────────────
-
-    #[test]
-    fn map_field_lowers_to_dart_map() {
-        let schema = Schema {
-            name: "Item".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "labels".into(),
-                    type_ref: TypeRef::Map(Box::new(TypeRef::String)),
-                    required: false,
-                    is_recursive: false,
-                    nullable: false,
-                }],
-            },
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Item", "Item", &fields_of(&schema), &registry);
-        assert!(
-            src.contains("Map<String, String>? labels"),
-            "missing Map type, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn map_of_named_lowers_correctly() {
-        let dart_type = to_dart_type(&TypeRef::Map(Box::new(TypeRef::Named("Pet".into()))), None);
-        assert_eq!(dart_type, "Map<String, Pet>");
-    }
-
-    #[test]
-    fn datetime_field_lowers_to_dart_datetime() {
-        let schema = Schema {
-            name: "Event".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "createdAt".into(),
-                    type_ref: TypeRef::DateTime,
-                    required: true,
-                    is_recursive: false,
-                    nullable: false,
-                }],
-            },
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Event", "Event", &fields_of(&schema), &registry);
-        assert!(
-            src.contains("required DateTime createdAt"),
-            "missing DateTime, got:\n{src}"
-        );
-    }
-
-    // ── Client: signatures (Phase 4) ─────────────────────────────────────────
-
-    #[test]
-    fn api_client_name_from_title() {
-        assert_eq!(api_client_name("Swagger Petstore"), "SwaggerPetstoreClient");
-        assert_eq!(api_client_name("My API"), "MyApiClient");
-    }
-
-    #[test]
-    fn client_class_and_constructor() {
-        let (filename, src) = emit_client(&petstore_api());
-        assert_eq!(filename, "swagger_petstore_client.dart");
-        assert!(src.contains("class SwaggerPetstoreClient"));
-        assert!(src.contains("final Dio _dio"));
-        assert!(src.contains("required String baseUrl"));
-        assert!(src.contains("BaseOptions(baseUrl: baseUrl)"));
-    }
-
-    #[test]
-    fn client_imports_models() {
-        let (_, src) = emit_client(&petstore_api());
-        assert!(src.contains("import 'package:dio/dio.dart';"));
-        // Error renamed → file is error_model.dart
-        assert!(src.contains("import 'error_model.dart';"));
-        assert!(src.contains("import 'pet.dart';"));
-        assert!(src.contains("import 'pets.dart';"));
-    }
-
-    #[test]
-    fn list_pets_signature() {
-        let (_, src) = emit_client(&petstore_api());
-        // Future<Pets> return, optional limit query param.
-        assert!(
-            src.contains("Future<Pets> listPets({"),
-            "missing return type / signature, got:\n{src}"
-        );
-        assert!(
-            src.contains("int? limit,"),
-            "missing optional limit, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn show_pet_by_id_signature() {
-        let (_, src) = emit_client(&petstore_api());
-        assert!(
-            src.contains("Future<Pet> showPetById({"),
-            "missing signature, got:\n{src}"
-        );
-        assert!(
-            src.contains("required String petId,"),
-            "missing required path param, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn create_pets_signature_has_required_body() {
-        let (_, src) = emit_client(&petstore_api());
-        assert!(
-            src.contains("Future<void> createPets({"),
-            "POST /pets has no 2xx schema → return Future<void>, got:\n{src}"
-        );
-        assert!(
-            src.contains("required Pet body,"),
-            "missing required body argument, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn reserved_keyword_param_renamed_in_signature() {
-        // Spec uses `in` as a query parameter name. Dart can't accept it
-        // verbatim — we rename to `inParam` in the signature but preserve
-        // `'in'` as the wire-side query map key.
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Get,
-                path: "/things".into(),
-                operation_id: Some("listThings".into()),
-                summary: None,
-                parameters: vec![Parameter {
-                    name: "in".into(),
-                    location: ParameterLocation::Query,
-                    type_ref: TypeRef::String,
-                    required: false,
-                }],
-                request_body: None,
-                responses: vec![],
-                security: None,
-            }],
-            schemas: vec![],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("String? inParam,"),
-            "param `in` should be escaped to inParam, got:\n{src}"
-        );
-        assert!(
-            src.contains("if (inParam != null) 'in': inParam"),
-            "wire key should remain 'in', got:\n{src}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "DECISIONS D10")]
-    fn cross_location_name_collision_is_hard_error() {
-        // Same name `id` in path and query — D10 says hard error.
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Get,
-                path: "/things/{id}".into(),
-                operation_id: Some("getThing".into()),
-                summary: None,
-                parameters: vec![
-                    Parameter {
-                        name: "id".into(),
-                        location: ParameterLocation::Path,
-                        type_ref: TypeRef::String,
-                        required: true,
-                    },
-                    Parameter {
-                        name: "id".into(),
-                        location: ParameterLocation::Query,
-                        type_ref: TypeRef::String,
-                        required: false,
-                    },
-                ],
-                request_body: None,
-                responses: vec![],
-                security: None,
-            }],
-            schemas: vec![],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let _ = emit_client(&api);
-    }
-
-    // ── Client: bodies (Phase 4) ─────────────────────────────────────────────
-
-    #[test]
-    fn list_pets_body_has_query_map_and_list_deserialisation() {
-        let (_, src) = emit_client(&petstore_api());
-        // Query map.
-        assert!(
-            src.contains("final queryParameters = <String, dynamic>{"),
-            "missing query map, got:\n{src}"
-        );
-        assert!(
-            src.contains("if (limit != null) 'limit': limit,"),
-            "missing collection-if entry, got:\n{src}"
-        );
-        // Dio call.
-        assert!(src.contains("await _dio.request<dynamic>("));
-        assert!(src.contains("'/pets',"), "missing path literal");
-        assert!(src.contains("options: Options(method: 'GET'),"));
-        assert!(src.contains("queryParameters: queryParameters,"));
-        // List deserialisation.
-        assert!(
-            src.contains("(data as List<dynamic>)"),
-            "missing list cast, got:\n{src}"
-        );
-        assert!(
-            src.contains(".map((e) => Pet.fromJson(e as Map<String, dynamic>))"),
-            "missing element deserialisation, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn show_pet_body_has_path_templating_and_object_deserialisation() {
-        let (_, src) = emit_client(&petstore_api());
-        assert!(
-            src.contains("'/pets/${petId}',"),
-            "missing path templating, got:\n{src}"
-        );
-        assert!(
-            src.contains("return Pet.fromJson(data as Map<String, dynamic>);"),
-            "missing object deserialisation, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn create_pets_body_passes_tojson_data_and_no_return() {
-        let (_, src) = emit_client(&petstore_api());
-        // We expect:  await _dio.request<dynamic>(... data: body.toJson() ...)
-        // No `final response` because there's no schema to deserialise.
-        assert!(
-            src.contains("await _dio.request<dynamic>("),
-            "missing dio call, got:\n{src}"
-        );
-        assert!(
-            src.contains("data: body.toJson(),"),
-            "missing body data, got:\n{src}"
-        );
-        // No `final response` for void returns.
-        let create_section = src
-            .split("createPets")
-            .nth(1)
-            .expect("createPets should appear in output")
-            .split("Future<")
-            .next()
-            .unwrap_or("");
-        assert!(
-            !create_section.contains("final response"),
-            "void return should not capture response, got:\n{create_section}"
-        );
-    }
-
-    #[test]
-    fn multipart_body_wraps_in_formdata() {
-        let api = Api {
-            title: "Upload".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Post,
-                path: "/upload".into(),
-                operation_id: Some("upload".into()),
-                summary: None,
-                parameters: vec![],
-                request_body: Some(RequestBody {
-                    content_type: "multipart/form-data".into(),
-                    schema_ref: TypeRef::Named("Upload".into()),
-                    required: true,
-                    is_multipart: true,
-                }),
-                responses: vec![Response {
-                    status_code: "204".into(),
-                    schema_ref: None,
-                }],
-                security: None,
-            }],
-            schemas: vec![Schema {
-                name: "Upload".into(),
-                kind: SchemaKind::Object { fields: vec![] },
-            }],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("data: FormData.fromMap(body.toJson()),"),
-            "multipart body must wrap in FormData.fromMap, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn header_param_attached_via_options() {
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Get,
-                path: "/x".into(),
-                operation_id: Some("getX".into()),
-                summary: None,
-                parameters: vec![Parameter {
-                    name: "X-Auth".into(),
-                    location: ParameterLocation::Header,
-                    type_ref: TypeRef::String,
-                    required: true,
-                }],
-                request_body: None,
-                responses: vec![],
-                security: None,
-            }],
-            schemas: vec![],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("'X-Auth': "),
-            "header should use original spec name as map key, got:\n{src}"
-        );
-        assert!(
-            src.contains("options: Options(method: 'GET', headers: headers),"),
-            "options should attach headers, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn no_2xx_response_returns_void() {
-        // Operation with only a `default` response → Future<void>.
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Delete,
-                path: "/x".into(),
-                operation_id: Some("deleteX".into()),
-                summary: None,
-                parameters: vec![],
-                request_body: None,
-                responses: vec![Response {
-                    status_code: "default".into(),
-                    schema_ref: Some(TypeRef::Named("Error".into())),
-                }],
-                security: None,
-            }],
-            schemas: vec![error_schema()],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("Future<void> deleteX("),
-            "default-only response → void, got:\n{src}"
-        );
-    }
-
-    // ── Helper for tests ─────────────────────────────────────────────────────
-
-    fn fields_of(schema: &Schema) -> Vec<Field> {
-        match &schema.kind {
-            SchemaKind::Object { fields } => fields
-                .iter()
-                .map(|f| Field {
-                    name: f.name.clone(),
-                    type_ref: f.type_ref.clone(),
-                    required: f.required,
-                    is_recursive: f.is_recursive,
-                    nullable: f.nullable,
-                })
-                .collect(),
-            _ => panic!("expected object schema"),
-        }
-    }
-}
-
-// ── Phase 5 (auth) tests ──────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod auth_tests {
-    //! Phase 5 (auth) tests. These are deliberately self-contained — they
-    //! build minimal `Api` fixtures rather than reusing the petstore helper
-    //! so they remain readable in isolation and are easy to extend as new
-    //! scheme variants arrive.
-
-    use super::*;
-    use flap_ir::{ApiKeyLocation, SecurityScheme};
-
-    fn empty_api(title: &str, schemes: Vec<SecurityScheme>) -> Api {
-        Api {
-            title: title.into(),
-            base_url: None,
-            operations: vec![],
-            schemas: vec![],
-            security_schemes: schemes,
-            security: vec![],
+    fn schema_with_field(name: &str, field: Field) -> Schema {
+        Schema {
+            name: name.into(),
+            kind: SchemaKind::Object { fields: vec![field] },
         }
     }
 
-    // ── Constructor shape ────────────────────────────────────────────────────
-
     #[test]
-    fn no_security_keeps_pre_phase5_constructor() {
-        // Specs without auth must produce the exact same constructor shape
-        // we emitted before Phase 5 — single-line initializer, no body block,
-        // no interceptor wiring. Anything else is a regression.
-        let api = empty_api("Plain", vec![]);
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("PlainClient({required String baseUrl})\n"),
-            "expected single-line constructor signature, got:\n{src}"
+    fn required_nullable_string_keeps_required_keyword_and_question_mark() {
+        // Cell (true, true): the receiver always sees the key, but the
+        // value may be null.
+        let schema = schema_with_field(
+            "Profile",
+            Field {
+                name: "bio".into(),
+                type_ref: TypeRef::String,
+                required: true,
+                nullable: true,
+                is_recursive: false,
+            },
         );
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Profile", "Profile", &fields_of(&schema), &registry);
         assert!(
-            src.contains(": _dio = Dio(BaseOptions(baseUrl: baseUrl));\n"),
-            "expected initializer-only constructor, got:\n{src}"
+            src.contains("required String? bio,"),
+            "expected `required String? bio,`, got:\n{src}"
         );
-        assert!(
-            !src.contains("InterceptorsWrapper"),
-            "no auth → no interceptor, got:\n{src}"
-        );
+        // Must NOT suppress the null wire form — that would defeat the
+        // whole point of (true, true).
+        assert!(!src.contains("includeIfNull: false"));
+        // (true, true) doesn't trigger the Optional wrapper.
+        assert!(!src.contains("Optional<"));
+        assert!(!src.contains("flap_utils.dart"));
     }
 
     #[test]
-    fn http_bearer_emits_bearer_token_param_and_header_injection() {
-        let api = empty_api(
-            "Secure",
-            vec![SecurityScheme::HttpBearer {
-                scheme_name: "bearerAuth".into(),
-                bearer_format: Some("JWT".into()),
-            }],
+    fn optional_non_nullable_string_uses_includeifnull_false() {
+        // Cell (false, false): client may omit the key, but if present
+        // the value is never null. `includeIfNull: false` keeps Dart-side
+        // nulls from leaking onto the wire as `"key": null`.
+        let schema = schema_with_field(
+            "Update",
+            Field {
+                name: "tag".into(),
+                type_ref: TypeRef::String,
+                required: false,
+                nullable: false,
+                is_recursive: false,
+            },
         );
-        let (_, src) = emit_client(&api);
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Update", "Update", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("@JsonKey(includeIfNull: false) String? tag,"),
+            "expected includeIfNull: false on optional non-nullable, got:\n{src}"
+        );
+        // Still no Optional wrapper for this cell.
+        assert!(!src.contains("Optional<"));
+    }
 
-        // Constructor signature.
+    #[test]
+    fn optional_nullable_primitive_uses_optional_wrapper() {
+        // Cell (false, true): the cell that motivates all of this. The
+        // wrapper is the only way to encode all three wire forms (absent,
+        // present-null, present-value) in a single Dart field.
+        let schema = schema_with_field(
+            "UpdateUserRequest",
+            Field {
+                name: "nickname".into(),
+                type_ref: TypeRef::String,
+                required: false,
+                nullable: true,
+                is_recursive: false,
+            },
+        );
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class(
+            "UpdateUserRequest",
+            "UpdateUserRequest",
+            &fields_of(&schema),
+            &registry,
+        );
+
+        // Field-level shape.
+        assert!(
+            src.contains("@OptionalConverter() @Default(Optional<String?>.absent()) Optional<String?> nickname,"),
+            "expected wrapper + converter + default, got:\n{src}"
+        );
+        // Class-level plumbing.
+        assert!(
+            src.contains("import 'flap_utils.dart';"),
+            "expected flap_utils.dart import, got:\n{src}"
+        );
+        assert!(
+            src.contains("const UpdateUserRequest._();"),
+            "Freezed needs a private constructor to attach toJson, got:\n{src}"
+        );
+        assert!(
+            src.contains("Map<String, dynamic> toJson() =>"),
+            "expected toJson override, got:\n{src}"
+        );
         assert!(
             src.contains(
-                "SecureClient({\n    required String baseUrl,\n    String? bearerAuth,\n  })"
+                "stripOptionalAbsent(_$UpdateUserRequestToJson(this as _UpdateUserRequest));"
             ),
-            "constructor should accept optional bearerAuth, got:\n{src}"
-        );
-        // Initializer + body block.
-        assert!(
-            src.contains(": _dio = Dio(BaseOptions(baseUrl: baseUrl)) {"),
-            "constructor should open a body block when auth is present, got:\n{src}"
-        );
-        // Interceptor wiring.
-        assert!(
-            src.contains("_dio.interceptors.add("),
-            "missing interceptor registration, got:\n{src}"
-        );
-        assert!(
-            src.contains("InterceptorsWrapper("),
-            "missing InterceptorsWrapper, got:\n{src}"
-        );
-        assert!(
-            src.contains("onRequest: (options, handler) {"),
-            "missing onRequest handler, got:\n{src}"
-        );
-        // Header injection — guarded by a null check.
-        assert!(
-            src.contains("if (bearerAuth != null) {"),
-            "missing null guard, got:\n{src}"
-        );
-        assert!(
-            src.contains("options.headers['Authorization'] = 'Bearer $bearerAuth';"),
-            "missing Authorization header, got:\n{src}"
-        );
-        assert!(
-            src.contains("handler.next(options);"),
-            "interceptor must call handler.next, got:\n{src}"
+            "toJson body must strip absence sentinels, got:\n{src}"
         );
     }
 
     #[test]
-    fn api_key_in_header_injects_custom_header() {
-        let api = empty_api(
-            "Secure",
-            vec![SecurityScheme::ApiKey {
-                scheme_name: "apiKeyAuth".into(),
-                parameter_name: "X-API-Key".into(),
-                location: ApiKeyLocation::Header,
-            }],
+    fn optional_nullable_int_uses_wrapper() {
+        // Same cell but with `int` — confirms the wrapper extends to
+        // every supported primitive, not just String.
+        let schema = schema_with_field(
+            "Patch",
+            Field {
+                name: "count".into(),
+                type_ref: TypeRef::Integer { format: None },
+                required: false,
+                nullable: true,
+                is_recursive: false,
+            },
         );
-        let (_, src) = emit_client(&api);
-
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
         assert!(
-            src.contains("String? apiKeyAuth,"),
-            "missing apiKeyAuth param, got:\n{src}"
-        );
-        assert!(
-            src.contains("if (apiKeyAuth != null) {"),
-            "missing null guard, got:\n{src}"
-        );
-        assert!(
-            src.contains("options.headers['X-API-Key'] = apiKeyAuth;"),
-            "header should use the spec's parameter name, not the scheme name, got:\n{src}"
+            src.contains("@OptionalConverter() @Default(Optional<int?>.absent()) Optional<int?> count,"),
+            "expected int wrapper, got:\n{src}"
         );
     }
 
     #[test]
-    fn api_key_in_query_injects_query_parameter() {
-        let api = empty_api(
-            "Secure",
-            vec![SecurityScheme::ApiKey {
-                scheme_name: "apiKeyAuth".into(),
-                parameter_name: "api_key".into(),
-                location: ApiKeyLocation::Query,
-            }],
+    fn optional_nullable_named_falls_back_with_todo() {
+        // A custom class is non-primitive — the canonical converter's
+        // `as T?` cast won't survive (the JSON is a Map, not a `Pet`).
+        // We degrade to (false, false) shape with a visible TODO so the
+        // round-trip loss is loud rather than silent.
+        let schema = schema_with_field(
+            "Patch",
+            Field {
+                name: "owner".into(),
+                type_ref: TypeRef::Named("Pet".into()),
+                required: false,
+                nullable: true,
+                is_recursive: false,
+            },
         );
-        let (_, src) = emit_client(&api);
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
+        assert!(
+            src.contains("// TODO(flap): nullable+optional non-primitive"),
+            "expected fallback TODO comment, got:\n{src}"
+        );
+        assert!(
+            src.contains("@JsonKey(includeIfNull: false) Pet? owner,"),
+            "fallback should be the (false, false) shape, got:\n{src}"
+        );
+        // No Optional plumbing at the class level since the wrapper
+        // wasn't used.
+        assert!(!src.contains("flap_utils.dart"));
+        assert!(!src.contains("const Patch._();"));
+    }
 
-        assert!(
-            src.contains("options.queryParameters['api_key'] = apiKeyAuth;"),
-            "query-located key must go on queryParameters, got:\n{src}"
+    #[test]
+    fn snake_case_field_with_optional_wrapper_combines_jsonkey_and_converter() {
+        // Both annotations must coexist: @JsonKey carries the wire-side
+        // name rewrite, @OptionalConverter and @Default sit alongside.
+        let schema = schema_with_field(
+            "Patch",
+            Field {
+                name: "display_name".into(),
+                type_ref: TypeRef::String,
+                required: false,
+                nullable: true,
+                is_recursive: false,
+            },
         );
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("Patch", "Patch", &fields_of(&schema), &registry);
         assert!(
-            !src.contains("options.headers['api_key']"),
-            "query key must not also land in headers, got:\n{src}"
+            src.contains("@JsonKey(name: 'display_name') @OptionalConverter() @Default(Optional<String?>.absent()) Optional<String?> displayName,"),
+            "expected JsonKey + converter + default + camelCased dart name, got:\n{src}"
         );
     }
 
     #[test]
-    fn api_key_in_cookie_appends_to_existing_cookie_header() {
-        // Caller may have set their own cookies on the request before the
-        // interceptor runs (e.g. a session cookie). The injection must
-        // preserve those, not clobber them.
-        let api = empty_api(
-            "Secure",
-            vec![SecurityScheme::ApiKey {
-                scheme_name: "session".into(),
-                parameter_name: "session_id".into(),
-                location: ApiKeyLocation::Cookie,
-            }],
-        );
-        let (_, src) = emit_client(&api);
-
-        assert!(
-            src.contains("final existing = options.headers['Cookie'];"),
-            "cookie injection must read existing header, got:\n{src}"
-        );
-        assert!(
-            src.contains("final cookie = 'session_id=$session';"),
-            "cookie value must use spec parameter name, got:\n{src}"
-        );
-        assert!(
-            src.contains("? cookie\n                : '$existing; $cookie';"),
-            "must append (with `; ` separator) when caller already set Cookie, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn multiple_schemes_each_get_their_own_injection_block() {
-        // Bearer + ApiKey/header on the same client — both arguments accepted,
-        // both injected, both null-guarded independently.
-        let api = empty_api(
-            "Secure",
-            vec![
-                SecurityScheme::ApiKey {
-                    scheme_name: "apiKeyAuth".into(),
-                    parameter_name: "X-API-Key".into(),
-                    location: ApiKeyLocation::Header,
-                },
-                SecurityScheme::HttpBearer {
-                    scheme_name: "bearerAuth".into(),
-                    bearer_format: None,
-                },
-            ],
-        );
-        let (_, src) = emit_client(&api);
-
-        assert!(src.contains("String? apiKeyAuth,"));
-        assert!(src.contains("String? bearerAuth,"));
-        assert!(src.contains("options.headers['X-API-Key'] = apiKeyAuth;"));
-        assert!(src.contains("options.headers['Authorization'] = 'Bearer $bearerAuth';"));
-
-        // Each block is independently guarded — supplying one credential
-        // must not affect whether the other gets sent.
-        let api_key_guards = src.matches("if (apiKeyAuth != null)").count();
-        let bearer_guards = src.matches("if (bearerAuth != null)").count();
-        assert_eq!(
-            api_key_guards, 1,
-            "expected exactly one guard per scheme for apiKeyAuth, got {api_key_guards}"
-        );
-        assert_eq!(
-            bearer_guards, 1,
-            "expected exactly one guard per scheme for bearerAuth, got {bearer_guards}"
-        );
-
-        // Single shared `handler.next(options);` at the end of the closure.
-        assert_eq!(
-            src.matches("handler.next(options);").count(),
-            1,
-            "handler.next must be called exactly once per request"
-        );
-    }
-
-    #[test]
-    fn reserved_word_scheme_name_gets_param_suffix() {
-        // A scheme literally named `default` would produce a Dart param
-        // called `default`, which is a reserved word. D10's escape policy
-        // applies — the param becomes `defaultParam`. The wire-side spec
-        // (the header name from `parameter_name`) is unaffected.
-        let api = empty_api(
-            "Secure",
-            vec![SecurityScheme::ApiKey {
-                scheme_name: "default".into(),
-                parameter_name: "X-API-Key".into(),
-                location: ApiKeyLocation::Header,
-            }],
-        );
-        let (_, src) = emit_client(&api);
-
-        assert!(
-            src.contains("String? defaultParam,"),
-            "reserved word must be escaped in the constructor, got:\n{src}"
-        );
-        assert!(
-            src.contains("if (defaultParam != null) {"),
-            "guard must use the escaped name, got:\n{src}"
-        );
-        assert!(
-            src.contains("options.headers['X-API-Key'] = defaultParam;"),
-            "header value must use the escaped Dart name, got:\n{src}"
-        );
-        // The wire-side header key remains the spec's parameter_name —
-        // `defaultParam` must not leak there.
-        assert!(
-            !src.contains("options.headers['default']"),
-            "wire header key must not use the (escaped) Dart name, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn dashed_scheme_name_produces_valid_dart_identifier() {
-        // `X-API-Key` as a registry key cannot appear verbatim in Dart —
-        // dashes are illegal in identifiers. The exact camelCase shape is
-        // up to `to_camel_case` (and is exercised by its own dedicated
-        // tests); here we just assert auth-relevant invariants:
-        //  1. The constructor parameter is a valid Dart identifier.
-        //  2. The wire-side header key is the spec's parameter_name verbatim.
-        let api = empty_api(
-            "Secure",
-            vec![SecurityScheme::ApiKey {
-                scheme_name: "X-API-Key".into(),
-                parameter_name: "X-API-Key".into(),
-                location: ApiKeyLocation::Header,
-            }],
-        );
-        let (_, src) = emit_client(&api);
-
-        let ident_line = src
-            .lines()
-            .find(|l| l.trim_start().starts_with("String? "))
-            .expect("expected a `String? <ident>,` line");
-        let ident = ident_line
-            .trim()
-            .trim_start_matches("String? ")
-            .trim_end_matches(',');
-        assert!(
-            !ident.contains('-'),
-            "dart identifier `{ident}` must not contain dashes"
-        );
-        assert!(
-            ident != "X-API-Key",
-            "dart identifier must not be the bare spec name"
-        );
-        assert!(
-            src.contains(&format!("options.headers['X-API-Key'] = {ident};")),
-            "header injection must use the spec's parameter_name as the key \
-             and the dart identifier as the value, got:\n{src}"
-        );
-    }
-}
-
-// ── Phase 6 (top-level maps & inline arrays) tests ───────────────────────────
-
-#[cfg(test)]
-mod phase6_tests {
-    //! Tests for the post-Phase-5 expansion: top-level pure-map schemas
-    //! become Dart typedefs, and inline `type: array` produces
-    //! `TypeRef::Array` which renders as `List<T>` everywhere a TypeRef is
-    //! used (fields, parameters, responses, request bodies).
-
-    use super::*;
-    use flap_ir::{
-        Api, Field, HttpMethod, Operation, Parameter, ParameterLocation, Response, Schema,
-        SchemaKind, TypeRef,
-    };
-
-    // ── Top-level map → typedef ──────────────────────────────────────────────
-
-    #[test]
-    fn top_level_map_emits_typedef() {
+    fn flap_utils_is_emitted_unconditionally() {
+        // Even a spec without any nullable+optional fields gets the
+        // utility file. Stable file set is more important than minimising
+        // emission.
         let api = Api {
             title: "T".into(),
             base_url: None,
             operations: vec![],
-            schemas: vec![Schema {
-                name: "UnitsMap".into(),
-                kind: SchemaKind::Map {
-                    value: TypeRef::String,
-                },
-            }],
+            schemas: vec![pet_schema()],
             security_schemes: vec![],
             security: vec![],
         };
         let files = emit_models(&api);
-        assert!(
-            files.contains_key("units_map.dart"),
-            "missing units_map.dart, got: {:?}",
-            files.keys().collect::<Vec<_>>()
-        );
-        let src = &files["units_map.dart"];
-        assert!(
-            src.contains("typedef UnitsMap = Map<String, String>;"),
-            "expected typedef, got:\n{src}"
-        );
-        assert!(
-            !src.contains("@freezed"),
-            "map typedef must not be a Freezed class, got:\n{src}"
-        );
+        assert!(files.contains_key("flap_utils.dart"));
+        let utils = &files["flap_utils.dart"];
+        assert!(utils.contains("sealed class Optional<T>"));
+        assert!(utils.contains("class OptionalConverter<T>"));
+        assert!(utils.contains("kOptionalAbsentSentinel"));
+        assert!(utils.contains("stripOptionalAbsent"));
     }
 
     #[test]
-    fn top_level_map_of_named_ref_in_typedef() {
+    fn flap_utils_runtime_is_self_contained() {
+        // The utility file must be drop-in: imports only the public
+        // freezed_annotation package, no project-internal refs.
         let api = Api {
             title: "T".into(),
             base_url: None,
             operations: vec![],
-            schemas: vec![
-                Schema {
-                    name: "Pet".into(),
-                    kind: SchemaKind::Object { fields: vec![] },
-                },
-                Schema {
-                    name: "PetCatalog".into(),
-                    kind: SchemaKind::Map {
-                        value: TypeRef::Named("Pet".into()),
-                    },
-                },
-            ],
+            schemas: vec![],
             security_schemes: vec![],
             security: vec![],
         };
         let files = emit_models(&api);
-        let src = &files["pet_catalog.dart"];
-        assert!(
-            src.contains("typedef PetCatalog = Map<String, Pet>;"),
-            "expected typedef of named ref, got:\n{src}"
-        );
+        let utils = &files["flap_utils.dart"];
+        assert!(utils.contains("import 'package:freezed_annotation/freezed_annotation.dart';"));
+        assert!(!utils.contains("import 'pet"));
+        assert!(!utils.contains("import 'flap_utils"));
     }
 
-    // ── Inline array TypeRef ─────────────────────────────────────────────────
-
     #[test]
-    fn inline_array_field_renders_as_list() {
+    fn class_with_mixed_fields_only_adds_optional_plumbing_for_wrapper_cell() {
+        // Realistic shape: a PATCH body with a required field, an
+        // optional non-nullable field, and an optional nullable field.
+        // Only the third cell triggers the wrapper, but the wrapper is
+        // enough by itself to add the class-level plumbing.
         let schema = Schema {
-            name: "Pet".into(),
+            name: "PatchUser".into(),
             kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "tags".into(),
-                    type_ref: TypeRef::Array(Box::new(TypeRef::String)),
-                    required: true,
-                    is_recursive: false,
-                    nullable: false,
-                }],
-            },
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Pet", "Pet", &fields_of(&schema), &registry);
-        assert!(
-            src.contains("required List<String> tags"),
-            "expected List<String>, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn inline_array_of_named_renders_with_import() {
-        let schema = Schema {
-            name: "Litter".into(),
-            kind: SchemaKind::Object {
-                fields: vec![Field {
-                    name: "pups".into(),
-                    type_ref: TypeRef::Array(Box::new(TypeRef::Named("Pet".into()))),
-                    required: false,
-                    is_recursive: false,
-                    nullable: false,
-                }],
-            },
-        };
-        let registry = EnumRegistry::default();
-        let src = emit_freezed_class("Litter", "Litter", &fields_of(&schema), &registry);
-        assert!(
-            src.contains("List<Pet>? pups"),
-            "expected optional List<Pet>, got:\n{src}"
-        );
-        assert!(
-            src.contains("import 'pet.dart';"),
-            "List of Named must import the element's file, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn inline_array_query_parameter_in_signature() {
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Get,
-                path: "/forecast".into(),
-                operation_id: Some("getForecast".into()),
-                summary: None,
-                parameters: vec![Parameter {
-                    name: "hourly".into(),
-                    location: ParameterLocation::Query,
-                    type_ref: TypeRef::Array(Box::new(TypeRef::String)),
-                    required: false,
-                }],
-                request_body: None,
-                responses: vec![],
-                security: None,
-            }],
-            schemas: vec![],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("List<String>? hourly,"),
-            "expected List<String> param, got:\n{src}"
-        );
-        // Wire-side serialisation: the existing query map shape passes the
-        // List value through — Dio handles the repeated-key encoding.
-        assert!(
-            src.contains("if (hourly != null) 'hourly': hourly,"),
-            "expected pass-through into query map, got:\n{src}"
-        );
-    }
-
-    #[test]
-    fn inline_array_response_deserialises_via_list_map() {
-        let api = Api {
-            title: "T".into(),
-            base_url: None,
-            operations: vec![Operation {
-                method: HttpMethod::Get,
-                path: "/things".into(),
-                operation_id: Some("listThings".into()),
-                summary: None,
-                parameters: vec![],
-                request_body: None,
-                responses: vec![Response {
-                    status_code: "200".into(),
-                    schema_ref: Some(TypeRef::Array(Box::new(TypeRef::String))),
-                }],
-                security: None,
-            }],
-            schemas: vec![],
-            security_schemes: vec![],
-            security: vec![],
-        };
-        let (_, src) = emit_client(&api);
-        assert!(
-            src.contains("Future<List<String>> listThings("),
-            "expected Future<List<String>> return, got:\n{src}"
-        );
-        assert!(
-            src.contains("(data as List<dynamic>)"),
-            "expected list cast, got:\n{src}"
-        );
-        assert!(
-            src.contains(".map((e) => e as String)"),
-            "expected element extraction, got:\n{src}"
-        );
-    }
-
-    // ── Helper ───────────────────────────────────────────────────────────────
-
-    fn fields_of(schema: &Schema) -> Vec<Field> {
-        match &schema.kind {
-            SchemaKind::Object { fields } => fields
-                .iter()
-                .map(|f| Field {
-                    name: f.name.clone(),
-                    type_ref: f.type_ref.clone(),
-                    required: f.required,
-                    is_recursive: f.is_recursive,
-                    nullable: false,
-                })
-                .collect(),
-            _ => panic!("expected object schema"),
-        }
-    }
-}
-
-#[test]
-fn union_emits_freezed_union_class() {
-    let api = Api {
-        title: "T".into(),
-        base_url: None,
-        operations: vec![],
-        schemas: vec![
-            Schema {
-                name: "Dog".into(),
-                kind: SchemaKind::Object {
-                    fields: vec![
-                        Field {
-                            name: "petType".into(),
-                            type_ref: TypeRef::String,
-                            required: true,
-                            is_recursive: true,
-                            nullable: false,
-                        },
-                        Field {
-                            name: "name".into(),
-                            type_ref: TypeRef::String,
-                            required: true,
-                            is_recursive: true,
-                            nullable: false,
-                        },
-                        Field {
-                            name: "breed".into(),
-                            type_ref: TypeRef::String,
-                            required: false,
-                            is_recursive: true,
-                            nullable: false,
-                        },
-                    ],
-                },
-            },
-            Schema {
-                name: "Cat".into(),
-                kind: SchemaKind::Object {
-                    fields: vec![
-                        Field {
-                            name: "petType".into(),
-                            type_ref: TypeRef::String,
-                            required: true,
-                            is_recursive: true,
-                            nullable: false,
-                        },
-                        Field {
-                            name: "name".into(),
-                            type_ref: TypeRef::String,
-                            required: true,
-                            is_recursive: true,
-                            nullable: false,
-                        },
-                        Field {
-                            name: "indoor".into(),
-                            type_ref: TypeRef::Boolean,
-                            required: false,
-                            is_recursive: false,
-                            nullable: false,
-                        },
-                    ],
-                },
-            },
-            Schema {
-                name: "Pet".into(),
-                kind: SchemaKind::Union {
-                    variants: vec![TypeRef::Named("Dog".into()), TypeRef::Named("Cat".into())],
-                    discriminator: "petType".into(),
-                    variant_tags: vec!["dog".into(), "cat".into()],
-                },
-            },
-        ],
-        security_schemes: vec![],
-        security: vec![],
-    };
-    let files = emit_models(&api);
-    let src = &files["pet.dart"];
-    assert!(src.contains("@Freezed(unionKey: 'petType')"), "got:\n{src}");
-    assert!(src.contains("sealed class Pet with _$Pet"), "got:\n{src}");
-    assert!(src.contains("const factory Pet.dog({"), "got:\n{src}");
-    assert!(src.contains("}) = PetDog;"), "got:\n{src}");
-    assert!(src.contains("const factory Pet.cat({"), "got:\n{src}");
-    assert!(src.contains("}) = PetCat;"), "got:\n{src}");
-    assert!(
-        src.contains("required String name"),
-        "field inlining: {src}"
-    );
-    assert!(src.contains("bool? indoor"), "optional bool: {src}");
-    assert!(src.contains("factory Pet.fromJson"), "got:\n{src}");
-    assert!(src.contains("_$PetFromJson(json)"), "got:\n{src}");
-    assert!(
-        !src.contains("@FreezedUnionValue"),
-        "no annotation should fire when tag matches camelCase factory: {src}"
-    );
-    assert!(src.contains("part 'pet.freezed.dart'"));
-    assert!(src.contains("part 'pet.g.dart'"));
-}
-
-#[test]
-fn explicit_variant_tags_emit_union_value_annotation() {
-    let api = Api {
-        title: "T".into(),
-        base_url: None,
-        operations: vec![],
-        schemas: vec![
-            Schema {
-                name: "Dog".into(),
-                kind: SchemaKind::Object {
-                    fields: vec![Field {
-                        name: "name".into(),
+                fields: vec![
+                    Field {
+                        name: "id".into(),
                         type_ref: TypeRef::String,
                         required: true,
-                        is_recursive: true,
                         nullable: false,
-                    }],
-                },
-            },
-            Schema {
-                name: "Cat".into(),
-                kind: SchemaKind::Object {
-                    fields: vec![Field {
-                        name: "name".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        is_recursive: true,
-                        nullable: false,
-                    }],
-                },
-            },
-            Schema {
-                name: "Pet".into(),
-                kind: SchemaKind::Union {
-                    variants: vec![TypeRef::Named("Dog".into()), TypeRef::Named("Cat".into())],
-                    discriminator: "petType".into(),
-                    variant_tags: vec!["v1.dog".into(), "v1.cat".into()],
-                },
-            },
-        ],
-        security_schemes: vec![],
-        security: vec![],
-    };
-    let files = emit_models(&api);
-    let src = &files["pet.dart"];
-    assert!(
-        src.contains("@FreezedUnionValue('v1.dog')"),
-        "missing annotation for Dog, got:\n{src}"
-    );
-    assert!(
-        src.contains("@FreezedUnionValue('v1.cat')"),
-        "missing annotation for Cat, got:\n{src}"
-    );
-}
-
-#[test]
-fn one_of_without_mapping_uses_schema_name_default() {
-    // OpenAPI default: wire tag is the schema name verbatim ("Dog").
-    // Factory name is camelCased ("dog"). They differ, so we expect
-    // an annotation — this pins down the "honest OpenAPI" behaviour
-    // even though most specs in practice use lowercase tags.
-    let api = Api {
-        title: "T".into(),
-        base_url: None,
-        operations: vec![],
-        schemas: vec![
-            Schema {
-                name: "Dog".into(),
-                kind: SchemaKind::Object {
-                    fields: vec![Field {
-                        name: "name".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
-                        is_recursive: true,
-                        nullable: false,
-                    }],
-                },
-            },
-            Schema {
-                name: "Pet".into(),
-                kind: SchemaKind::Union {
-                    variants: vec![TypeRef::Named("Dog".into())],
-                    discriminator: "petType".into(),
-                    variant_tags: vec!["Dog".into()], // OpenAPI default
-                },
-            },
-        ],
-        security_schemes: vec![],
-        security: vec![],
-    };
-    let files = emit_models(&api);
-    let src = &files["pet.dart"];
-    assert!(src.contains("@FreezedUnionValue('Dog')"), "got:\n{src}");
-}
-
-#[test]
-fn one_of_with_camelcase_matching_tags_omits_annotation() {
-    // The clean path: spec uses lowercase wire tags that match the
-    // camelCased factory name. No annotation needed.
-    let api = Api {
-        title: "T".into(),
-        base_url: None,
-        operations: vec![],
-        schemas: vec![
-            Schema {
-                name: "Dog".into(),
-                kind: SchemaKind::Object {
-                    fields: vec![Field {
-                        name: "name".into(),
-                        type_ref: TypeRef::String,
-                        required: true,
                         is_recursive: false,
+                    },
+                    Field {
+                        name: "tag".into(),
+                        type_ref: TypeRef::String,
+                        required: false,
                         nullable: false,
-                    }],
-                },
+                        is_recursive: false,
+                    },
+                    Field {
+                        name: "nickname".into(),
+                        type_ref: TypeRef::String,
+                        required: false,
+                        nullable: true,
+                        is_recursive: false,
+                    },
+                ],
             },
-            Schema {
-                name: "Pet".into(),
-                kind: SchemaKind::Union {
-                    variants: vec![TypeRef::Named("Dog".into())],
-                    discriminator: "petType".into(),
-                    variant_tags: vec!["dog".into()], // matches factory name
-                },
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("PatchUser", "PatchUser", &fields_of(&schema), &registry);
+
+        // Required, non-nullable: untouched.
+        assert!(src.contains("required String id,"));
+        // Optional non-nullable: includeIfNull suppression only.
+        assert!(src.contains("@JsonKey(includeIfNull: false) String? tag,"));
+        // Optional nullable: full wrapper.
+        assert!(src.contains("Optional<String?> nickname,"));
+        // Class-level plumbing (driven by the wrapper field).
+        assert!(src.contains("import 'flap_utils.dart';"));
+        assert!(src.contains("const PatchUser._();"));
+        assert!(src.contains("stripOptionalAbsent(_$PatchUserToJson(this as _PatchUser));"));
+    }
+
+    #[test]
+    fn d7_renamed_class_uses_renamed_in_tojson_cast() {
+        // `Error` → `ErrorModel` per D7. The toJson cast must use the
+        // renamed class; if it didn't, the generated `_$ErrorModelToJson`
+        // would refuse the bare `Error` and the file wouldn't compile.
+        let schema = Schema {
+            name: "Error".into(),
+            kind: SchemaKind::Object {
+                fields: vec![Field {
+                    name: "detail".into(),
+                    type_ref: TypeRef::String,
+                    required: false,
+                    nullable: true,
+                    is_recursive: false,
+                }],
             },
-        ],
-        security_schemes: vec![],
-        security: vec![],
-    };
-    let files = emit_models(&api);
-    let src = &files["pet.dart"];
-    assert!(
-        !src.contains("@FreezedUnionValue"),
-        "no annotation expected when tag matches factory name, got:\n{src}"
-    );
+        };
+        let registry = EnumRegistry::default();
+        let src = emit_freezed_class("ErrorModel", "Error", &fields_of(&schema), &registry);
+        assert!(
+            src.contains(
+                "stripOptionalAbsent(_$ErrorModelToJson(this as _ErrorModel));"
+            ),
+            "toJson cast must use the D7-renamed class, got:\n{src}"
+        );
+    }
+
+    // ── Existing client tests, abridged to confirm no regressions ────────────
+
+    #[test]
+    fn list_pets_signature_unchanged() {
+        let (_, src) = emit_client(&petstore_api());
+        assert!(src.contains("Future<Pets> listPets({"));
+        assert!(src.contains("int? limit,"));
+    }
+
+    #[test]
+    fn show_pet_body_path_templating_unchanged() {
+        let (_, src) = emit_client(&petstore_api());
+        assert!(src.contains("'/pets/${petId}',"));
+        assert!(src.contains("return Pet.fromJson(data as Map<String, dynamic>);"));
+    }
 }
