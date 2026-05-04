@@ -16,19 +16,95 @@ use flap_ir::{
 // ── Identifier policy ────────────────────────────────────────────────────────
 
 const DART_CORE_COLLISIONS: &[&str] = &[
-    "bool", "DateTime", "double", "Duration", "Error", "Exception", "Function", "Future", "int",
-    "Iterable", "List", "Map", "num", "Object", "Pattern", "Record", "RegExp", "Set", "Stream",
-    "String", "Symbol", "Type", "Uri",
+    "bool",
+    "DateTime",
+    "double",
+    "Duration",
+    "Error",
+    "Exception",
+    "Function",
+    "Future",
+    "int",
+    "Iterable",
+    "List",
+    "Map",
+    "num",
+    "Object",
+    "Pattern",
+    "Record",
+    "RegExp",
+    "Set",
+    "Stream",
+    "String",
+    "Symbol",
+    "Type",
+    "Uri",
 ];
 
 const DART_RESERVED_KEYWORDS: &[&str] = &[
-    "abstract", "as", "assert", "async", "await", "break", "case", "catch", "class", "const",
-    "continue", "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
-    "extends", "extension", "external", "factory", "false", "final", "finally", "for", "get",
-    "hide", "if", "implements", "import", "in", "interface", "is", "late", "library", "mixin",
-    "new", "null", "of", "on", "operator", "part", "required", "rethrow", "return", "set", "show",
-    "static", "super", "switch", "sync", "this", "throw", "true", "try", "typedef", "var", "void",
-    "while", "with", "yield",
+    "abstract",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "dynamic",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extension",
+    "external",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "get",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "of",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "set",
+    "show",
+    "static",
+    "super",
+    "switch",
+    "sync",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
 ];
 
 fn dart_class_name(schema_name: &str) -> String {
@@ -77,6 +153,38 @@ pub enum ClientBackend {
     Http,
 }
 
+// ── NEW: add near NullSafety and ClientBackend ────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct MappingConfig {
+    /// Schema name → replacement Dart type.  e.g. `"Pet" → "ExamplePet"`.
+    pub type_map: std::collections::HashMap<String, String>,
+    /// Dart type name → import URI.  e.g. `"ExamplePet" → "package:myapp/example_pet.dart"`.
+    pub import_map: std::collections::HashMap<String, String>,
+}
+
+impl MappingConfig {
+    pub fn is_empty(&self) -> bool {
+        self.type_map.is_empty() && self.import_map.is_empty()
+    }
+
+    /// Resolve a schema name to its Dart class name, honouring any type mapping.
+    pub fn resolve_class(&self, schema_name: &str) -> String {
+        if let Some(mapped) = self.type_map.get(schema_name) {
+            mapped.clone()
+        } else {
+            dart_class_name(schema_name)
+        }
+    }
+
+    /// Returns a ready-to-emit import line for a Dart type, if one is registered.
+    pub fn import_for(&self, dart_type: &str) -> Option<String> {
+        self.import_map
+            .get(dart_type)
+            .map(|path| format!("import '{path}';"))
+    }
+}
+
 // ── Synthetic enum registry ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -105,21 +213,36 @@ impl EnumRegistry {
                         let synth = format!("{}{}", schema.name, to_pascal_case(&field.name));
                         reg.field_enums
                             .insert((schema.name.clone(), field.name.clone()), synth.clone());
-                        reg.enums.insert(synth.clone(), SynthEnum { name: synth, values: values.clone() });
+                        reg.enums.insert(
+                            synth.clone(),
+                            SynthEnum {
+                                name: synth,
+                                values: values.clone(),
+                            },
+                        );
                     }
                 }
             }
         }
 
         for op in &api.operations {
-            let Some(op_id) = &op.operation_id else { continue };
+            let Some(op_id) = &op.operation_id else {
+                continue;
+            };
             let op_pascal = to_pascal_case(op_id);
 
             for param in &op.parameters {
                 if let TypeRef::Enum(values) = &param.type_ref {
                     let synth = format!("{}{}", op_pascal, to_pascal_case(&param.name));
-                    reg.param_enums.insert((op_id.clone(), param.name.clone()), synth.clone());
-                    reg.enums.insert(synth.clone(), SynthEnum { name: synth, values: values.clone() });
+                    reg.param_enums
+                        .insert((op_id.clone(), param.name.clone()), synth.clone());
+                    reg.enums.insert(
+                        synth.clone(),
+                        SynthEnum {
+                            name: synth,
+                            values: values.clone(),
+                        },
+                    );
                 }
             }
 
@@ -127,16 +250,33 @@ impl EnumRegistry {
                 if let TypeRef::Enum(values) = &body.schema_ref {
                     let synth = format!("{op_pascal}Body");
                     reg.body_enums.insert(op_id.clone(), synth.clone());
-                    reg.enums.insert(synth.clone(), SynthEnum { name: synth, values: values.clone() });
+                    reg.enums.insert(
+                        synth.clone(),
+                        SynthEnum {
+                            name: synth,
+                            values: values.clone(),
+                        },
+                    );
                 }
             }
 
             for resp in &op.responses {
                 if let Some(TypeRef::Enum(values)) = &resp.schema_ref {
-                    let code = resp.status_code.chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+                    let code = resp
+                        .status_code
+                        .chars()
+                        .filter(|c| c.is_alphanumeric())
+                        .collect::<String>();
                     let synth = format!("{op_pascal}{code}Response");
-                    reg.response_enums.insert((op_id.clone(), resp.status_code.clone()), synth.clone());
-                    reg.enums.insert(synth.clone(), SynthEnum { name: synth, values: values.clone() });
+                    reg.response_enums
+                        .insert((op_id.clone(), resp.status_code.clone()), synth.clone());
+                    reg.enums.insert(
+                        synth.clone(),
+                        SynthEnum {
+                            name: synth,
+                            values: values.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -145,11 +285,15 @@ impl EnumRegistry {
     }
 
     fn lookup_field(&self, schema: &str, field: &str) -> Option<&str> {
-        self.field_enums.get(&(schema.to_string(), field.to_string())).map(String::as_str)
+        self.field_enums
+            .get(&(schema.to_string(), field.to_string()))
+            .map(String::as_str)
     }
 
     fn lookup_param(&self, op_id: &str, param: &str) -> Option<&str> {
-        self.param_enums.get(&(op_id.to_string(), param.to_string())).map(String::as_str)
+        self.param_enums
+            .get(&(op_id.to_string(), param.to_string()))
+            .map(String::as_str)
     }
 
     fn lookup_body(&self, op_id: &str) -> Option<&str> {
@@ -157,13 +301,19 @@ impl EnumRegistry {
     }
 
     fn lookup_response(&self, op_id: &str, status_code: &str) -> Option<&str> {
-        self.response_enums.get(&(op_id.to_string(), status_code.to_string())).map(String::as_str)
+        self.response_enums
+            .get(&(op_id.to_string(), status_code.to_string()))
+            .map(String::as_str)
     }
 }
 
 // ── Public entry point: models ────────────────────────────────────────────────
 
-pub fn emit_models(api: &Api, mode: NullSafety) -> HashMap<String, String> {
+pub fn emit_models(
+    api: &Api,
+    mode: NullSafety,
+    mappings: &MappingConfig,
+) -> HashMap<String, String> {
     let registry = EnumRegistry::build(api);
     let mut files = HashMap::new();
 
@@ -172,10 +322,16 @@ pub fn emit_models(api: &Api, mode: NullSafety) -> HashMap<String, String> {
     }
 
     for schema in &api.schemas {
-        if schema.internal { continue; }
-        let class_name = dart_class_name(&schema.name);
+        if schema.internal {
+            continue;
+        }
+        // Skip schemas the user has replaced with their own hand-written type.
+        if mappings.type_map.contains_key(&schema.name) {
+            continue;
+        }
+        let class_name = mappings.resolve_class(&schema.name);
         let filename = format!("{}.dart", to_snake_case(&class_name));
-        let source = emit_schema(schema, &class_name, &registry, &api.schemas, mode);
+        let source = emit_schema(schema, &class_name, &registry, &api.schemas, mode, mappings);
         files.insert(filename, source);
     }
 
@@ -190,13 +346,18 @@ pub fn emit_models(api: &Api, mode: NullSafety) -> HashMap<String, String> {
 // ── Public entry point: client ────────────────────────────────────────────────
 
 /// Returns `(filename, dart_source)`.
-pub fn emit_client(api: &Api, mode: NullSafety, backend: ClientBackend) -> (String, String) {
+pub fn emit_client(
+    api: &Api,
+    mode: NullSafety,
+    backend: ClientBackend,
+    mappings: &MappingConfig,
+) -> (String, String) {
     let registry = EnumRegistry::build(api);
     let class_name = api_client_name(&api.title);
     let filename = format!("{}.dart", to_snake_case(&class_name));
     let source = match backend {
-        ClientBackend::Dio  => emit_client_dio(api, &class_name, &registry, mode),
-        ClientBackend::Http => emit_client_http(api, &class_name, &registry, mode),
+        ClientBackend::Dio => emit_client_dio(api, &class_name, &registry, mode, mappings),
+        ClientBackend::Http => emit_client_http(api, &class_name, &registry, mode, mappings),
     };
     (filename, source)
 }
@@ -292,43 +453,71 @@ fn emit_schema(
     registry: &EnumRegistry,
     schemas: &[Schema],
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     match &schema.kind {
-        SchemaKind::Object { fields } => {
-            emit_freezed_class(class_name, &schema.name, fields, schemas, registry, mode)
-        }
-        SchemaKind::Array { item } => emit_array_typedef(class_name, item),
-        SchemaKind::Map { value } => emit_map_typedef(class_name, value),
-        SchemaKind::Union { variants, discriminator, variant_tags } => {
-            emit_freezed_union(class_name, &schema.name, variants, discriminator, variant_tags, schemas, registry, mode)
-        }
-        SchemaKind::UntaggedUnion { variants } => {
-            emit_untagged_union(class_name, &schema.name, variants, schemas, registry, mode)
-        }
-        SchemaKind::Alias { target } => emit_alias_typedef(class_name, target),
+        SchemaKind::Object { fields } => emit_freezed_class(
+            class_name,
+            &schema.name,
+            fields,
+            schemas,
+            registry,
+            mode,
+            mappings,
+        ),
+        SchemaKind::Array { item } => emit_array_typedef(class_name, item, mappings),
+        SchemaKind::Map { value } => emit_map_typedef(class_name, value, mappings),
+        SchemaKind::Union {
+            variants,
+            discriminator,
+            variant_tags,
+        } => emit_freezed_union(
+            class_name,
+            &schema.name,
+            variants,
+            discriminator,
+            variant_tags,
+            schemas,
+            registry,
+            mode,
+            mappings,
+        ),
+        SchemaKind::UntaggedUnion { variants } => emit_untagged_union(
+            class_name,
+            &schema.name,
+            variants,
+            schemas,
+            registry,
+            mode,
+            mappings,
+        ),
+        SchemaKind::Alias { target } => emit_alias_typedef(class_name, target, mappings),
     }
 }
 
-fn emit_alias_typedef(alias_name: &str, target: &str) -> String {
-    let target_cls = dart_class_name(target);
+fn emit_alias_typedef(alias_name: &str, target: &str, mappings: &MappingConfig) -> String {
+    let target_cls = mappings.resolve_class(target);
     let target_file = to_snake_case(&target_cls);
+    let import_line = mappings
+        .import_for(&target_cls)
+        .unwrap_or_else(|| format!("import '{target_file}.dart';"));
     format!(
         "// Generated from OpenAPI $ref alias `{alias_name}` → `{target}`.\n\
-         import '{target_file}.dart';\n\
+         {import_line}\n\
          typedef {alias_name} = {target_cls};\n"
     )
 }
 
-fn emit_array_typedef(name: &str, item: &TypeRef) -> String {
-    let dart_item = to_dart_type(item, None);
+fn emit_array_typedef(name: &str, item: &TypeRef, mappings: &MappingConfig) -> String {
+    let dart_item = to_dart_type(item, None, mappings);
     format!(
         "// Generated from OpenAPI array schema `{name}`.\n\
          typedef {name} = List<{dart_item}>;\n"
     )
 }
 
-fn emit_map_typedef(name: &str, value: &TypeRef) -> String {
-    let dart_value = to_dart_type(value, None);
+fn emit_map_typedef(name: &str, value: &TypeRef, mappings: &MappingConfig) -> String {
+    let dart_value = to_dart_type(value, None, mappings);
     format!(
         "// Generated from OpenAPI map schema `{name}`\n\
          // (object with `additionalProperties` and no fixed properties).\n\
@@ -363,6 +552,7 @@ fn emit_freezed_class(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let snake = to_snake_case(class_name);
     let has_optional = class_has_optional_wrapper_field(fields, mode);
@@ -378,11 +568,22 @@ fn emit_freezed_class(
 
     let mut imports: Vec<String> = Vec::new();
     for field in fields {
-        collect_field_imports(&field.type_ref, &field.name, schema_name, class_name, registry, &mut imports);
+        collect_field_imports(
+            &field.type_ref,
+            &field.name,
+            schema_name,
+            class_name,
+            registry,
+            &mut imports,
+            mappings,
+        );
     }
     imports.sort();
     imports.dedup();
-    for line in &imports { out.push_str(line); out.push('\n'); }
+    for line in &imports {
+        out.push_str(line);
+        out.push('\n');
+    }
     out.push('\n');
 
     out.push_str(&format!("part '{snake}.freezed.dart';\n"));
@@ -394,7 +595,14 @@ fn emit_freezed_class(
     }
     out.push_str(&format!("  const factory {class_name}({{\n"));
     for field in fields {
-        out.push_str(&emit_field(field, schema_name, schemas, registry, mode));
+        out.push_str(&emit_field(
+            field,
+            schema_name,
+            schemas,
+            registry,
+            mode,
+            mappings,
+        ));
     }
     out.push_str(&format!("  }}) = _{class_name};\n\n"));
     out.push_str(&format!(
@@ -418,9 +626,10 @@ fn emit_field(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let synth = registry.lookup_field(schema_name, &field.name);
-    let dart_type = to_dart_type(&field.type_ref, synth);
+    let dart_type = to_dart_type(&field.type_ref, synth, mappings);
     let dart_name = to_camel_case(&field.name);
     let force_nullable_for_recursion =
         field.is_recursive && matches!(&field.type_ref, TypeRef::Named(_));
@@ -431,8 +640,11 @@ fn emit_field(
     }
     let mut sibling_annotations: Vec<String> = Vec::new();
 
+    // Only emit the converter annotation when the schema is NOT mapped away —
+    // if it is mapped, the external type handles its own serialization.
     if let TypeRef::Named(name) = &field.type_ref
         && is_untagged_union(schemas, name)
+        && !mappings.type_map.contains_key(name.as_str())
     {
         sibling_annotations.push(format!("@_{name}Converter()"));
     }
@@ -467,7 +679,8 @@ fn emit_field(
                     (false, false) => {
                         json_key_args.push("includeIfNull: false".to_string());
                         if let Some(default) = &field.default_value {
-                            sibling_annotations.push(format!("@Default({})", dart_default_expr(default)));
+                            sibling_annotations
+                                .push(format!("@Default({})", dart_default_expr(default)));
                             format!("{dart_type} {dart_name},\n")
                         } else {
                             format!("{dart_type}? {dart_name},\n")
@@ -476,12 +689,14 @@ fn emit_field(
                     (false, true) => {
                         if type_ref_supports_optional_wrapper(&field.type_ref) {
                             sibling_annotations.push("@OptionalConverter()".to_string());
-                            sibling_annotations.push(format!("@Default(Optional<{dart_type}?>.absent())"));
+                            sibling_annotations
+                                .push(format!("@Default(Optional<{dart_type}?>.absent())"));
                             format!("Optional<{dart_type}?> {dart_name},\n")
                         } else {
                             json_key_args.push("includeIfNull: false".to_string());
                             leading_comment = Some(format!(
-                                "// TODO(flap): nullable+optional non-primitive — `Optional<{dart_type}?>` not yet supported"
+                                "// TODO(flap): nullable+optional non-primitive — \
+                                 `Optional<{dart_type}?>` not yet supported for this type"
                             ));
                             format!("{dart_type}? {dart_name},\n")
                         }
@@ -492,12 +707,19 @@ fn emit_field(
     };
 
     let mut out = String::new();
-    if let Some(c) = leading_comment { out.push_str("    "); out.push_str(&c); out.push('\n'); }
+    if let Some(c) = leading_comment {
+        out.push_str("    ");
+        out.push_str(&c);
+        out.push('\n');
+    }
     out.push_str("    ");
     if !json_key_args.is_empty() {
         out.push_str(&format!("@JsonKey({}) ", json_key_args.join(", ")));
     }
-    for ann in &sibling_annotations { out.push_str(ann); out.push(' '); }
+    for ann in &sibling_annotations {
+        out.push_str(ann);
+        out.push(' ');
+    }
     out.push_str(&typed_fragment);
     out
 }
@@ -509,6 +731,7 @@ fn collect_field_imports(
     class_name: &str,
     registry: &EnumRegistry,
     imports: &mut Vec<String>,
+    mappings: &MappingConfig,
 ) {
     match type_ref {
         TypeRef::Enum(_) => {
@@ -517,13 +740,27 @@ fn collect_field_imports(
             }
         }
         TypeRef::Named(name) => {
-            let cls = dart_class_name(name);
-            if cls != class_name {
+            let cls = mappings.resolve_class(name);
+            if cls == class_name {
+                return;
+            }
+            // Use the registered import if one exists, otherwise assume a sibling file.
+            if let Some(import_line) = mappings.import_for(&cls) {
+                imports.push(import_line);
+            } else {
                 imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
             }
         }
         TypeRef::Map(inner) | TypeRef::Array(inner) => {
-            collect_field_imports(inner, field_name, schema_name, class_name, registry, imports);
+            collect_field_imports(
+                inner,
+                field_name,
+                schema_name,
+                class_name,
+                registry,
+                imports,
+                mappings,
+            );
         }
         _ => {}
     }
@@ -540,6 +777,7 @@ fn emit_freezed_union(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let snake = to_snake_case(class_name);
     let mut out = String::new();
@@ -548,26 +786,48 @@ fn emit_freezed_union(
     let mut imports: Vec<String> = Vec::new();
     let mut needs_flap_utils = false;
     for variant in variants {
-        let TypeRef::Named(variant_name) = variant else { continue };
+        let TypeRef::Named(variant_name) = variant else {
+            continue;
+        };
         if let Some(SchemaKind::Object { fields }) = named_schema_kind(variant_name, schemas) {
             for field in fields {
-                collect_field_imports(&field.type_ref, &field.name, variant_name, class_name, registry, &mut imports);
-                if field_uses_optional_wrapper(field, mode) { needs_flap_utils = true; }
+                collect_field_imports(
+                    &field.type_ref,
+                    &field.name,
+                    variant_name,
+                    class_name,
+                    registry,
+                    &mut imports,
+                    mappings,
+                );
+                if field_uses_optional_wrapper(field, mode) {
+                    needs_flap_utils = true;
+                }
             }
         }
     }
-    if needs_flap_utils { imports.push("import 'flap_utils.dart';".to_string()); }
-    imports.sort(); imports.dedup();
-    for line in &imports { out.push_str(line); out.push('\n'); }
+    if needs_flap_utils {
+        imports.push("import 'flap_utils.dart';".to_string());
+    }
+    imports.sort();
+    imports.dedup();
+    for line in &imports {
+        out.push_str(line);
+        out.push('\n');
+    }
     out.push('\n');
 
     out.push_str(&format!("part '{snake}.freezed.dart';\n"));
     out.push_str(&format!("part '{snake}.g.dart';\n\n"));
     out.push_str(&format!("@Freezed(unionKey: '{discriminator}')\n"));
-    out.push_str(&format!("sealed class {class_name} with _${class_name} {{\n"));
+    out.push_str(&format!(
+        "sealed class {class_name} with _${class_name} {{\n"
+    ));
 
     for (variant, wire_tag) in variants.iter().zip(variant_tags.iter()) {
-        let TypeRef::Named(variant_name) = variant else { continue };
+        let TypeRef::Named(variant_name) = variant else {
+            continue;
+        };
         let variant_class = format!("{}{}", class_name, to_pascal_case(variant_name));
         let factory_name = to_camel_case(variant_name);
         let fields: &[Field] = match named_schema_kind(variant_name, schemas) {
@@ -579,7 +839,14 @@ fn emit_freezed_union(
         }
         out.push_str(&format!("  const factory {class_name}.{factory_name}({{\n"));
         for field in fields {
-            out.push_str(&emit_field(field, variant_name, schemas, registry, mode));
+            out.push_str(&emit_field(
+                field,
+                variant_name,
+                schemas,
+                registry,
+                mode,
+                mappings,
+            ));
         }
         out.push_str(&format!("  }}) = {variant_class};\n\n"));
     }
@@ -600,6 +867,7 @@ fn emit_untagged_union(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut out = String::new();
     out.push_str("import 'dart:convert';\n");
@@ -610,27 +878,39 @@ fn emit_untagged_union(
         if let TypeRef::Named(variant_name) = variant
             && !is_internal_wrapper(schemas, variant_name)
         {
-            let cls = dart_class_name(variant_name);
-            imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
+            let cls = mappings.resolve_class(variant_name);
+            if let Some(import_line) = mappings.import_for(&cls) {
+                imports.push(import_line);
+            } else {
+                imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
+            }
         }
     }
-    imports.sort(); imports.dedup();
-    for line in &imports { out.push_str(line); out.push('\n'); }
+    imports.sort();
+    imports.dedup();
+    for line in &imports {
+        out.push_str(line);
+        out.push('\n');
+    }
     out.push('\n');
 
     out.push_str(&format!("sealed class {class_name} {{\n"));
     out.push_str(&format!("  const {class_name}._();\n\n"));
 
     for (i, variant) in variants.iter().enumerate() {
-        let (variant_dart_type, _, _) = resolve_untagged_variant_info(variant, schemas, registry);
+        let (variant_dart_type, _, _) =
+            resolve_untagged_variant_info(variant, schemas, registry, mappings);
         out.push_str(&format!(
             "  const factory {class_name}.variant{i}({variant_dart_type} value) = _Variant{i};\n"
         ));
     }
 
-    out.push_str(&format!("\n  factory {class_name}.fromJson(dynamic json) {{\n"));
+    out.push_str(&format!(
+        "\n  factory {class_name}.fromJson(dynamic json) {{\n"
+    ));
     for (i, variant) in variants.iter().enumerate() {
-        let (variant_dart_type, _, is_primitive) = resolve_untagged_variant_info(variant, schemas, registry);
+        let (variant_dart_type, _, is_primitive) =
+            resolve_untagged_variant_info(variant, schemas, registry, mappings);
         if is_primitive {
             out.push_str(&format!(
                 "    if (json is {variant_dart_type}) return {class_name}.variant{i}(json);\n"
@@ -649,11 +929,16 @@ fn emit_untagged_union(
         "    throw ArgumentError('Cannot deserialize into {class_name}: $json');\n  }}\n\n"
     ));
 
-    let obj_nullable = if mode == NullSafety::Safe { "Object?" } else { "Object" };
+    let obj_nullable = if mode == NullSafety::Safe {
+        "Object?"
+    } else {
+        "Object"
+    };
     out.push_str(&format!("  {obj_nullable} toJson();\n}}\n\n"));
 
     for (i, variant) in variants.iter().enumerate() {
-        let (variant_dart_type, _, _) = resolve_untagged_variant_info(variant, schemas, registry);
+        let (variant_dart_type, _, _) =
+            resolve_untagged_variant_info(variant, schemas, registry, mappings);
         out.push_str(&format!("class _Variant{i} extends {class_name} {{\n"));
         out.push_str(&format!("  final {variant_dart_type} value;\n"));
         out.push_str(&format!("  const _Variant{i}(this.value) : super._();\n\n"));
@@ -664,10 +949,13 @@ fn emit_untagged_union(
             out.push_str(&format!("  {obj_nullable} toJson() => value.toJson();\n"));
         }
         out.push_str("  @override\n");
-        out.push_str(&format!("  bool operator ==(Object other) => other is _Variant{i} && other.value == value;\n"));
+        out.push_str(&format!(
+            "  bool operator ==(Object other) => other is _Variant{i} && other.value == value;\n"
+        ));
         out.push_str("  @override\n");
-        out.push_str(&format!("  int get hashCode => Object.hash(_Variant{i}, value);\n"));
-        out.push_str("}\n\n");
+        out.push_str(&format!(
+            "  int get hashCode => Object.hash(_Variant{i}, value);\n}}\n\n"
+        ));
     }
 
     let converter_name = format!("_{class_name}Converter");
@@ -687,6 +975,7 @@ fn resolve_untagged_variant_info(
     type_ref: &TypeRef,
     schemas: &[Schema],
     _registry: &EnumRegistry,
+    mappings: &MappingConfig,
 ) -> (String, String, bool) {
     match type_ref {
         TypeRef::Named(name) => {
@@ -697,11 +986,15 @@ fn resolve_untagged_variant_info(
                     && fields.len() == 1
                     && fields[0].name == "value"
                 {
-                    return (to_dart_type(&fields[0].type_ref, None), "value".to_string(), true);
+                    return (
+                        to_dart_type(&fields[0].type_ref, None, mappings),
+                        "value".to_string(),
+                        true,
+                    );
                 }
                 panic!("internal wrapper schema without a single 'value' field");
             }
-            (dart_class_name(name), "value".to_string(), false)
+            (mappings.resolve_class(name), "value".to_string(), false)
         }
         _ => panic!("unexpected TypeRef in untagged union variant"),
     }
@@ -720,7 +1013,10 @@ fn is_variant_primitive(variant_type_ref: &TypeRef, schemas: &[Schema]) -> bool 
 fn emit_synth_enum(synth: &SynthEnum) -> String {
     let mut out = String::new();
     out.push_str("import 'package:freezed_annotation/freezed_annotation.dart';\n\n");
-    out.push_str(&format!("@JsonEnum(unknownValue: {}.unknown)\n", synth.name));
+    out.push_str(&format!(
+        "@JsonEnum(unknownValue: {}.unknown)\n",
+        synth.name
+    ));
     out.push_str(&format!("enum {} {{\n", synth.name));
     for value in &synth.values {
         let (dart_case, json_annotation) = match value {
@@ -743,6 +1039,7 @@ fn emit_client_dio(
     class_name: &str,
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut out = String::new();
     out.push_str("import 'dart:convert';\n");
@@ -753,18 +1050,26 @@ fn emit_client_dio(
     out.push('\n');
 
     emit_server_urls(&mut out, class_name, &api.base_urls);
-    emit_model_imports(&mut out, api, registry);
+    emit_model_imports(&mut out, api, registry, mappings);
 
-    let credentials: Vec<DartCredential> = api.security_schemes.iter().map(DartCredential::from_scheme).collect();
+    let credentials: Vec<DartCredential> = api
+        .security_schemes
+        .iter()
+        .map(DartCredential::from_scheme)
+        .collect();
 
     out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str(&emit_constructor_dio(class_name, &credentials, &api.base_urls));
+    out.push_str(&emit_constructor_dio(
+        class_name,
+        &credentials,
+        &api.base_urls,
+    ));
     out.push('\n');
     out.push_str("  late final Dio _dio;\n");
 
     for op in &api.operations {
         out.push('\n');
-        out.push_str(&emit_method_dio(op, &api.schemas, registry, mode));
+        out.push_str(&emit_method_dio(op, &api.schemas, registry, mode, mappings));
     }
 
     out.push_str("}\n");
@@ -776,7 +1081,10 @@ fn emit_constructor_dio(
     credentials: &[DartCredential],
     base_urls: &[String],
 ) -> String {
-    let default_url = base_urls.first().map(|u| format!("'{u}'")).unwrap_or_else(|| "''".to_string());
+    let default_url = base_urls
+        .first()
+        .map(|u| format!("'{u}'"))
+        .unwrap_or_else(|| "''".to_string());
     let mut out = String::new();
     out.push_str(&format!("  {class_name}({{\n"));
     out.push_str(&format!("    String baseUrl = {default_url},\n"));
@@ -823,7 +1131,11 @@ fn emit_credential_injection_dio(cred: &DartCredential) -> String {
             "          if ({dart} != null) {{\n            \
              options.headers['Authorization'] = 'Bearer ${dart}';\n          }}\n"
         ),
-        SecurityScheme::ApiKey { parameter_name, location, .. } => match location {
+        SecurityScheme::ApiKey {
+            parameter_name,
+            location,
+            ..
+        } => match location {
             ApiKeyLocation::Header => format!(
                 "          if ({dart} != null) {{\n            \
                  options.headers['{parameter_name}'] = {dart};\n          }}\n"
@@ -854,7 +1166,11 @@ struct DartParam<'a> {
     required: bool,
 }
 
-fn build_dart_params<'a>(op: &'a Operation, registry: &EnumRegistry) -> Vec<DartParam<'a>> {
+fn build_dart_params<'a>(
+    op: &'a Operation,
+    registry: &EnumRegistry,
+    mappings: &MappingConfig,
+) -> Vec<DartParam<'a>> {
     let op_id = op.operation_id.as_deref().unwrap_or("");
     let mut out = Vec::with_capacity(op.parameters.len());
     let mut seen: HashMap<&str, ParameterLocation> = HashMap::new();
@@ -872,7 +1188,7 @@ fn build_dart_params<'a>(op: &'a Operation, registry: &EnumRegistry) -> Vec<Dart
             spec_name: &param.name,
             dart_name: escape_dart_keyword(&to_camel_case(&param.name)),
             location: param.location,
-            non_null_type: to_dart_type(&param.type_ref, synth),
+            non_null_type: to_dart_type(&param.type_ref, synth, mappings),
             required: param.required,
         });
     }
@@ -884,6 +1200,7 @@ fn emit_method_dio(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut out = String::new();
     if let Some(summary) = &op.summary {
@@ -892,27 +1209,26 @@ fn emit_method_dio(
     out.push_str(&format!("  // {} {}\n", op.method, op.path));
 
     let method_name = op_method_name(op);
-    let dart_params = build_dart_params(op, registry);
-    let return_type = success_return_type(&op.responses, mode);
+    let dart_params = build_dart_params(op, registry, mappings);
+    let return_type = success_return_type(&op.responses, mode, mappings);
     let has_params = !dart_params.is_empty() || op.request_body.is_some();
 
-    if !has_params {
-        out.push_str(&format!("  Future<{return_type}> {method_name}({{\n"));
-        out.push_str("    CancelToken? cancelToken,\n");
-        out.push_str("  }) async {\n");
-    } else {
-        out.push_str(&format!("  Future<{return_type}> {method_name}({{\n"));
+    out.push_str(&format!("  Future<{return_type}> {method_name}({{\n"));
+    if has_params {
         let mut required: Vec<&DartParam> = dart_params.iter().filter(|p| p.required).collect();
         let mut optional: Vec<&DartParam> = dart_params.iter().filter(|p| !p.required).collect();
         required.sort_by(|a, b| a.dart_name.cmp(&b.dart_name));
         optional.sort_by(|a, b| a.dart_name.cmp(&b.dart_name));
 
         for p in &required {
-            out.push_str(&format!("    required {} {},\n", p.non_null_type, p.dart_name));
+            out.push_str(&format!(
+                "    required {} {},\n",
+                p.non_null_type, p.dart_name
+            ));
         }
         if let Some(body) = &op.request_body {
             let op_id = op.operation_id.as_deref().unwrap_or("");
-            let body_type = to_dart_type(&body.schema_ref, registry.lookup_body(op_id));
+            let body_type = to_dart_type(&body.schema_ref, registry.lookup_body(op_id), mappings);
             if body.required {
                 out.push_str(&format!("    required {body_type} body,\n"));
             } else {
@@ -922,11 +1238,18 @@ fn emit_method_dio(
         for p in &optional {
             out.push_str(&format!("    {}? {},\n", p.non_null_type, p.dart_name));
         }
-        out.push_str("    CancelToken? cancelToken,\n");
-        out.push_str("  }) async {\n");
     }
+    out.push_str("    CancelToken? cancelToken,\n");
+    out.push_str("  }) async {\n");
 
-    out.push_str(&emit_method_body_dio(op, &dart_params, schemas, registry, mode));
+    out.push_str(&emit_method_body_dio(
+        op,
+        &dart_params,
+        schemas,
+        registry,
+        mode,
+        mappings,
+    ));
     out.push_str("  }\n");
     out
 }
@@ -937,6 +1260,7 @@ fn emit_method_body_dio(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut body = String::new();
 
@@ -951,27 +1275,39 @@ fn emit_method_body_dio(
     }
     let dart_path_literal = format!("'{templated_path}'");
 
-    let query_params: Vec<&DartParam> = dart_params.iter().filter(|p| p.location == ParameterLocation::Query).collect();
+    let query_params: Vec<&DartParam> = dart_params
+        .iter()
+        .filter(|p| p.location == ParameterLocation::Query)
+        .collect();
     if !query_params.is_empty() {
         body.push_str("    final queryParameters = <String, dynamic>{\n");
         for p in &query_params {
             if p.required {
                 body.push_str(&format!("      '{}': {},\n", p.spec_name, p.dart_name));
             } else {
-                body.push_str(&format!("      if ({} != null) '{}': {},\n", p.dart_name, p.spec_name, p.dart_name));
+                body.push_str(&format!(
+                    "      if ({} != null) '{}': {},\n",
+                    p.dart_name, p.spec_name, p.dart_name
+                ));
             }
         }
         body.push_str("    };\n");
     }
 
-    let header_params: Vec<&DartParam> = dart_params.iter().filter(|p| p.location == ParameterLocation::Header).collect();
+    let header_params: Vec<&DartParam> = dart_params
+        .iter()
+        .filter(|p| p.location == ParameterLocation::Header)
+        .collect();
     if !header_params.is_empty() {
         body.push_str("    final headers = <String, dynamic>{\n");
         for p in &header_params {
             if p.required {
                 body.push_str(&format!("      '{}': {},\n", p.spec_name, p.dart_name));
             } else {
-                body.push_str(&format!("      if ({} != null) '{}': {},\n", p.dart_name, p.spec_name, p.dart_name));
+                body.push_str(&format!(
+                    "      if ({} != null) '{}': {},\n",
+                    p.dart_name, p.spec_name, p.dart_name
+                ));
             }
         }
         body.push_str("    };\n");
@@ -983,16 +1319,24 @@ fn emit_method_body_dio(
         .map(|r| r.schema_ref.is_some() || !r.headers.is_empty())
         .unwrap_or(false);
 
-    let response_assign = if needs_response_var { "    final response = " } else { "    " };
+    let response_assign = if needs_response_var {
+        "    final response = "
+    } else {
+        "    "
+    };
     body.push_str(response_assign);
     body.push_str("await _dio.request<dynamic>(\n");
     body.push_str(&format!("      {dart_path_literal},\n"));
 
     let method_str = op.method.to_string();
     if header_params.is_empty() {
-        body.push_str(&format!("      options: Options(method: '{method_str}'),\n"));
+        body.push_str(&format!(
+            "      options: Options(method: '{method_str}'),\n"
+        ));
     } else {
-        body.push_str(&format!("      options: Options(method: '{method_str}', headers: headers),\n"));
+        body.push_str(&format!(
+            "      options: Options(method: '{method_str}', headers: headers),\n"
+        ));
     }
     if !query_params.is_empty() {
         body.push_str("      queryParameters: queryParameters,\n");
@@ -1004,7 +1348,9 @@ fn emit_method_body_dio(
     body.push_str("    );\n");
 
     if let Some(resp) = success_response(&op.responses) {
-        body.push_str(&emit_success_return_dio(resp, schemas, registry, mode));
+        body.push_str(&emit_success_return_dio(
+            resp, schemas, registry, mode, mappings,
+        ));
     }
 
     body
@@ -1033,10 +1379,14 @@ fn emit_success_return_dio(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     if mode == NullSafety::Unsafe {
         if let Some(schema) = &resp.schema_ref {
-            return format!("    return {};\n", deserialize_expr(schema, schemas, registry, "response.data"));
+            return format!(
+                "    return {};\n",
+                deserialize_expr(schema, schemas, registry, "response.data", mappings)
+            );
         }
         return String::new();
     }
@@ -1044,7 +1394,10 @@ fn emit_success_return_dio(
     let has_headers = !resp.headers.is_empty();
     if !has_headers {
         if let Some(schema) = &resp.schema_ref {
-            return format!("    return {};\n", deserialize_expr(schema, schemas, registry, "response.data"));
+            return format!(
+                "    return {};\n",
+                deserialize_expr(schema, schemas, registry, "response.data", mappings)
+            );
         }
         return String::new();
     }
@@ -1054,16 +1407,25 @@ fn emit_success_return_dio(
         let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
         let raw_expr = format!("response.headers.value('{}')", hdr.name.to_lowercase());
         if hdr.required {
-            out.push_str(&format!("    final {dart_name} = {};\n", header_deserialize_expr(&hdr.type_ref, &raw_expr)));
+            out.push_str(&format!(
+                "    final {dart_name} = {};\n",
+                header_deserialize_expr(&hdr.type_ref, &raw_expr)
+            ));
         } else {
             out.push_str(&format!("    final {dart_name}Raw = {raw_expr};\n"));
-            out.push_str(&format!("    final {dart_name} = {};\n", header_deserialize_expr_nullable(&hdr.type_ref, &format!("{dart_name}Raw"))));
+            out.push_str(&format!(
+                "    final {dart_name} = {};\n",
+                header_deserialize_expr_nullable(&hdr.type_ref, &format!("{dart_name}Raw"))
+            ));
         }
     }
 
     let mut record_fields: Vec<String> = Vec::new();
     if let Some(s) = &resp.schema_ref {
-        record_fields.push(format!("body: {}", deserialize_expr(s, schemas, registry, "response.data")));
+        record_fields.push(format!(
+            "body: {}",
+            deserialize_expr(s, schemas, registry, "response.data", mappings)
+        ));
     }
     for hdr in &resp.headers {
         let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
@@ -1080,6 +1442,7 @@ fn emit_client_http(
     class_name: &str,
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut out = String::new();
     out.push_str("import 'dart:convert';\n");
@@ -1090,19 +1453,28 @@ fn emit_client_http(
     out.push('\n');
 
     emit_server_urls(&mut out, class_name, &api.base_urls);
-    emit_model_imports(&mut out, api, registry);
+    emit_model_imports(&mut out, api, registry, mappings);
 
-    let credentials: Vec<DartCredential> = api.security_schemes.iter().map(DartCredential::from_scheme).collect();
+    let credentials: Vec<DartCredential> = api
+        .security_schemes
+        .iter()
+        .map(DartCredential::from_scheme)
+        .collect();
 
     out.push_str(&format!("class {class_name} {{\n"));
-    out.push_str(&emit_constructor_http(class_name, &credentials, &api.base_urls));
+    out.push_str(&emit_constructor_http(
+        class_name,
+        &credentials,
+        &api.base_urls,
+    ));
     out.push('\n');
     out.push_str("  final String _baseUrl;\n");
     out.push_str("  final http.Client _client;\n");
 
-    // Auth headers as a getter
     if credentials.is_empty() {
-        out.push_str("  Map<String, String> get _headers => {'Content-Type': 'application/json'};\n");
+        out.push_str(
+            "  Map<String, String> get _headers => {'Content-Type': 'application/json'};\n",
+        );
     } else {
         out.push_str("  Map<String, String> get _headers => {\n");
         out.push_str("    'Content-Type': 'application/json',\n");
@@ -1110,8 +1482,6 @@ fn emit_client_http(
             out.push_str(&emit_credential_header_http(cred));
         }
         out.push_str("  };\n");
-
-        // Store credential fields
         out.push('\n');
         for cred in &credentials {
             out.push_str(&format!("  final String? _{};\n", cred.dart_param_name));
@@ -1120,7 +1490,13 @@ fn emit_client_http(
 
     for op in &api.operations {
         out.push('\n');
-        out.push_str(&emit_method_http(op, &api.schemas, registry, mode));
+        out.push_str(&emit_method_http(
+            op,
+            &api.schemas,
+            registry,
+            mode,
+            mappings,
+        ));
     }
 
     out.push_str("}\n");
@@ -1132,7 +1508,10 @@ fn emit_constructor_http(
     credentials: &[DartCredential],
     base_urls: &[String],
 ) -> String {
-    let default_url = base_urls.first().map(|u| format!("'{u}'")).unwrap_or_else(|| "''".to_string());
+    let default_url = base_urls
+        .first()
+        .map(|u| format!("'{u}'"))
+        .unwrap_or_else(|| "''".to_string());
     let mut out = String::new();
     out.push_str(&format!("  {class_name}({{\n"));
     out.push_str(&format!("    String baseUrl = {default_url},\n"));
@@ -1143,7 +1522,10 @@ fn emit_constructor_http(
     out.push_str("  }) : _baseUrl = baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl,\n");
     out.push_str("       _client = client ?? http.Client()");
     for cred in credentials {
-        out.push_str(&format!(",\n       _{} = {}", cred.dart_param_name, cred.dart_param_name));
+        out.push_str(&format!(
+            ",\n       _{} = {}",
+            cred.dart_param_name, cred.dart_param_name
+        ));
     }
     out.push_str(";\n");
     out
@@ -1156,9 +1538,15 @@ fn emit_credential_header_http(cred: &DartCredential) -> String {
             format!("    if (_{dart} != null) 'Authorization': 'Bearer ${{_{dart}!}}',\n")
         }
         SecurityScheme::HttpBasic { .. } => {
-            format!("    if (_{dart} != null) 'Authorization': 'Basic ${{base64Encode(utf8.encode(_{dart}!))}}',\n")
+            format!(
+                "    if (_{dart} != null) 'Authorization': 'Basic ${{base64Encode(utf8.encode(_{dart}!))}}',\n"
+            )
         }
-        SecurityScheme::ApiKey { parameter_name, location, .. } => match location {
+        SecurityScheme::ApiKey {
+            parameter_name,
+            location,
+            ..
+        } => match location {
             ApiKeyLocation::Header => {
                 format!("    if (_{dart} != null) '{parameter_name}': _{dart}!,\n")
             }
@@ -1176,6 +1564,7 @@ fn emit_method_http(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut out = String::new();
     if let Some(summary) = &op.summary {
@@ -1184,12 +1573,14 @@ fn emit_method_http(
     out.push_str(&format!("  // {} {}\n", op.method, op.path));
 
     let method_name = op_method_name(op);
-    let dart_params = build_dart_params(op, registry);
-    let return_type = success_return_type(&op.responses, mode);
+    let dart_params = build_dart_params(op, registry, mappings);
+    let return_type = success_return_type(&op.responses, mode, mappings);
     let has_params = !dart_params.is_empty() || op.request_body.is_some();
 
     if !has_params {
-        out.push_str(&format!("  Future<{return_type}> {method_name}() async {{\n"));
+        out.push_str(&format!(
+            "  Future<{return_type}> {method_name}() async {{\n"
+        ));
     } else {
         out.push_str(&format!("  Future<{return_type}> {method_name}({{\n"));
         let mut required: Vec<&DartParam> = dart_params.iter().filter(|p| p.required).collect();
@@ -1198,11 +1589,14 @@ fn emit_method_http(
         optional.sort_by(|a, b| a.dart_name.cmp(&b.dart_name));
 
         for p in &required {
-            out.push_str(&format!("    required {} {},\n", p.non_null_type, p.dart_name));
+            out.push_str(&format!(
+                "    required {} {},\n",
+                p.non_null_type, p.dart_name
+            ));
         }
         if let Some(body) = &op.request_body {
             let op_id = op.operation_id.as_deref().unwrap_or("");
-            let body_type = to_dart_type(&body.schema_ref, registry.lookup_body(op_id));
+            let body_type = to_dart_type(&body.schema_ref, registry.lookup_body(op_id), mappings);
             if body.required {
                 out.push_str(&format!("    required {body_type} body,\n"));
             } else {
@@ -1215,7 +1609,14 @@ fn emit_method_http(
         out.push_str("  }) async {\n");
     }
 
-    out.push_str(&emit_method_body_http(op, &dart_params, schemas, registry, mode));
+    out.push_str(&emit_method_body_http(
+        op,
+        &dart_params,
+        schemas,
+        registry,
+        mode,
+        mappings,
+    ));
     out.push_str("  }\n");
     out
 }
@@ -1226,10 +1627,10 @@ fn emit_method_body_http(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
     let mut body = String::new();
 
-    // ── Build URI ─────────────────────────────────────────────────────────────
     let mut templated_path = op.path.clone();
     for p in dart_params {
         if p.location == ParameterLocation::Path {
@@ -1240,37 +1641,51 @@ fn emit_method_body_http(
         }
     }
 
-    let query_params: Vec<&DartParam> = dart_params.iter().filter(|p| p.location == ParameterLocation::Query).collect();
+    let query_params: Vec<&DartParam> = dart_params
+        .iter()
+        .filter(|p| p.location == ParameterLocation::Query)
+        .collect();
 
-    // Also handle query-location api keys
-    let has_credential_query = false; // future: scan credentials for Query api keys
-
-    if query_params.is_empty() && !has_credential_query {
-        body.push_str(&format!("    final uri = Uri.parse('$_baseUrl{templated_path}');\n"));
+    if query_params.is_empty() {
+        body.push_str(&format!(
+            "    final uri = Uri.parse('$_baseUrl{templated_path}');\n"
+        ));
     } else {
-        body.push_str(&format!("    final _queryParams = <String, dynamic>{{\n"));
+        body.push_str("    final _queryParams = <String, dynamic>{\n");
         for p in &query_params {
             if p.required {
                 body.push_str(&format!("      '{}': ${{{}}},\n", p.spec_name, p.dart_name));
             } else {
-                body.push_str(&format!("      if ({} != null) '{}': ${{{}}},\n", p.dart_name, p.spec_name, p.dart_name));
+                body.push_str(&format!(
+                    "      if ({} != null) '{}': ${{{}}},\n",
+                    p.dart_name, p.spec_name, p.dart_name
+                ));
             }
         }
         body.push_str("    };\n");
         body.push_str(&format!(
-            "    final uri = Uri.parse('$_baseUrl{templated_path}').replace(\n      queryParameters: _queryParams.map((k, v) => MapEntry(k, v.toString())),\n    );\n"
+            "    final uri = Uri.parse('$_baseUrl{templated_path}').replace(\n\
+                   queryParameters: _queryParams.map((k, v) => MapEntry(k, v.toString())),\n    );\n"
         ));
     }
 
-    // ── Extra headers (per-request header params) ─────────────────────────────
-    let header_params: Vec<&DartParam> = dart_params.iter().filter(|p| p.location == ParameterLocation::Header).collect();
+    let header_params: Vec<&DartParam> = dart_params
+        .iter()
+        .filter(|p| p.location == ParameterLocation::Header)
+        .collect();
     if !header_params.is_empty() {
         body.push_str("    final _extraHeaders = <String, String>{\n");
         for p in &header_params {
             if p.required {
-                body.push_str(&format!("      '{}': ${{{}}}.toString(),\n", p.spec_name, p.dart_name));
+                body.push_str(&format!(
+                    "      '{}': ${{{}}}.toString(),\n",
+                    p.spec_name, p.dart_name
+                ));
             } else {
-                body.push_str(&format!("      if ({} != null) '{}': ${{{}}}.toString(),\n", p.dart_name, p.spec_name, p.dart_name));
+                body.push_str(&format!(
+                    "      if ({} != null) '{}': ${{{}}}.toString(),\n",
+                    p.dart_name, p.spec_name, p.dart_name
+                ));
             }
         }
         body.push_str("    };\n");
@@ -1279,7 +1694,6 @@ fn emit_method_body_http(
         body.push_str("    final _allHeaders = _headers;\n");
     }
 
-    // ── Request body ──────────────────────────────────────────────────────────
     let method_lower = op.method.to_string().to_lowercase();
 
     if let Some(req_body) = &op.request_body {
@@ -1292,7 +1706,9 @@ fn emit_method_body_http(
             body.push_str("    _request.headers.addAll(_allHeaders);\n");
             match &req_body.schema_ref {
                 TypeRef::Named(_) => {
-                    body.push_str("    body.toJson().forEach((k, v) => _request.fields[k] = v.toString());\n");
+                    body.push_str(
+                        "    body.toJson().forEach((k, v) => _request.fields[k] = v.toString());\n",
+                    );
                 }
                 _ => {
                     body.push_str("    _request.fields['data'] = body.toString();\n");
@@ -1311,31 +1727,21 @@ fn emit_method_body_http(
             ));
         }
     } else {
-        // Methods that don't send a body
-        match op.method {
-            HttpMethod::Get | HttpMethod::Head | HttpMethod::Delete | HttpMethod::Options => {
-                body.push_str(&format!(
-                    "    final _response = await _client.{method_lower}(uri, headers: _allHeaders);\n"
-                ));
-            }
-            _ => {
-                body.push_str(&format!(
-                    "    final _response = await _client.{method_lower}(uri, headers: _allHeaders);\n"
-                ));
-            }
-        }
+        body.push_str(&format!(
+            "    final _response = await _client.{method_lower}(uri, headers: _allHeaders);\n"
+        ));
     }
 
-    // ── Status check ──────────────────────────────────────────────────────────
     body.push_str(&format!(
         "    if (_response.statusCode < 200 || _response.statusCode >= 300) {{\n      \
          throw Exception('{} {} returned ${{_response.statusCode}}: ${{_response.body}}');\n    }}\n",
         op.method, op.path
     ));
 
-    // ── Deserialize response ──────────────────────────────────────────────────
     if let Some(resp) = success_response(&op.responses) {
-        body.push_str(&emit_success_return_http(resp, schemas, registry, mode));
+        body.push_str(&emit_success_return_http(
+            resp, schemas, registry, mode, mappings,
+        ));
     }
 
     body
@@ -1346,51 +1752,72 @@ fn emit_success_return_http(
     schemas: &[Schema],
     registry: &EnumRegistry,
     mode: NullSafety,
+    mappings: &MappingConfig,
 ) -> String {
-    // http package: response body is a String, headers are Map<String, String>
     let has_headers = !resp.headers.is_empty();
 
     if !has_headers {
         if let Some(schema) = &resp.schema_ref {
-            let expr = deserialize_expr(schema, schemas, registry, "jsonDecode(_response.body)");
-            return format!("    return {expr};\n");
+            return format!(
+                "    return {};\n",
+                deserialize_expr(
+                    schema,
+                    schemas,
+                    registry,
+                    "jsonDecode(_response.body)",
+                    mappings
+                )
+            );
         }
         return String::new();
     }
 
-    // Emit header extractions (Map-based, no .value() method)
+    if mode == NullSafety::Unsafe {
+        if let Some(schema) = &resp.schema_ref {
+            return format!(
+                "    return {};\n",
+                deserialize_expr(
+                    schema,
+                    schemas,
+                    registry,
+                    "jsonDecode(_response.body)",
+                    mappings
+                )
+            );
+        }
+        return String::new();
+    }
+
     let mut out = String::new();
     for hdr in &resp.headers {
         let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
         let map_key = hdr.name.to_lowercase();
         let raw_expr = format!("_response.headers['{map_key}']");
         if hdr.required {
-            let typed = header_deserialize_expr(&hdr.type_ref, &raw_expr);
-            out.push_str(&format!("    final {dart_name} = {typed};\n"));
+            out.push_str(&format!(
+                "    final {dart_name} = {};\n",
+                header_deserialize_expr(&hdr.type_ref, &raw_expr)
+            ));
         } else {
             out.push_str(&format!("    final {dart_name}Raw = {raw_expr};\n"));
-            let typed = header_deserialize_expr_nullable(&hdr.type_ref, &format!("{dart_name}Raw"));
-            out.push_str(&format!("    final {dart_name} = {typed};\n"));
+            out.push_str(&format!(
+                "    final {dart_name} = {};\n",
+                header_deserialize_expr_nullable(&hdr.type_ref, &format!("{dart_name}Raw"))
+            ));
         }
     }
 
     let mut record_fields: Vec<String> = Vec::new();
     if let Some(s) = &resp.schema_ref {
-        record_fields.push(format!("body: {}", deserialize_expr(s, schemas, registry, "jsonDecode(_response.body)")));
+        record_fields.push(format!(
+            "body: {}",
+            deserialize_expr(s, schemas, registry, "jsonDecode(_response.body)", mappings)
+        ));
     }
     for hdr in &resp.headers {
         let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
         record_fields.push(format!("{dart_name}: {dart_name}"));
     }
-
-    if mode == NullSafety::Unsafe {
-        // Records don't exist in unsafe mode — return body only
-        if let Some(s) = &resp.schema_ref {
-            return format!("    return {};\n", deserialize_expr(s, schemas, registry, "jsonDecode(_response.body)"));
-        }
-        return String::new();
-    }
-
     out.push_str(&format!("    return ({});\n", record_fields.join(", ")));
     out
 }
@@ -1407,20 +1834,38 @@ fn emit_server_urls(out: &mut String, class_name: &str, base_urls: &[String]) {
     }
 }
 
-fn emit_model_imports(out: &mut String, api: &Api, registry: &EnumRegistry) {
+fn emit_model_imports(
+    out: &mut String,
+    api: &Api,
+    registry: &EnumRegistry,
+    mappings: &MappingConfig,
+) {
     let mut imports: Vec<String> = Vec::new();
+
     for schema in &api.schemas {
-        if !schema.internal {
-            let cls = dart_class_name(&schema.name);
+        if schema.internal {
+            continue;
+        }
+        let cls = mappings.resolve_class(&schema.name);
+        // If the schema is mapped to an external type, use its registered import.
+        // If there is no registered import, fall back to the generated sibling file.
+        if let Some(import_line) = mappings.import_for(&cls) {
+            imports.push(import_line);
+        } else if !mappings.type_map.contains_key(&schema.name) {
+            // Only emit a sibling-file import when we actually generated a file for it.
             imports.push(format!("import '{}.dart';", to_snake_case(&cls)));
         }
     }
+
     for synth in registry.enums.values() {
         imports.push(format!("import '{}.dart';", to_snake_case(&synth.name)));
     }
     imports.sort();
     imports.dedup();
-    for line in &imports { out.push_str(line); out.push('\n'); }
+    for line in &imports {
+        out.push_str(line);
+        out.push('\n');
+    }
     out.push('\n');
 }
 
@@ -1442,18 +1887,24 @@ impl<'a> DartCredential<'a> {
 
 // ── Response helpers (shared) ─────────────────────────────────────────────────
 
-fn success_return_type(responses: &[Response], mode: NullSafety) -> String {
-    let Some(resp) = success_response(responses) else { return "void".into() };
+fn success_return_type(
+    responses: &[Response],
+    mode: NullSafety,
+    mappings: &MappingConfig,
+) -> String {
+    let Some(resp) = success_response(responses) else {
+        return "void".into();
+    };
 
     if mode == NullSafety::Unsafe || resp.headers.is_empty() {
         return match &resp.schema_ref {
-            Some(t) => to_dart_type(t, None),
+            Some(t) => to_dart_type(t, None, mappings),
             None => "void".into(),
         };
     }
 
     let body_type = match &resp.schema_ref {
-        Some(t) => to_dart_type(t, None),
+        Some(t) => to_dart_type(t, None, mappings),
         None => "void".into(),
     };
 
@@ -1462,7 +1913,7 @@ fn success_return_type(responses: &[Response], mode: NullSafety) -> String {
         fields.push(format!("{body_type} body"));
     }
     for hdr in &resp.headers {
-        let dart_type = to_dart_type(&hdr.type_ref, None);
+        let dart_type = to_dart_type(&hdr.type_ref, None, mappings);
         let dart_name = to_camel_case(&hdr.name.replace('-', "_"));
         if hdr.required {
             fields.push(format!("{dart_type} {dart_name}"));
@@ -1474,7 +1925,9 @@ fn success_return_type(responses: &[Response], mode: NullSafety) -> String {
 }
 
 fn success_response(responses: &[Response]) -> Option<&Response> {
-    responses.iter().find(|r| matches!(r.status_code.parse::<u16>(), Ok(c) if (200..300).contains(&c)))
+    responses
+        .iter()
+        .find(|r| matches!(r.status_code.parse::<u16>(), Ok(c) if (200..300).contains(&c)))
 }
 
 fn header_deserialize_expr(type_ref: &TypeRef, raw: &str) -> String {
@@ -1499,13 +1952,21 @@ fn header_deserialize_expr_nullable(type_ref: &TypeRef, raw_var: &str) -> String
         TypeRef::Boolean => format!("{raw_var} != null ? ({raw_var} == 'true') : null"),
         TypeRef::Array(inner) => {
             let item_expr = header_deserialize_expr(inner, "e");
-            format!("{raw_var} != null ? {raw_var}!.split(',').map((e) => {item_expr}).toList() : null")
+            format!(
+                "{raw_var} != null ? {raw_var}!.split(',').map((e) => {item_expr}).toList() : null"
+            )
         }
         _ => raw_var.to_string(),
     }
 }
 
-fn deserialize_expr(type_ref: &TypeRef, schemas: &[Schema], registry: &EnumRegistry, data_var: &str) -> String {
+fn deserialize_expr(
+    type_ref: &TypeRef,
+    schemas: &[Schema],
+    registry: &EnumRegistry,
+    data_var: &str,
+    mappings: &MappingConfig,
+) -> String {
     match type_ref {
         TypeRef::String => format!("{data_var} as String"),
         TypeRef::Integer { .. } => format!("({data_var} as num).toInt()"),
@@ -1516,57 +1977,82 @@ fn deserialize_expr(type_ref: &TypeRef, schemas: &[Schema], registry: &EnumRegis
         TypeRef::Boolean => format!("{data_var} as bool"),
         TypeRef::DateTime => format!("DateTime.parse({data_var} as String)"),
         TypeRef::Map(inner) => {
-            let value_ty = to_dart_type(inner, None);
-            let inner_expr = deserialize_expr(inner, schemas, registry, "v");
-            format!("({data_var} as Map<String, dynamic>).map(\n      (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()")
+            let value_ty = to_dart_type(inner, None, mappings);
+            let inner_expr = deserialize_expr(inner, schemas, registry, "v", mappings);
+            format!(
+                "({data_var} as Map<String, dynamic>).map(\n      \
+                 (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()"
+            )
         }
         TypeRef::Array(inner) => {
-            let inner_expr = deserialize_expr(inner, schemas, registry, "e");
-            format!("({data_var} as List<dynamic>)\n        .map((e) => {inner_expr})\n        .toList()")
+            let inner_expr = deserialize_expr(inner, schemas, registry, "e", mappings);
+            format!(
+                "({data_var} as List<dynamic>)\n        .map((e) => {inner_expr})\n        .toList()"
+            )
         }
         TypeRef::Enum(_) => format!("{data_var} as String"),
-        TypeRef::Named(name) => match named_schema_kind(name, schemas) {
-            Some(SchemaKind::Object { .. }) | Some(SchemaKind::Union { .. }) => {
-                format!("{}.fromJson({data_var} as Map<String, dynamic>)", dart_class_name(name))
+        TypeRef::Named(name) => {
+            let cls = mappings.resolve_class(name);
+            match named_schema_kind(name, schemas) {
+                Some(SchemaKind::Object { .. }) | Some(SchemaKind::Union { .. }) => {
+                    format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
+                }
+                Some(SchemaKind::Array { item }) => {
+                    let item_expr = deserialize_expr(item, schemas, registry, "e", mappings);
+                    format!(
+                        "({data_var} as List<dynamic>)\n        .map((e) => {item_expr})\n        .toList()"
+                    )
+                }
+                Some(SchemaKind::Map { value }) => {
+                    let value_ty = to_dart_type(value, None, mappings);
+                    let inner_expr = deserialize_expr(value, schemas, registry, "v", mappings);
+                    format!(
+                        "({data_var} as Map<String, dynamic>).map(\n      \
+                         (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()"
+                    )
+                }
+                Some(SchemaKind::UntaggedUnion { .. }) => {
+                    format!("{cls}.fromJson({data_var})")
+                }
+                Some(SchemaKind::Alias { target }) => {
+                    let target_cls = mappings.resolve_class(target);
+                    format!("{target_cls}.fromJson({data_var} as Map<String, dynamic>)")
+                }
+                // None means the schema was mapped away — the external type is
+                // assumed to implement fromJson with the standard Freezed signature.
+                None => {
+                    format!("{cls}.fromJson({data_var} as Map<String, dynamic>)")
+                }
             }
-            Some(SchemaKind::Array { item }) => {
-                let item_expr = deserialize_expr(item, schemas, registry, "e");
-                format!("({data_var} as List<dynamic>)\n        .map((e) => {item_expr})\n        .toList()")
-            }
-            Some(SchemaKind::Map { value }) => {
-                let value_ty = to_dart_type(value, None);
-                let inner_expr = deserialize_expr(value, schemas, registry, "v");
-                format!("({data_var} as Map<String, dynamic>).map(\n      (k, v) => MapEntry(k, {inner_expr}),\n    ).cast<String, {value_ty}>()")
-            }
-            Some(SchemaKind::UntaggedUnion { .. }) => {
-                format!("{}.fromJson({data_var})", dart_class_name(name))
-            }
-            Some(SchemaKind::Alias { target }) => {
-                format!("{}.fromJson({data_var} as Map<String, dynamic>)", dart_class_name(target))
-            }
-            None => {
-                format!("{}.fromJson({data_var} as Map<String, dynamic>)", dart_class_name(name))
-            }
-        },
+        }
     }
 }
 
 // ── Naming / type utilities ───────────────────────────────────────────────────
 
 fn op_method_name(op: &Operation) -> String {
-    if let Some(id) = &op.operation_id { return id.clone(); }
-    let path_slug: String = op.path
+    if let Some(id) = &op.operation_id {
+        return id.clone();
+    }
+    let path_slug: String = op
+        .path
         .split('/')
         .filter(|s| !s.is_empty() && !s.starts_with('{'))
         .flat_map(|s| {
             let mut chars = s.chars();
-            chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
         })
         .collect();
     format!("{}{path_slug}", op.method.to_string().to_lowercase())
 }
 
-fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
+fn to_dart_type(
+    type_ref: &TypeRef,
+    enum_synth_name: Option<&str>,
+    mappings: &MappingConfig,
+) -> String {
     match type_ref {
         TypeRef::String => "String".into(),
         TypeRef::Integer { .. } => "int".into(),
@@ -1576,15 +2062,20 @@ fn to_dart_type(type_ref: &TypeRef, enum_synth_name: Option<&str>) -> String {
         },
         TypeRef::Boolean => "bool".into(),
         TypeRef::DateTime => "DateTime".into(),
-        TypeRef::Enum(_) => enum_synth_name.map(str::to_string).unwrap_or_else(|| "String".into()),
-        TypeRef::Map(inner) => format!("Map<String, {}>", to_dart_type(inner, None)),
-        TypeRef::Array(inner) => format!("List<{}>", to_dart_type(inner, None)),
-        TypeRef::Named(name) => dart_class_name(name),
+        TypeRef::Enum(_) => enum_synth_name
+            .map(str::to_string)
+            .unwrap_or_else(|| "String".into()),
+        TypeRef::Map(inner) => format!("Map<String, {}>", to_dart_type(inner, None, mappings)),
+        TypeRef::Array(inner) => format!("List<{}>", to_dart_type(inner, None, mappings)),
+        // Use the mapping if one exists; otherwise fall back to dart_class_name.
+        TypeRef::Named(name) => mappings.resolve_class(name),
     }
 }
 
 fn is_untagged_union(schemas: &[Schema], name: &str) -> bool {
-    schemas.iter().any(|s| s.name == name && matches!(s.kind, SchemaKind::UntaggedUnion { .. }))
+    schemas
+        .iter()
+        .any(|s| s.name == name && matches!(s.kind, SchemaKind::UntaggedUnion { .. }))
 }
 
 fn named_schema_kind<'a>(name: &str, schemas: &'a [Schema]) -> Option<&'a SchemaKind> {
@@ -1594,14 +2085,18 @@ fn named_schema_kind<'a>(name: &str, schemas: &'a [Schema]) -> Option<&'a Schema
 fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 { out.push('_'); }
+        if ch.is_uppercase() && i > 0 {
+            out.push('_');
+        }
         out.extend(ch.to_lowercase());
     }
     out
 }
 
 fn to_camel_case(s: &str) -> String {
-    if !s.contains('_') && !s.contains('-') { return s.to_string(); }
+    if !s.contains('_') && !s.contains('-') {
+        return s.to_string();
+    }
     let parts: Vec<&str> = s.split(['_', '-']).filter(|p| !p.is_empty()).collect();
     let mut out = String::with_capacity(s.len());
     for (i, part) in parts.iter().enumerate() {
@@ -1609,7 +2104,9 @@ fn to_camel_case(s: &str) -> String {
             out.push_str(&part.to_lowercase());
         } else {
             let mut chars = part.chars();
-            if let Some(c) = chars.next() { out.extend(c.to_uppercase()); }
+            if let Some(c) = chars.next() {
+                out.extend(c.to_uppercase());
+            }
             out.push_str(&chars.as_str().to_lowercase());
         }
     }
@@ -1626,20 +2123,29 @@ fn to_pascal_case(s: &str) -> String {
 }
 
 fn to_dart_enum_case(value: &str) -> String {
-    let cleaned: String = value.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    let cleaned: String = value
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
     let parts: Vec<&str> = cleaned.split('_').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() { return "value".into(); }
+    if parts.is_empty() {
+        return "value".into();
+    }
     let mut out = String::new();
     for (i, part) in parts.iter().enumerate() {
         if i == 0 {
             out.push_str(&part.to_lowercase());
         } else {
             let mut chars = part.chars();
-            if let Some(c) = chars.next() { out.extend(c.to_uppercase()); }
+            if let Some(c) = chars.next() {
+                out.extend(c.to_uppercase());
+            }
             out.push_str(&chars.as_str().to_lowercase());
         }
     }
-    if out.starts_with(|c: char| c.is_ascii_digit()) { out = format!("v{out}"); }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out = format!("v{out}");
+    }
     out
 }
 
@@ -1652,7 +2158,11 @@ fn dart_default_expr(default: &flap_ir::DefaultValue) -> String {
         }
         DefaultValue::Integer(n) => n.to_string(),
         DefaultValue::Number(n) => {
-            if n.fract() == 0.0 { format!("{n:.1}") } else { n.to_string() }
+            if n.fract() == 0.0 {
+                format!("{n:.1}")
+            } else {
+                n.to_string()
+            }
         }
         DefaultValue::Boolean(b) => b.to_string(),
     }

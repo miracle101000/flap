@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
+use flap_emit_dart::MappingConfig;
 use flap_emit_dart::{ClientBackend, NullSafety};
 
 const FLAP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,12 +38,14 @@ const LOCK_FILE: &str = ".flap.lock";
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    let (out_dir, specs, force, backend) = match parse_args(&args) {
+    let (out_dir, specs, force, backend, mappings) = match parse_args(&args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
             eprintln!(
-                "usage: gen_dart --out <out-dir> [--force] [--client=dio|http] <spec> [<spec> ...]"
+                "usage: gen_dart --out <out-dir> [--force] [--client=dio|http] \
+                 [--type-map=Schema=DartType] [--import-map=DartType=package:...] \
+                 <spec> [<spec> ...]"
             );
             return ExitCode::from(2);
         }
@@ -50,9 +53,6 @@ fn main() -> ExitCode {
 
     if specs.is_empty() {
         eprintln!("error: at least one spec path or URL is required");
-        eprintln!(
-            "usage: gen_dart --out <out-dir> [--force] [--client=dio|http] <spec> [<spec> ...]"
-        );
         return ExitCode::from(2);
     }
 
@@ -60,14 +60,22 @@ fn main() -> ExitCode {
         ClientBackend::Dio => "dio",
         ClientBackend::Http => "http",
     };
-    println!("client backend: {backend_label}");
+    println!("client backend : {backend_label}");
+    if !mappings.is_empty() {
+        for (k, v) in &mappings.type_map {
+            println!("  type-map     : {k} → {v}");
+        }
+        for (k, v) in &mappings.import_map {
+            println!("  import-map   : {k} → {v}");
+        }
+    }
 
     let mut any_failed = false;
 
     for spec in &specs {
         println!("\n── {spec} ──");
 
-        let fingerprint = local_fingerprint(spec, backend);
+        let fingerprint = local_fingerprint(spec, backend, &mappings);
 
         let api = match flap_spec::load_path_or_url(spec) {
             Ok(api) => api,
@@ -92,10 +100,6 @@ fn main() -> ExitCode {
                 continue;
             }
 
-            // ── Incremental check ─────────────────────────────────────────
-            // Lock file name encodes both the null-safety mode and the backend
-            // so switching --client=http forces regeneration even if the spec
-            // hasn't changed.
             let lock_path = spec_out.join(format!("{LOCK_FILE}.{suffix}.{backend_label}"));
             if !force {
                 if let Some(ref fp) = fingerprint {
@@ -107,7 +111,7 @@ fn main() -> ExitCode {
             }
 
             // ── Models ────────────────────────────────────────────────────
-            let models = flap_emit_dart::emit_models(&api, mode);
+            let models = flap_emit_dart::emit_models(&api, mode, &mappings);
             let mut filenames: Vec<&String> = models.keys().collect();
             filenames.sort();
             let mut write_ok = true;
@@ -123,7 +127,8 @@ fn main() -> ExitCode {
             }
 
             // ── Client ────────────────────────────────────────────────────
-            let (client_filename, client_src) = flap_emit_dart::emit_client(&api, mode, backend);
+            let (client_filename, client_src) =
+                flap_emit_dart::emit_client(&api, mode, backend, &mappings);
             let client_path = spec_out.join(&client_filename);
             if let Err(e) = fs::write(&client_path, &client_src) {
                 eprintln!("  error writing {}: {e}", client_path.display());
@@ -139,7 +144,6 @@ fn main() -> ExitCode {
                 spec_out.display()
             );
 
-            // ── Update lockfile only if all writes succeeded ───────────────
             if write_ok {
                 if let Some(ref fp) = fingerprint {
                     write_lock(&lock_path, fp);
@@ -158,11 +162,14 @@ fn main() -> ExitCode {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Parse `--out <dir> [--force] [--client=dio|http] <spec> [<spec> ...]`.
-fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>, bool, ClientBackend), String> {
+fn parse_args(
+    args: &[String],
+) -> Result<(PathBuf, Vec<String>, bool, ClientBackend, MappingConfig), String> {
     let mut out_dir: Option<PathBuf> = None;
     let mut specs: Vec<String> = Vec::new();
     let mut force = false;
     let mut backend = ClientBackend::Dio;
+    let mut mappings = MappingConfig::default();
     let mut i = 0;
 
     while i < args.len() {
@@ -192,6 +199,20 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>, bool, ClientBack
                     "unknown client backend `{val}` — expected `dio` or `http`"
                 ));
             }
+            arg if arg.starts_with("--type-map=") => {
+                let pair = &arg["--type-map=".len()..];
+                let (k, v) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("--type-map requires KEY=VALUE, got `{pair}`"))?;
+                mappings.type_map.insert(k.to_string(), v.to_string());
+            }
+            arg if arg.starts_with("--import-map=") => {
+                let pair = &arg["--import-map=".len()..];
+                let (k, v) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("--import-map requires KEY=VALUE, got `{pair}`"))?;
+                mappings.import_map.insert(k.to_string(), v.to_string());
+            }
             other => {
                 specs.push(other.to_string());
             }
@@ -200,7 +221,7 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>, bool, ClientBack
     }
 
     let out_dir = out_dir.ok_or_else(|| "--out <dir> is required".to_string())?;
-    Ok((out_dir, specs, force, backend))
+    Ok((out_dir, specs, force, backend, mappings))
 }
 
 /// Fingerprint a local spec file using mtime + size + flap version + backend.
@@ -210,7 +231,11 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>, bool, ClientBack
 /// unchanged — correct because the client file content differs between backends.
 ///
 /// Returns `None` for remote URLs — those always regenerate.
-fn local_fingerprint(spec: &str, backend: ClientBackend) -> Option<String> {
+fn local_fingerprint(
+    spec: &str,
+    backend: ClientBackend,
+    mappings: &MappingConfig,
+) -> Option<String> {
     if spec.starts_with("http://") || spec.starts_with("https://") {
         return None;
     }
@@ -226,8 +251,23 @@ fn local_fingerprint(spec: &str, backend: ClientBackend) -> Option<String> {
         ClientBackend::Dio => "dio",
         ClientBackend::Http => "http",
     };
+    // Include sorted mappings so that changing a --type-map or --import-map
+    // invalidates the lockfile even when the spec file itself hasn't changed.
+    let mut type_pairs: Vec<String> = mappings
+        .type_map
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    type_pairs.sort();
+    let mut import_pairs: Vec<String> = mappings
+        .import_map
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    import_pairs.sort();
+    let mappings_tag = format!("t:[{}]i:[{}]", type_pairs.join(","), import_pairs.join(","));
     Some(format!(
-        "flap:{FLAP_VERSION}|backend:{backend_tag}|mtime:{mtime}|size:{size}"
+        "flap:{FLAP_VERSION}|backend:{backend_tag}|{mappings_tag}|mtime:{mtime}|size:{size}"
     ))
 }
 
