@@ -123,6 +123,305 @@ fn escape_dart_keyword(name: &str) -> String {
     }
 }
 
+// ── Template support ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct TemplateConfig {
+    /// Directory to search for template overrides.
+    /// Resolution order per output file:
+    ///   1. `{dir}/{exact_filename}`       — verbatim copy, no rendering
+    ///   2. `{dir}/model.dart.jinja`       — Jinja2 template for every model
+    ///   3. `{dir}/client.dart.jinja`      — Jinja2 template for the client
+    ///   4. `{dir}/flap_utils.dart`        — verbatim override for the runtime file
+    ///   5. built-in emitter               — fallback when nothing matches
+    pub template_dir: Option<std::path::PathBuf>,
+}
+
+impl TemplateConfig {
+    /// Returns the raw content of `{template_dir}/{filename}` if the file exists.
+    fn verbatim(&self, filename: &str) -> Option<String> {
+        let dir = self.template_dir.as_ref()?;
+        std::fs::read_to_string(dir.join(filename)).ok()
+    }
+
+    /// Returns the raw content of `{template_dir}/{name}.jinja` if the file exists.
+    fn jinja(&self, name: &str) -> Option<String> {
+        let dir = self.template_dir.as_ref()?;
+        std::fs::read_to_string(dir.join(format!("{name}.jinja"))).ok()
+    }
+}
+
+// ── Jinja2 template contexts (serde::Serialize so minijinja can use them) ─────
+
+#[derive(serde::Serialize)]
+struct ModelTemplateCtx {
+    /// Dart class name after collision-avoidance and type mapping.
+    class_name: String,
+    /// Original schema name from the spec.
+    schema_name: String,
+    /// snake_case class name — used for `part` directives.
+    snake_name: String,
+    fields: Vec<FieldTemplateCtx>,
+    /// Ready-to-emit `import '...';` lines, sorted and deduped.
+    imports: Vec<String>,
+    has_optional_fields: bool,
+    /// Parent schema name when the schema uses allOf inheritance.
+    extends: Option<String>,
+    /// "safe" or "unsafe"
+    null_safety: String,
+}
+
+#[derive(serde::Serialize)]
+struct FieldTemplateCtx {
+    /// Original spec field name.
+    spec_name: String,
+    /// camelCase Dart identifier.
+    dart_name: String,
+    /// Full resolved Dart type, e.g. `"List<String>"`, `"Pet?"`, `"Optional<int?>"`.
+    dart_type: String,
+    required: bool,
+    nullable: bool,
+    /// True when this field uses the `Optional<T?>` absent/present wrapper.
+    uses_optional_wrapper: bool,
+    /// `@Default(...)` expression, if any.
+    default_expr: Option<String>,
+    /// Non-null when the Dart identifier differs from the spec name.
+    json_name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ClientTemplateCtx {
+    class_name: String,
+    /// First server URL, or empty string.
+    default_base_url: String,
+    base_urls: Vec<String>,
+    operations: Vec<OperationTemplateCtx>,
+    credentials: Vec<CredentialTemplateCtx>,
+    /// "dio" or "http"
+    backend: String,
+    /// "safe" or "unsafe"
+    null_safety: String,
+}
+
+#[derive(serde::Serialize)]
+struct OperationTemplateCtx {
+    method: String,
+    path: String,
+    method_name: String,
+    summary: Option<String>,
+    return_type: String,
+    parameters: Vec<ParamTemplateCtx>,
+    has_body: bool,
+    body_type: Option<String>,
+    body_required: bool,
+    is_multipart: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ParamTemplateCtx {
+    spec_name: String,
+    dart_name: String,
+    dart_type: String,
+    /// "query", "path", "header", or "cookie"
+    location: String,
+    required: bool,
+}
+
+#[derive(serde::Serialize)]
+struct CredentialTemplateCtx {
+    dart_param_name: String,
+    /// "apiKey", "httpBearer", "httpBasic", "oauth2", "openIdConnect"
+    scheme_type: String,
+}
+
+// ── Jinja renderer ────────────────────────────────────────────────────────────
+
+fn render_jinja(template_src: &str, context: impl serde::Serialize) -> Result<String, String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template("t", template_src)
+        .map_err(|e| format!("template parse error: {e}"))?;
+    let tmpl = env.get_template("t").unwrap();
+    let ctx = minijinja::Value::from_serialize(&context);
+    tmpl.render(ctx).map_err(|e| format!("template render error: {e}"))
+}
+
+// ── Context builders ──────────────────────────────────────────────────────────
+
+fn build_model_ctx(
+    schema: &Schema,
+    class_name: &str,
+    registry: &EnumRegistry,
+    schemas: &[Schema],
+    mode: NullSafety,
+    mappings: &MappingConfig,
+) -> ModelTemplateCtx {
+    let snake_name = to_snake_case(class_name);
+    let null_safety = if mode == NullSafety::Safe { "safe" } else { "unsafe" }.to_string();
+
+    let fields = match &schema.kind {
+        SchemaKind::Object { fields } => fields
+            .iter()
+            .map(|f| build_field_ctx(f, &schema.name, registry, mode, mappings))
+            .collect(),
+        _ => vec![],
+    };
+
+    let has_optional_fields = fields.iter().any(|f: &FieldTemplateCtx| f.uses_optional_wrapper);
+
+    let mut imports: Vec<String> = Vec::new();
+    if let SchemaKind::Object { fields } = &schema.kind {
+        for field in fields {
+            collect_field_imports(
+                &field.type_ref, &field.name, &schema.name, class_name,
+                registry, &mut imports, mappings,
+            );
+        }
+    }
+    imports.sort();
+    imports.dedup();
+
+    ModelTemplateCtx {
+        class_name: class_name.to_string(),
+        schema_name: schema.name.clone(),
+        snake_name,
+        fields,
+        imports,
+        has_optional_fields,
+        extends: schema.extends.clone(),
+        null_safety,
+    }
+}
+
+fn build_field_ctx(
+    field: &Field,
+    schema_name: &str,
+    registry: &EnumRegistry,
+    mode: NullSafety,
+    mappings: &MappingConfig,
+) -> FieldTemplateCtx {
+    let synth = registry.lookup_field(schema_name, &field.name);
+    let dart_type = to_dart_type(&field.type_ref, synth, mappings);
+    let dart_name = to_camel_case(&field.name);
+    let uses_optional_wrapper = mode == NullSafety::Safe
+        && !field.required
+        && field.nullable
+        && type_ref_supports_optional_wrapper(&field.type_ref);
+
+    let dart_type_in_ctx = if uses_optional_wrapper {
+        format!("Optional<{dart_type}?>")
+    } else if !field.required || field.nullable {
+        format!("{dart_type}?")
+    } else {
+        dart_type
+    };
+
+    let default_expr = field
+        .default_value
+        .as_ref()
+        .map(dart_default_expr);
+
+    let json_name = if dart_name != field.name {
+        Some(field.name.clone())
+    } else {
+        None
+    };
+
+    FieldTemplateCtx {
+        spec_name: field.name.clone(),
+        dart_name,
+        dart_type: dart_type_in_ctx,
+        required: field.required,
+        nullable: field.nullable,
+        uses_optional_wrapper,
+        default_expr,
+        json_name,
+    }
+}
+
+fn build_client_ctx(
+    api: &Api,
+    class_name: &str,
+    registry: &EnumRegistry,
+    mode: NullSafety,
+    backend: ClientBackend,
+    mappings: &MappingConfig,
+) -> ClientTemplateCtx {
+    let null_safety = if mode == NullSafety::Safe { "safe" } else { "unsafe" }.to_string();
+    let backend_str = match backend {
+        ClientBackend::Dio  => "dio",
+        ClientBackend::Http => "http",
+    }
+    .to_string();
+
+    let default_base_url = api.base_urls.first().cloned().unwrap_or_default();
+
+    let credentials: Vec<CredentialTemplateCtx> = api
+        .security_schemes
+        .iter()
+        .map(|s| CredentialTemplateCtx {
+            dart_param_name: escape_dart_keyword(&to_camel_case(s.scheme_name())),
+            scheme_type: match s {
+                SecurityScheme::ApiKey { .. }      => "apiKey",
+                SecurityScheme::HttpBasic { .. }   => "httpBasic",
+                SecurityScheme::HttpBearer { .. }  => "httpBearer",
+                SecurityScheme::OAuth2 { .. }      => "oauth2",
+                SecurityScheme::OpenIdConnect { .. } => "openIdConnect",
+            }
+            .to_string(),
+        })
+        .collect();
+
+    let operations = api
+        .operations
+        .iter()
+        .map(|op| {
+            let dart_params = build_dart_params(op, registry, mappings);
+            let return_type = success_return_type(&op.responses, mode, mappings);
+            let op_id = op.operation_id.as_deref().unwrap_or("");
+
+            let (has_body, body_type, body_required, is_multipart) =
+                if let Some(rb) = &op.request_body {
+                    let bt = to_dart_type(&rb.schema_ref, registry.lookup_body(op_id), mappings);
+                    (true, Some(bt), rb.required, rb.is_multipart)
+                } else {
+                    (false, None, false, false)
+                };
+
+            OperationTemplateCtx {
+                method: op.method.to_string(),
+                path: op.path.clone(),
+                method_name: op_method_name(op),
+                summary: op.summary.clone(),
+                return_type,
+                parameters: dart_params
+                    .iter()
+                    .map(|p| ParamTemplateCtx {
+                        spec_name: p.spec_name.to_string(),
+                        dart_name: p.dart_name.clone(),
+                        dart_type: p.non_null_type.clone(),
+                        location: p.location.to_string(),
+                        required: p.required,
+                    })
+                    .collect(),
+                has_body,
+                body_type,
+                body_required,
+                is_multipart,
+            }
+        })
+        .collect();
+
+    ClientTemplateCtx {
+        class_name: class_name.to_string(),
+        default_base_url,
+        base_urls: api.base_urls.clone(),
+        operations,
+        credentials,
+        backend: backend_str,
+        null_safety,
+    }
+}
+
 // ── Public enums ──────────────────────────────────────────────────────────────
 
 /// Controls whether the emitted Dart code targets sound null safety (Dart ≥ 2.12)
@@ -308,36 +607,62 @@ impl EnumRegistry {
 }
 
 // ── Public entry point: models ────────────────────────────────────────────────
-
 pub fn emit_models(
     api: &Api,
     mode: NullSafety,
     mappings: &MappingConfig,
+    templates: &TemplateConfig,
 ) -> HashMap<String, String> {
     let registry = EnumRegistry::build(api);
     let mut files = HashMap::new();
 
     if mode == NullSafety::Safe {
-        files.insert("flap_utils.dart".to_string(), emit_flap_utils());
+        // Allow verbatim override of the runtime file.
+        let utils = templates
+            .verbatim("flap_utils.dart")
+            .unwrap_or_else(emit_flap_utils);
+        files.insert("flap_utils.dart".to_string(), utils);
     }
 
+    // Pre-load the global model Jinja template once (if present).
+    let model_jinja = templates.jinja("model.dart");
+
     for schema in &api.schemas {
-        if schema.internal {
-            continue;
-        }
-        // Skip schemas the user has replaced with their own hand-written type.
-        if mappings.type_map.contains_key(&schema.name) {
-            continue;
-        }
+        if schema.internal { continue; }
+        if mappings.type_map.contains_key(&schema.name) { continue; }
+
         let class_name = mappings.resolve_class(&schema.name);
         let filename = format!("{}.dart", to_snake_case(&class_name));
-        let source = emit_schema(schema, &class_name, &registry, &api.schemas, mode, mappings);
+
+        let source = if let Some(verbatim) = templates.verbatim(&filename) {
+            // 1. Exact file override — highest priority.
+            verbatim
+        } else if let Some(ref jinja_src) = model_jinja {
+            // 2. Global model Jinja template.
+            let ctx = build_model_ctx(schema, &class_name, &registry, &api.schemas, mode, mappings);
+            match render_jinja(jinja_src, ctx) {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    eprintln!("warning: model.dart.jinja error for `{}`: {e}", schema.name);
+                    // Fall through to built-in on render error.
+                    emit_schema(schema, &class_name, &registry, &api.schemas, mode, mappings)
+                }
+            }
+        } else {
+            // 3. Built-in emitter.
+            emit_schema(schema, &class_name, &registry, &api.schemas, mode, mappings)
+        };
+
         files.insert(filename, source);
     }
 
     for synth in registry.enums.values() {
         let filename = format!("{}.dart", to_snake_case(&synth.name));
-        files.insert(filename, emit_synth_enum(synth));
+        // Enum files support verbatim override only — no global Jinja template.
+        let source = templates
+            .verbatim(&filename)
+            .unwrap_or_else(|| emit_synth_enum(synth));
+        files.insert(filename, source);
     }
 
     files
@@ -351,14 +676,37 @@ pub fn emit_client(
     mode: NullSafety,
     backend: ClientBackend,
     mappings: &MappingConfig,
+    templates: &TemplateConfig,
 ) -> (String, String) {
     let registry = EnumRegistry::build(api);
     let class_name = api_client_name(&api.title);
     let filename = format!("{}.dart", to_snake_case(&class_name));
-    let source = match backend {
-        ClientBackend::Dio => emit_client_dio(api, &class_name, &registry, mode, mappings),
-        ClientBackend::Http => emit_client_http(api, &class_name, &registry, mode, mappings),
+
+    let source = if let Some(verbatim) = templates.verbatim(&filename) {
+        // 1. Exact file override.
+        verbatim
+    } else if let Some(jinja_src) = templates.jinja("client.dart") {
+        // 2. Global client Jinja template.
+        let ctx = build_client_ctx(api, &class_name, &registry, mode, backend, mappings);
+        match render_jinja(&jinja_src, ctx) {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                eprintln!("warning: client.dart.jinja render error: {e}");
+                // Fall through to built-in on render error.
+                match backend {
+                    ClientBackend::Dio  => emit_client_dio(api, &class_name, &registry, mode, mappings),
+                    ClientBackend::Http => emit_client_http(api, &class_name, &registry, mode, mappings),
+                }
+            }
+        }
+    } else {
+        // 3. Built-in emitter.
+        match backend {
+            ClientBackend::Dio  => emit_client_dio(api, &class_name, &registry, mode, mappings),
+            ClientBackend::Http => emit_client_http(api, &class_name, &registry, mode, mappings),
+        }
     };
+
     (filename, source)
 }
 

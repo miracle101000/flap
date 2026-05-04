@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 flap-ir = { path = "../flap-ir" }
+minijinja = { version = "2", features = ["loader"] }
+serde     = { version = "1", features = ["derive"] }
