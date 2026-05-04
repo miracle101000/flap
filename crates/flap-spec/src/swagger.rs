@@ -19,6 +19,8 @@ pub struct SwaggerSpec {
     pub security_definitions: BTreeMap<String, SwaggerSecurityDefinition>,
     #[serde(default)]
     pub security: Vec<BTreeMap<String, Vec<String>>>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Clone)]
@@ -75,6 +77,8 @@ pub struct SwaggerOperation {
     pub consumes: Vec<String>,
     #[serde(default)]
     pub security: Option<Vec<BTreeMap<String, Vec<String>>>>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 // Parameter (2.0 style: type lives at top level, not in a schema)
@@ -95,6 +99,8 @@ pub struct SwaggerParameter {
     // For 'body' parameter
     pub schema: Option<SwaggerSchemaOrRef>,
     // For 'in: formData' the type is inline, we'll treat it like a query param
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 // Items for arrays inside parameters
@@ -111,6 +117,8 @@ pub struct SwaggerItems {
 pub struct SwaggerResponse {
     pub description: Option<String>,
     pub schema: Option<SwaggerSchemaOrRef>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_yaml::Value>,
     // Could also have headers, etc.
 }
 
@@ -141,7 +149,8 @@ pub struct SwaggerSchema {
     pub additional_properties: Option<SwaggerAdditionalProperties>,
     #[serde(default, rename = "allOf")]
     pub all_of: Vec<SwaggerSchemaOrRef>,
-    // note: no anyOf/oneOf in 2.0
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]

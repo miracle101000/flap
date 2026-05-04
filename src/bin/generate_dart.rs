@@ -2,66 +2,87 @@
 //! to disk. Each spec gets its own subdirectory under the shared output root.
 //!
 //! Usage:
-//!   cargo run --bin generate_dart -- --out <out-dir> <spec> [<spec> ...]
+//!   cargo run --bin generate_dart -- --out <out-dir> [--force] [--client=dio|http] <spec> [<spec> ...]
 //!
 //! Examples:
-//!   # Single local file output to an 'sdks' folder in the project root
+//!   # Single local file, Dio client (default)
 //!   cargo run --bin generate_dart -- \
 //!     --out ./sdks \
 //!     tests/fixtures/petstore.yaml
 //!
-//!   # Multiple specs in one run output to the project root
+//!   # http package client
 //!   cargo run --bin generate_dart -- \
 //!     --out ./sdks \
+//!     --client=http \
+//!     tests/fixtures/petstore.yaml
+//!
+//!   # Multiple specs, force regeneration
+//!   cargo run --bin generate_dart -- \
+//!     --out ./sdks \
+//!     --force \
 //!     tests/fixtures/petstore.yaml \
-//!     tests/fixtures/secure_petstore.yaml \
 //!     https://petstore3.swagger.io/api/v3/openapi.yaml
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::UNIX_EPOCH;
+
+use flap_emit_dart::{ClientBackend, NullSafety};
+
+const FLAP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LOCK_FILE: &str = ".flap.lock";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    // ── Argument parsing ─────────────────────────────────────────────────────
-    // Expected: --out <dir> <spec> [<spec> ...]
-    let (out_dir, specs) = match parse_args(&args) {
+    let (out_dir, specs, force, backend) = match parse_args(&args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("error: {msg}");
-            eprintln!("usage: gen_dart --out <out-dir> <spec> [<spec> ...]");
+            eprintln!(
+                "usage: gen_dart --out <out-dir> [--force] [--client=dio|http] <spec> [<spec> ...]"
+            );
             return ExitCode::from(2);
         }
     };
 
     if specs.is_empty() {
         eprintln!("error: at least one spec path or URL is required");
-        eprintln!("usage: gen_dart --out <out-dir> <spec> [<spec> ...]");
+        eprintln!(
+            "usage: gen_dart --out <out-dir> [--force] [--client=dio|http] <spec> [<spec> ...]"
+        );
         return ExitCode::from(2);
     }
 
-    // ── Per-spec generation ──────────────────────────────────────────────────
+    let backend_label = match backend {
+        ClientBackend::Dio => "dio",
+        ClientBackend::Http => "http",
+    };
+    println!("client backend: {backend_label}");
+
     let mut any_failed = false;
 
     for spec in &specs {
         println!("\n── {spec} ──");
+
+        let fingerprint = local_fingerprint(spec, backend);
 
         let api = match flap_spec::load_path_or_url(spec) {
             Ok(api) => api,
             Err(e) => {
                 eprintln!("  error loading spec: {e:#}");
                 any_failed = true;
-                continue; // keep going; generate what we can
+                continue;
             }
         };
 
-        // Derive a safe directory name from the spec path or URL stem.
         let subdir_name = spec_to_dir_name(spec);
 
         for (mode, suffix) in [
-            (flap_emit_dart::NullSafety::Safe, "null_safe"),
-            (flap_emit_dart::NullSafety::Unsafe, "null_unsafe"),
+            (NullSafety::Safe, "null_safe"),
+            (NullSafety::Unsafe, "null_unsafe"),
         ] {
             let spec_out = out_dir.join(&subdir_name);
 
@@ -71,35 +92,59 @@ fn main() -> ExitCode {
                 continue;
             }
 
-            // Models
+            // ── Incremental check ─────────────────────────────────────────
+            // Lock file name encodes both the null-safety mode and the backend
+            // so switching --client=http forces regeneration even if the spec
+            // hasn't changed.
+            let lock_path = spec_out.join(format!("{LOCK_FILE}.{suffix}.{backend_label}"));
+            if !force {
+                if let Some(ref fp) = fingerprint {
+                    if read_lock(&lock_path).as_deref() == Some(fp.as_str()) {
+                        println!("  [{suffix}/{backend_label}] unchanged — skipping");
+                        continue;
+                    }
+                }
+            }
+
+            // ── Models ────────────────────────────────────────────────────
             let models = flap_emit_dart::emit_models(&api, mode);
             let mut filenames: Vec<&String> = models.keys().collect();
             filenames.sort();
+            let mut write_ok = true;
             for filename in filenames {
                 let path = spec_out.join(filename);
                 if let Err(e) = fs::write(&path, &models[filename]) {
                     eprintln!("  error writing {}: {e}", path.display());
                     any_failed = true;
+                    write_ok = false;
                     continue;
                 }
                 println!("  wrote {}", path.display());
             }
 
-            // Client
-            let (client_filename, client_src) = flap_emit_dart::emit_client(&api, mode);
+            // ── Client ────────────────────────────────────────────────────
+            let (client_filename, client_src) = flap_emit_dart::emit_client(&api, mode, backend);
             let client_path = spec_out.join(&client_filename);
             if let Err(e) = fs::write(&client_path, &client_src) {
                 eprintln!("  error writing {}: {e}", client_path.display());
                 any_failed = true;
-                continue;
+                write_ok = false;
+            } else {
+                println!("  wrote {}", client_path.display());
             }
-            println!("  wrote {}", client_path.display());
 
             println!(
-                "  [{suffix}] {} model file(s) + 1 client → {}",
+                "  [{suffix}/{backend_label}] {} model file(s) + 1 client → {}",
                 models.len(),
                 spec_out.display()
             );
+
+            // ── Update lockfile only if all writes succeeded ───────────────
+            if write_ok {
+                if let Some(ref fp) = fingerprint {
+                    write_lock(&lock_path, fp);
+                }
+            }
         }
     }
 
@@ -110,12 +155,14 @@ fn main() -> ExitCode {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Parse `--out <dir> <spec> [<spec> ...]` from the raw argument list.
-fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+/// Parse `--out <dir> [--force] [--client=dio|http] <spec> [<spec> ...]`.
+fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>, bool, ClientBackend), String> {
     let mut out_dir: Option<PathBuf> = None;
     let mut specs: Vec<String> = Vec::new();
+    let mut force = false;
+    let mut backend = ClientBackend::Dio;
     let mut i = 0;
 
     while i < args.len() {
@@ -130,6 +177,21 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
             arg if arg.starts_with("--out=") => {
                 out_dir = Some(PathBuf::from(&arg["--out=".len()..]));
             }
+            "--force" | "-f" => {
+                force = true;
+            }
+            "--client=dio" => {
+                backend = ClientBackend::Dio;
+            }
+            "--client=http" => {
+                backend = ClientBackend::Http;
+            }
+            arg if arg.starts_with("--client=") => {
+                let val = &arg["--client=".len()..];
+                return Err(format!(
+                    "unknown client backend `{val}` — expected `dio` or `http`"
+                ));
+            }
             other => {
                 specs.push(other.to_string());
             }
@@ -138,17 +200,53 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
     }
 
     let out_dir = out_dir.ok_or_else(|| "--out <dir> is required".to_string())?;
-    Ok((out_dir, specs))
+    Ok((out_dir, specs, force, backend))
+}
+
+/// Fingerprint a local spec file using mtime + size + flap version + backend.
+///
+/// Including the backend means switching from `--client=dio` to `--client=http`
+/// invalidates the lockfile and forces regeneration even when the spec is
+/// unchanged — correct because the client file content differs between backends.
+///
+/// Returns `None` for remote URLs — those always regenerate.
+fn local_fingerprint(spec: &str, backend: ClientBackend) -> Option<String> {
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        return None;
+    }
+    let meta = std::fs::metadata(spec).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let size = meta.len();
+    let backend_tag = match backend {
+        ClientBackend::Dio => "dio",
+        ClientBackend::Http => "http",
+    };
+    Some(format!(
+        "flap:{FLAP_VERSION}|backend:{backend_tag}|mtime:{mtime}|size:{size}"
+    ))
+}
+
+fn read_lock(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+fn write_lock(path: &std::path::Path, fingerprint: &str) {
+    let _ = std::fs::write(path, fingerprint);
 }
 
 /// Convert a spec path or URL into a safe single-directory-component name.
 ///
 /// Examples:
-///   "tests/fixtures/petstore.yaml"               → "petstore"
-///   "https://example.com/api/v3/openapi.yaml"    → "openapi"
-///   "https://example.com/api/v3/openapi.json"    → "openapi"
+///   "tests/fixtures/petstore.yaml"            → "petstore"
+///   "https://example.com/api/v3/openapi.yaml" → "openapi"
 fn spec_to_dir_name(spec: &str) -> String {
-    // Strip query string and fragment for URLs.
     let without_suffix = spec
         .split('?')
         .next()
@@ -157,21 +255,18 @@ fn spec_to_dir_name(spec: &str) -> String {
         .next()
         .unwrap_or(spec);
 
-    // Take just the final path component.
     let basename = without_suffix
         .trim_end_matches('/')
         .rsplit('/')
         .next()
         .unwrap_or(without_suffix);
 
-    // Strip known extensions.
     let stem = basename
         .strip_suffix(".yaml")
         .or_else(|| basename.strip_suffix(".yml"))
         .or_else(|| basename.strip_suffix(".json"))
         .unwrap_or(basename);
 
-    // Sanitise: replace anything that isn't alphanumeric, `-`, or `_` with `_`.
     let sanitised: String = stem
         .chars()
         .map(|c| {

@@ -1,22 +1,4 @@
 //! OpenAPI 3.0 loader and lowering pass.
-//!
-//! Public API: one function, `load`, which reads a YAML file and returns a
-//! fully-populated `flap_ir::Api`. Everything inside is private serde plumbing.
-//!
-//! # Phase 8 (nullability)
-//!
-//! `RawSchema.nullable` mirrors OpenAPI 3.0's `nullable: true` flag. It's
-//! propagated into `Field.nullable` during `collect_object_fields`, where
-//! it's also OR-merged across `allOf` parents (matching the merge rule
-//! already used for `required` — any source declaring a wider semantics
-//! wins, because narrowing later would silently drop wire forms a base
-//! schema legitimately accepts).
-//!
-//! OpenAPI 3.1's `type: [T, "null"]` is supported: `deserialize_openapi_type`
-//! already accepts both a bare string and an array of strings, `primary_type`
-//! filters out `"null"` to find the real type, and `is_nullable` detects it.
-//! The 3.0 `nullable: true` keyword and the 3.1 array form are OR-merged in
-//! `collect_object_fields`, so both formats produce identical IR.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -24,12 +6,48 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flap_ir::{
-    Api, ApiKeyLocation, EnumValue, Field, HttpMethod, OAuth2Flow, OAuth2FlowType, Operation,
-    Parameter, ParameterLocation, RequestBody, Response, Schema, SchemaKind, SecurityScheme,
-    TypeRef,
+    Api, ApiKeyLocation, EnumValue, ExtensionValue, Extensions, Field, HttpMethod, OAuth2Flow,
+    OAuth2FlowType, Operation, Parameter, ParameterLocation, RequestBody, Response, Schema,
+    SchemaKind, SecurityScheme, TypeRef,
 };
 use serde::Deserialize;
+
 pub mod swagger;
+
+// ── Extension helpers ─────────────────────────────────────────────────────────
+
+fn yaml_to_extension(v: &serde_yaml::Value) -> ExtensionValue {
+    match v {
+        serde_yaml::Value::Null => ExtensionValue::Null,
+        serde_yaml::Value::Bool(b) => ExtensionValue::Bool(*b),
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                ExtensionValue::Integer(i)
+            } else {
+                ExtensionValue::Float(n.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        serde_yaml::Value::String(s) => ExtensionValue::String(s.clone()),
+        serde_yaml::Value::Sequence(seq) => {
+            ExtensionValue::Sequence(seq.iter().map(yaml_to_extension).collect())
+        }
+        serde_yaml::Value::Mapping(map) => ExtensionValue::Mapping(
+            map.iter()
+                .filter_map(|(k, v)| k.as_str().map(|s| (s.to_string(), yaml_to_extension(v))))
+                .collect(),
+        ),
+        _ => ExtensionValue::Null,
+    }
+}
+
+fn collect_extensions(extra: &BTreeMap<String, serde_yaml::Value>) -> Extensions {
+    extra
+        .iter()
+        .filter(|(k, _)| k.starts_with("x-"))
+        .map(|(k, v)| (k.clone(), yaml_to_extension(v)))
+        .collect()
+}
+
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn load(path: impl AsRef<Path>) -> Result<Api> {
@@ -37,526 +55,22 @@ pub fn load(path: impl AsRef<Path>) -> Result<Api> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading spec file {}", path.display()))?;
 
-    // Detect version from first line
     let first_line = text.lines().next().unwrap_or("");
     if first_line.trim().starts_with("swagger:") {
         return load_swagger_str(&text).with_context(|| format!("in spec file {}", path.display()));
     }
 
-    // existing 3.x path
     check_openapi_version(&text)?;
     let raw: RawSpec = serde_yaml::from_str(&text).context("parsing OpenAPI YAML")?;
     lower(raw)
 }
 
-fn lower_swagger_inline_type(
-    ty: Option<&str>,
-    format: Option<&str>,
-    items: Option<&SwaggerItems>,
-    enum_values: &[serde_yaml::Value],
-) -> Result<TypeRef> {
-    if !enum_values.is_empty() {
-        let values = lower_enum_values("anonymous_enum", enum_values)
-            .with_context(|| "invalid enum value")?;
-        return Ok(TypeRef::Enum(values));
-    }
-    match ty {
-        Some("string") => {
-            if format == Some("date-time") {
-                Ok(TypeRef::DateTime)
-            } else {
-                Ok(TypeRef::String)
-            }
-        }
-        Some("integer") => Ok(TypeRef::Integer {
-            format: format.map(|s| s.to_string()),
-        }),
-        Some("number") => Ok(TypeRef::Number {
-            format: format.map(|s| s.to_string()),
-        }),
-        Some("boolean") => Ok(TypeRef::Boolean),
-        Some("array") => {
-            let items = items.ok_or_else(|| anyhow!("array type missing items"))?;
-            let inner =
-                lower_swagger_inline_type(Some(&items.ty), items.format.as_deref(), None, &[])?;
-            Ok(TypeRef::Array(Box::new(inner)))
-        }
-        Some("file") => bail!("file parameters are not supported"),
-        _ => bail!("unsupported inline type {:?}", ty),
-    }
-}
-
-fn lower_swagger_schema_or_ref(
-    sor: &SwaggerSchemaOrRef,
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
-    visiting: &HashSet<String>,
-) -> Result<TypeRef> {
-    match sor {
-        SwaggerSchemaOrRef::Ref { reference } => {
-            let name = parse_swagger_ref(reference)?; // extracts from "#/definitions/XXX"
-            if !definitions.contains_key(name) {
-                bail!("unknown definition {name}");
-            }
-            Ok(TypeRef::Named(name.to_string()))
-        }
-        SwaggerSchemaOrRef::Inline(raw) => {
-            // if it has type, format, items, enum → return primitive/array
-            if let Some(ty) = &raw.ty {
-                return lower_swagger_inline_type(
-                    Some(ty),
-                    raw.format.as_deref(),
-                    None,
-                    &raw.enum_values,
-                );
-            }
-            // otherwise it's an inline object/map/array, but those would become named schemas
-            // (unlikely at top-level)
-            bail!("inline schema without type not supported")
-        }
-    }
-}
-
-pub fn load_swagger_str(text: &str) -> Result<Api> {
-    let raw: SwaggerSpec = serde_yaml::from_str(text).context("parsing Swagger 2.0 YAML")?;
-    lower_swagger(raw)
-}
-/// Extracts the schema name from a Swagger‑style `$ref` pointer.
-///
-/// Example: `"#/definitions/Pet"` → `"Pet"`.
-fn parse_swagger_ref(reference: &str) -> Result<&str> {
-    let bare = reference.strip_prefix("#/definitions/").ok_or_else(|| {
-        anyhow!(
-            "`$ref` `{reference}` is not a definition reference – \
-             Swagger 2.0 only supports `#/definitions/*`"
-        )
-    })?;
-    if bare.is_empty() || bare.contains('/') {
-        bail!("malformed $ref pointer `{reference}`");
-    }
-    Ok(bare)
-}
-
-fn lower_swagger(spec: SwaggerSpec) -> Result<Api> {
-    let title = spec.info.title;
-    let base_urls = build_swagger_base_url(&spec.host, &spec.base_path)
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut ctx = SwaggerContext::new(&spec.definitions);
-    let operations = lower_swagger_operations(&spec.paths, &mut ctx)?;
-    let schemas = lower_swagger_schemas(&spec.definitions, &mut ctx)?;
-    let security_schemes = lower_swagger_security(&spec.security_definitions)?;
-    let security = flatten_security_requirements(&spec.security);
-    Ok(Api {
-        title,
-        base_urls,
-        operations,
-        schemas,
-        security_schemes,
-        security,
-    })
-}
-
-fn build_swagger_base_url(host: &Option<String>, base_path: &Option<String>) -> Option<String> {
-    match (host.as_deref(), base_path.as_deref()) {
-        (Some(h), Some(bp)) => Some(format!("https://{h}{bp}")), // assume https; could add schemes
-        (Some(h), None) => Some(format!("https://{h}")),
-        (None, Some(bp)) => Some(bp.to_string()),
-        (None, None) => None,
-    }
-}
-
-fn lower_swagger_security(
-    raw: &BTreeMap<String, SwaggerSecurityDefinition>,
-) -> Result<Vec<SecurityScheme>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for (name, def) in raw {
-        let scheme = lower_one_swagger_security(name, def)?;
-        out.push(scheme);
-    }
-    Ok(out)
-}
-
-fn lower_one_swagger_security(
-    name: &str,
-    def: &SwaggerSecurityDefinition,
-) -> Result<SecurityScheme> {
-    match def.ty.as_str() {
-        "apiKey" => {
-            let parameter_name = def
-                .name
-                .clone()
-                .ok_or_else(|| anyhow!("apiKey missing `name`"))?;
-            let location = match def.location.as_deref() {
-                Some("header") => ApiKeyLocation::Header,
-                Some("query") => ApiKeyLocation::Query,
-                Some("cookie") => ApiKeyLocation::Cookie,
-                other => bail!("invalid apiKey location: {:?}", other),
-            };
-            Ok(SecurityScheme::ApiKey {
-                scheme_name: name.to_string(),
-                parameter_name,
-                location,
-            })
-        }
-        "basic" => {
-            // Add HttpBasic to your IR if not already present; otherwise use a bearer fallback
-            Ok(SecurityScheme::HttpBasic {
-                scheme_name: name.to_string(),
-            })
-        }
-        "oauth2" => {
-            let flow = def.flow.as_deref().unwrap_or("implicit");
-            let flow_type = match flow {
-                "implicit" => OAuth2FlowType::Implicit,
-                "password" => OAuth2FlowType::Password,
-                "application" => OAuth2FlowType::ClientCredentials,
-                "accessCode" => OAuth2FlowType::AuthorizationCode,
-                other => bail!("unsupported OAuth2 flow: {other}"),
-            };
-            let flows = vec![OAuth2Flow {
-                flow_type,
-                token_url: def.token_url.clone(),
-                authorization_url: def.authorization_url.clone(),
-                scopes: def.scopes.keys().cloned().collect(),
-            }];
-            Ok(SecurityScheme::OAuth2 {
-                scheme_name: name.to_string(),
-                flows,
-            })
-        }
-        other => bail!("unsupported security type: {other}"),
-    }
-}
-
-fn lower_swagger_schemas(
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
-    ctx: &mut SwaggerContext,
-) -> Result<Vec<Schema>> {
-    let mut out = Vec::with_capacity(definitions.len());
-    for (name, sor) in definitions {
-        ctx.visiting.insert(name.clone());
-        let kind = lower_swagger_schema_kind(name, sor, definitions, ctx)?;
-        ctx.visiting.remove(name);
-
-        // Detect allOf-based single inheritance: if the first allOf entry
-        // is a $ref, that target is the logical parent. Swagger 2.0 has no
-        // discriminator, so `extends` is purely informational for emitters.
-        let extends = if let SwaggerSchemaOrRef::Inline(raw) = sor {
-            raw.all_of.first().and_then(|first| {
-                if let SwaggerSchemaOrRef::Ref { reference } = first {
-                    parse_swagger_ref(reference).ok().map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-
-        out.push(Schema {
-            name: name.clone(),
-            kind,
-            internal: false, // none are synthetic for Swagger
-            extends,
-        });
-    }
-    Ok(out)
-}
-
-fn lower_swagger_schema_kind(
-    name: &str,
-    sor: &SwaggerSchemaOrRef,
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
-    ctx: &SwaggerContext,
-) -> Result<SchemaKind> {
-    match sor {
-        SwaggerSchemaOrRef::Ref { .. } => {
-            // Swagger does not allow top-level definitions to be bare $refs, but if it happens,
-            // we bail.
-            bail!("top-level definition `{name}` is a bare $ref – not supported")
-        }
-        SwaggerSchemaOrRef::Inline(raw) => {
-            if !raw.all_of.is_empty() {
-                let fields = collect_swagger_object_fields(raw, definitions, ctx)?;
-                return Ok(SchemaKind::Object { fields });
-            }
-            match raw.ty.as_deref() {
-                Some("object") | None if !raw.properties.is_empty() => {
-                    let fields = collect_swagger_object_fields(raw, definitions, ctx)?;
-                    Ok(SchemaKind::Object { fields })
-                }
-                Some("object") | None
-                    if raw.properties.is_empty()
-                        && matches!(
-                            &raw.additional_properties,
-                            Some(SwaggerAdditionalProperties::Schema(_))
-                        ) =>
-                {
-                    let Some(SwaggerAdditionalProperties::Schema(inner)) =
-                        &raw.additional_properties
-                    else {
-                        unreachable!()
-                    };
-                    let value = lower_swagger_schema_or_ref(inner, definitions, &ctx.visiting)?;
-                    Ok(SchemaKind::Map { value })
-                }
-                Some("array") => {
-                    let items = raw
-                        .items
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("array schema missing items"))?;
-                    let item = lower_swagger_schema_or_ref(items, definitions, &ctx.visiting)?;
-                    Ok(SchemaKind::Array { item })
-                }
-                other => bail!("unsupported schema type {:?} for `{name}`", other),
-            }
-        }
-    }
-}
-
-fn collect_swagger_object_fields(
-    raw: &SwaggerSchema,
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
-    ctx: &SwaggerContext,
-) -> Result<Vec<Field>> {
-    let mut fields = Vec::new();
-
-    // allOf members (they contribute properties)
-    for member in &raw.all_of {
-        fields.extend(collect_allof_fields_swagger(member, definitions, ctx)?);
-    }
-
-    let own_required: HashSet<&str> = raw.required.iter().map(String::as_str).collect();
-    for (field_name, sor) in &raw.properties {
-        let type_ref = lower_swagger_schema_or_ref(sor, definitions, &ctx.visiting)?;
-        let is_required = own_required.contains(field_name.as_str());
-        let is_recursive = type_ref_is_recursive(&type_ref, &ctx.visiting);
-        fields.push(Field {
-            name: field_name.clone(),
-            type_ref,
-            required: is_required,
-            nullable: false, // Swagger 2.0 has no nullable
-            is_recursive,
-            default_value: None,
-        });
-    }
-
-    // deduplicate (same as in spec.rs)
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    let mut deduped: Vec<Field> = Vec::with_capacity(fields.len());
-    for field in fields {
-        if let Some(&idx) = seen.get(&field.name) {
-            let merged_required = deduped[idx].required || field.required;
-            let merged_recursive = deduped[idx].is_recursive || field.is_recursive;
-            deduped[idx] = Field {
-                name: field.name.clone(),         // clone because field is moved
-                type_ref: field.type_ref.clone(), // clone if needed (TypeRef is Clone)
-                required: merged_required,
-                nullable: false, // Swagger has no nullable
-                is_recursive: merged_recursive,
-                default_value: None, // Swagger has no default values
-            };
-        } else {
-            seen.insert(field.name.clone(), deduped.len());
-            deduped.push(Field {
-                name: field.name,
-                type_ref: field.type_ref,
-                required: field.required,
-                nullable: false,
-                is_recursive: field.is_recursive,
-                default_value: None,
-            });
-        }
-    }
-    Ok(deduped)
-}
-
-fn collect_allof_fields_swagger(
-    sor: &SwaggerSchemaOrRef,
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
-    ctx: &SwaggerContext,
-) -> Result<Vec<Field>> {
-    match sor {
-        SwaggerSchemaOrRef::Ref { reference } => {
-            let name = parse_swagger_ref(reference)?;
-            let target = definitions
-                .get(name)
-                .ok_or_else(|| anyhow!("unknown allOf ref {name}"))?;
-            if ctx.visiting.contains(name) {
-                bail!("cycle in allOf chain via `{name}`");
-            }
-            match target {
-                SwaggerSchemaOrRef::Inline(raw) => {
-                    // Build a temporary context that marks `name` as visiting
-                    // so cycles through this ref are caught on the next level.
-                    let inner_ctx = ctx.with_visiting(name);
-                    collect_swagger_object_fields(raw, definitions, &inner_ctx)
-                }
-                SwaggerSchemaOrRef::Ref { .. } => bail!("chained $ref not supported"),
-            }
-        }
-        SwaggerSchemaOrRef::Inline(raw) => collect_swagger_object_fields(raw, definitions, ctx),
-    }
-}
-
-fn lower_swagger_operations(
-    paths: &BTreeMap<String, SwaggerPathItem>,
-    ctx: &mut SwaggerContext,
-) -> Result<Vec<Operation>> {
-    let mut ops = Vec::new();
-    for (path, item) in paths {
-        let pairs: [(HttpMethod, &Option<SwaggerOperation>); 7] = [
-            (HttpMethod::Delete, &item.delete),
-            (HttpMethod::Get, &item.get),
-            (HttpMethod::Head, &item.head),
-            (HttpMethod::Options, &item.options),
-            (HttpMethod::Patch, &item.patch),
-            (HttpMethod::Post, &item.post),
-            (HttpMethod::Put, &item.put),
-        ];
-        for (method, maybe_op) in pairs {
-            if let Some(raw_op) = maybe_op {
-                // Collect path-level params as references, then override with
-                // operation-level params (same name+location = operation wins).
-                let mut merged_params: Vec<&SwaggerParameter> = item.parameters.iter().collect();
-                for op_param in &raw_op.parameters {
-                    if let Some(pos) = merged_params
-                        .iter()
-                        .position(|p| p.name == op_param.name && p.location == op_param.location)
-                    {
-                        merged_params.remove(pos);
-                    }
-                    merged_params.push(op_param);
-                }
-
-                // Separate body from the merged list before lowering.
-                let body_param = merged_params.iter().find(|p| p.location == "body").copied();
-                let non_body_params: Vec<&SwaggerParameter> = merged_params
-                    .iter()
-                    .filter(|p| p.location != "body")
-                    .copied()
-                    .collect();
-
-                let parameters = non_body_params
-                    .iter()
-                    .map(|p| lower_swagger_parameter(p, ctx.definitions, &ctx.visiting))
-                    .collect::<Result<Vec<_>>>()?;
-
-                let request_body = body_param
-                    .map(|p| lower_swagger_body_param(p, ctx.definitions, &ctx.visiting))
-                    .transpose()?;
-
-                let responses = raw_op
-                    .responses
-                    .iter()
-                    .map(|(code, resp)| {
-                        Ok(Response {
-                            headers: vec![],
-                            status_code: code.clone(),
-                            schema_ref: resp
-                                .schema
-                                .as_ref()
-                                .map(|s| {
-                                    lower_swagger_schema_or_ref(s, ctx.definitions, &ctx.visiting)
-                                })
-                                .transpose()?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let security = raw_op
-                    .security
-                    .as_ref()
-                    .map(|reqs| flatten_security_requirements(reqs));
-
-                ops.push(Operation {
-                    method,
-                    path: path.clone(),
-                    operation_id: raw_op.operation_id.clone(),
-                    summary: raw_op.summary.clone(),
-                    parameters,
-                    request_body,
-                    responses,
-                    security,
-                });
-            }
-        }
-    }
-    Ok(ops)
-}
-
-fn lower_swagger_parameter(
-    param: &SwaggerParameter,
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>, // was &mut
-    visiting: &HashSet<String>,
-) -> Result<Parameter> {
-    // body params are handled separately via lower_swagger_body_param
-    let location = match param.location.as_str() {
-        "query" => ParameterLocation::Query,
-        "path" => ParameterLocation::Path,
-        "header" => ParameterLocation::Header,
-        "cookie" => ParameterLocation::Cookie,
-        // body is handled via lower_swagger_body_param before this call site
-        // is reached; if it arrives here it's a caller bug, not a spec bug.
-        "body" => bail!(
-            "body parameter `{}` reached lower_swagger_parameter — \
-         this is a bug in the caller; body params must be extracted first",
-            param.name
-        ),
-        // formData: treated as a regular query-style param for now.
-        // A future pass could detect multipart consumes and emit is_multipart.
-        "formData" => ParameterLocation::Query,
-        other => bail!("unsupported parameter location `{other}`"),
-    };
-
-    let required = param.required || location == ParameterLocation::Path;
-    let type_ref = if let Some(schema) = &param.schema {
-        lower_swagger_schema_or_ref(schema, definitions, visiting)?
-    } else {
-        lower_swagger_inline_type(
-            param.ty.as_deref(),
-            param.format.as_deref(),
-            param.items.as_deref(),
-            &param.enum_values,
-        )?
-    };
-
-    Ok(Parameter {
-        name: param.name.clone(),
-        location,
-        type_ref,
-        required,
-    })
-}
-
-fn lower_swagger_body_param(
-    param: &SwaggerParameter,
-    definitions: &BTreeMap<String, SwaggerSchemaOrRef>, // was &mut
-    visiting: &HashSet<String>,
-) -> Result<RequestBody> {
-    let schema = param
-        .schema
-        .as_ref()
-        .ok_or_else(|| anyhow!("body param `{}` has no schema", param.name))?;
-    let schema_ref = lower_swagger_schema_or_ref(schema, definitions, visiting)?;
-    Ok(RequestBody {
-        content_type: "application/json".to_string(),
-        schema_ref,
-        required: param.required,
-        is_multipart: false,
-    })
-}
-
-/// Exposed for unit tests.
 pub fn load_str(text: &str) -> Result<Api> {
     check_openapi_version(text)?;
     let raw: RawSpec = serde_yaml::from_str(text).context("parsing OpenAPI YAML")?;
     lower(raw)
 }
 
-/// Fetch a remote OpenAPI / Swagger spec from `url` and lower it into an
-/// `Api`, applying exactly the same detection and validation logic as
-/// [`load`] does for local files.
 pub fn load_url(url: &str) -> Result<Api> {
     let raw_text = ureq::get(url)
         .call()
@@ -564,9 +78,6 @@ pub fn load_url(url: &str) -> Result<Api> {
         .into_string()
         .with_context(|| format!("reading response body from {url}"))?;
 
-    // JSON detection — `reject_unsupported_version` scans for an `openapi:`
-    // key which won't exist in a raw JSON document. Normalise to YAML first
-    // so the rest of the pipeline is format-agnostic.
     let text = if raw_text.trim_start().starts_with('{') {
         let val: serde_yaml::Value = serde_json::from_str(&raw_text)
             .with_context(|| format!("parsing JSON spec from {url}"))?;
@@ -575,7 +86,6 @@ pub fn load_url(url: &str) -> Result<Api> {
         raw_text
     };
 
-    // Reuse the same format-detection logic as `load`.
     let first_line = text.lines().next().unwrap_or("");
     if first_line.trim().starts_with("swagger:") {
         return load_swagger_str(&text).with_context(|| format!("in remote spec {url}"));
@@ -586,8 +96,6 @@ pub fn load_url(url: &str) -> Result<Api> {
     lower(raw)
 }
 
-/// Like [`load`] but accepts either a local filesystem path or an
-/// `http://` / `https://` URL.
 pub fn load_path_or_url(spec: &str) -> Result<Api> {
     if spec.starts_with("http://") || spec.starts_with("https://") {
         load_url(spec)
@@ -597,6 +105,7 @@ pub fn load_path_or_url(spec: &str) -> Result<Api> {
 }
 
 // ── Version guard ────────────────────────────────────────────────────────────
+
 fn check_openapi_version(text: &str) -> Result<()> {
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("openapi:") {
@@ -610,7 +119,7 @@ fn check_openapi_version(text: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Raw serde types (parse layer) ────────────────────────────────────────────
+// ── Raw serde types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct RawSpec {
@@ -623,6 +132,8 @@ struct RawSpec {
     components: RawComponents,
     #[serde(default)]
     security: Vec<BTreeMap<String, Vec<String>>>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -641,7 +152,6 @@ struct RawOAuth2Flow {
     token_url: Option<String>,
     #[serde(rename = "authorizationUrl")]
     authorization_url: Option<String>,
-    /// Keys are scope names; values are human-readable descriptions we discard.
     #[serde(default)]
     scopes: BTreeMap<String, String>,
 }
@@ -674,9 +184,7 @@ struct RawSecurityScheme {
     scheme: Option<String>,
     #[serde(rename = "bearerFormat")]
     bearer_format: Option<String>,
-    // ── OAuth2 ──
     flows: Option<RawOAuth2Flows>,
-    // ── OpenID Connect ──
     #[serde(rename = "openIdConnectUrl")]
     open_id_connect_url: Option<String>,
 }
@@ -691,6 +199,8 @@ struct RawPathItem {
     pub options: Option<RawOperation>,
     pub head: Option<RawOperation>,
     pub trace: Option<RawOperation>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -705,6 +215,8 @@ struct RawOperation {
     #[serde(default)]
     responses: BTreeMap<String, RawResponse>,
     security: Option<Vec<BTreeMap<String, Vec<String>>>>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -715,6 +227,8 @@ struct RawParameter {
     #[serde(default)]
     required: bool,
     schema: Option<RawSchemaOrRef>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,6 +236,8 @@ struct RawRequestBody {
     content: BTreeMap<String, RawMediaType>,
     #[serde(default)]
     required: bool,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,9 +253,10 @@ struct RawResponse {
     content: BTreeMap<String, RawMediaType>,
     #[serde(default)]
     headers: BTreeMap<String, RawResponseHeader>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
-/// One entry in a response's `headers:` block.
 #[derive(Debug, Deserialize)]
 struct RawResponseHeader {
     schema: Option<RawSchemaOrRef>,
@@ -782,15 +299,12 @@ struct RawSchema {
     #[serde(default, rename = "oneOf")]
     one_of: Vec<RawSchemaOrRef>,
     discriminator: Option<RawDiscriminator>,
-    // AFTER
-    /// OpenAPI 3.0 `nullable: true`. In 3.1 this keyword was removed in
-    /// favour of `type: [T, "null"]`. Both forms are handled: this field
-    /// captures the 3.0 flag, and `is_nullable(&raw.ty)` detects the 3.1
-    /// array form. `collect_object_fields` ORs the two together.
     #[serde(default)]
     nullable: Option<bool>,
     #[serde(rename = "default")]
     default: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -810,7 +324,360 @@ enum RawAdditionalProperties {
     Schema(Box<RawSchemaOrRef>),
 }
 
-// ── Lowering context ─────────────────────────────────────────────────────────
+// ── Validation ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+struct Diagnostics {
+    errors: Vec<String>,
+}
+
+impl Diagnostics {
+    fn error(&mut self, msg: impl Into<String>) {
+        self.errors.push(msg.into());
+    }
+
+    fn into_result(self) -> Result<()> {
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            let joined = self.errors.join("\n  - ");
+            bail!("spec validation failed:\n  - {joined}");
+        }
+    }
+}
+
+fn validate_raw_spec(raw: &RawSpec) -> Result<()> {
+    let mut d = Diagnostics::default();
+    let schemas = &raw.components.schemas;
+
+    // ── $ref integrity ────────────────────────────────────────────────────────
+
+    // Collect every $ref that appears anywhere in the spec and verify it
+    // resolves to a known component schema. We walk schemas, path parameters,
+    // request bodies, and responses.
+
+    for (schema_name, sor) in schemas {
+        validate_schema_or_ref(sor, schema_name, schemas, &mut d);
+    }
+
+    for (path, item) in &raw.paths {
+        let ops: [Option<&RawOperation>; 8] = [
+            item.get.as_ref(),
+            item.post.as_ref(),
+            item.put.as_ref(),
+            item.delete.as_ref(),
+            item.patch.as_ref(),
+            item.options.as_ref(),
+            item.head.as_ref(),
+            item.trace.as_ref(),
+        ];
+        for op in ops.into_iter().flatten() {
+            let ctx = op.operation_id.as_deref().unwrap_or(path.as_str());
+
+            for (i, param) in op.parameters.iter().enumerate() {
+                if let Some(schema) = &param.schema {
+                    validate_schema_or_ref(
+                        schema,
+                        &format!("{ctx} parameter[{i}] `{}`", param.name),
+                        schemas,
+                        &mut d,
+                    );
+                } else if param.location != "body" {
+                    // OpenAPI 3.x requires every non-body param to have a schema.
+                    d.error(format!(
+                        "{ctx} parameter[{i}] `{}` (in: {}) has no `schema`",
+                        param.name, param.location
+                    ));
+                }
+                if !["query", "path", "header", "cookie"].contains(&param.location.as_str()) {
+                    d.error(format!(
+                        "{ctx} parameter[{i}] `{}` has unsupported `in: {}`",
+                        param.name, param.location
+                    ));
+                }
+            }
+
+            if let Some(rb) = &op.request_body {
+                for (ct, media) in &rb.content {
+                    if let Some(s) = &media.schema {
+                        validate_schema_or_ref(
+                            s,
+                            &format!("{ctx} requestBody[{ct}]"),
+                            schemas,
+                            &mut d,
+                        );
+                    }
+                }
+            }
+
+            for (code, resp) in &op.responses {
+                for (ct, media) in &resp.content {
+                    if let Some(s) = &media.schema {
+                        validate_schema_or_ref(
+                            s,
+                            &format!("{ctx} response[{code}][{ct}]"),
+                            schemas,
+                            &mut d,
+                        );
+                    }
+                }
+            }
+
+            // operationId uniqueness is checked separately below.
+        }
+    }
+
+    // ── operationId uniqueness ────────────────────────────────────────────────
+    let mut seen_ids: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (path, item) in &raw.paths {
+        let ops: [Option<&RawOperation>; 8] = [
+            item.get.as_ref(),
+            item.post.as_ref(),
+            item.put.as_ref(),
+            item.delete.as_ref(),
+            item.patch.as_ref(),
+            item.options.as_ref(),
+            item.head.as_ref(),
+            item.trace.as_ref(),
+        ];
+        for op in ops.into_iter().flatten() {
+            if let Some(id) = &op.operation_id {
+                if let Some(prev) = seen_ids.insert(id.as_str(), path.as_str()) {
+                    d.error(format!(
+                        "operationId `{id}` is used by both `{prev}` and `{path}`"
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── security scheme references ────────────────────────────────────────────
+    let defined_schemes: std::collections::HashSet<&str> = raw
+        .components
+        .security_schemes
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    let check_security_refs =
+        |reqs: &[BTreeMap<String, Vec<String>>], location: &str, d: &mut Diagnostics| {
+            for req in reqs {
+                for name in req.keys() {
+                    if !defined_schemes.contains(name.as_str()) {
+                        d.error(format!(
+                            "security requirement `{name}` at {location} references an \
+                         undefined security scheme"
+                        ));
+                    }
+                }
+            }
+        };
+
+    check_security_refs(&raw.security, "top-level", &mut d);
+    for (path, item) in &raw.paths {
+        let ops: [Option<&RawOperation>; 8] = [
+            item.get.as_ref(),
+            item.post.as_ref(),
+            item.put.as_ref(),
+            item.delete.as_ref(),
+            item.patch.as_ref(),
+            item.options.as_ref(),
+            item.head.as_ref(),
+            item.trace.as_ref(),
+        ];
+        for op in ops.into_iter().flatten() {
+            if let Some(reqs) = &op.security {
+                let ctx = op.operation_id.as_deref().unwrap_or(path.as_str());
+                check_security_refs(reqs, ctx, &mut d);
+            }
+        }
+    }
+
+    d.into_result()
+}
+
+/// Recursively validate every $ref inside a schema tree.
+fn validate_schema_or_ref(
+    sor: &RawSchemaOrRef,
+    location: &str,
+    schemas: &BTreeMap<String, RawSchemaOrRef>,
+    d: &mut Diagnostics,
+) {
+    match sor {
+        RawSchemaOrRef::Ref { reference } => match parse_schema_ref_pointer(reference) {
+            Ok(name) => {
+                if !schemas.contains_key(name) {
+                    d.error(format!(
+                        "{location}: $ref `{reference}` points to undefined schema `{name}`"
+                    ));
+                }
+            }
+            Err(e) => d.error(format!("{location}: malformed $ref `{reference}`: {e}")),
+        },
+        RawSchemaOrRef::Inline(raw) => {
+            validate_inline_schema(raw, location, schemas, d);
+        }
+    }
+}
+
+fn validate_inline_schema(
+    raw: &RawSchema,
+    location: &str,
+    schemas: &BTreeMap<String, RawSchemaOrRef>,
+    d: &mut Diagnostics,
+) {
+    for (field_name, sor) in &raw.properties {
+        validate_schema_or_ref(sor, &format!("{location}.{field_name}"), schemas, d);
+    }
+    if let Some(items) = &raw.items {
+        validate_schema_or_ref(items, &format!("{location}[items]"), schemas, d);
+    }
+    for (i, member) in raw.all_of.iter().enumerate() {
+        validate_schema_or_ref(member, &format!("{location} allOf[{i}]"), schemas, d);
+    }
+    for (i, member) in raw.any_of.iter().enumerate() {
+        validate_schema_or_ref(member, &format!("{location} anyOf[{i}]"), schemas, d);
+    }
+    for (i, member) in raw.one_of.iter().enumerate() {
+        validate_schema_or_ref(member, &format!("{location} oneOf[{i}]"), schemas, d);
+    }
+    if let Some(RawAdditionalProperties::Schema(inner)) = &raw.additional_properties {
+        validate_schema_or_ref(
+            inner,
+            &format!("{location}[additionalProperties]"),
+            schemas,
+            d,
+        );
+    }
+    // discriminator mapping refs
+    if let Some(disc) = &raw.discriminator {
+        for (tag, target) in &disc.mapping {
+            if target.starts_with("#/") {
+                match parse_schema_ref_pointer(target) {
+                    Ok(name) if !schemas.contains_key(name) => d.error(format!(
+                        "{location} discriminator mapping `{tag}` → `{target}` \
+                         points to undefined schema `{name}`"
+                    )),
+                    Err(e) => d.error(format!(
+                        "{location} discriminator mapping `{tag}`: malformed $ref: {e}"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn validate_swagger_spec(spec: &SwaggerSpec) -> Result<()> {
+    let mut d = Diagnostics::default();
+    let definitions = &spec.definitions;
+
+    // ── $ref integrity ────────────────────────────────────────────────────────
+    for (name, sor) in definitions {
+        validate_swagger_sor(sor, name, definitions, &mut d);
+    }
+
+    for (path, item) in &spec.paths {
+        let ops: [Option<&SwaggerOperation>; 7] = [
+            item.get.as_ref(),
+            item.post.as_ref(),
+            item.put.as_ref(),
+            item.delete.as_ref(),
+            item.patch.as_ref(),
+            item.options.as_ref(),
+            item.head.as_ref(),
+        ];
+        for op in ops.into_iter().flatten() {
+            let ctx = op.operation_id.as_deref().unwrap_or(path.as_str());
+            for (i, param) in op.parameters.iter().enumerate() {
+                if let Some(s) = &param.schema {
+                    validate_swagger_sor(
+                        s,
+                        &format!("{ctx} parameter[{i}] `{}`", param.name),
+                        definitions,
+                        &mut d,
+                    );
+                }
+            }
+            for (code, resp) in &op.responses {
+                if let Some(s) = &resp.schema {
+                    validate_swagger_sor(
+                        s,
+                        &format!("{ctx} response[{code}]"),
+                        definitions,
+                        &mut d,
+                    );
+                }
+            }
+        }
+    }
+
+    // ── operationId uniqueness ────────────────────────────────────────────────
+    let mut seen_ids: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (path, item) in &spec.paths {
+        let ops: [Option<&SwaggerOperation>; 7] = [
+            item.get.as_ref(),
+            item.post.as_ref(),
+            item.put.as_ref(),
+            item.delete.as_ref(),
+            item.patch.as_ref(),
+            item.options.as_ref(),
+            item.head.as_ref(),
+        ];
+        for op in ops.into_iter().flatten() {
+            if let Some(id) = &op.operation_id {
+                if let Some(prev) = seen_ids.insert(id.as_str(), path.as_str()) {
+                    d.error(format!(
+                        "operationId `{id}` is used by both `{prev}` and `{path}`"
+                    ));
+                }
+            }
+        }
+    }
+
+    d.into_result()
+}
+
+fn validate_swagger_sor(
+    sor: &SwaggerSchemaOrRef,
+    location: &str,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    d: &mut Diagnostics,
+) {
+    match sor {
+        SwaggerSchemaOrRef::Ref { reference } => match parse_swagger_ref(reference) {
+            Ok(name) => {
+                if !definitions.contains_key(name) {
+                    d.error(format!(
+                        "{location}: $ref `{reference}` points to undefined definition `{name}`"
+                    ));
+                }
+            }
+            Err(e) => d.error(format!("{location}: malformed $ref `{reference}`: {e}")),
+        },
+        SwaggerSchemaOrRef::Inline(raw) => {
+            for (field, sor) in &raw.properties {
+                validate_swagger_sor(sor, &format!("{location}.{field}"), definitions, d);
+            }
+            if let Some(items) = &raw.items {
+                validate_swagger_sor(items, &format!("{location}[items]"), definitions, d);
+            }
+            for (i, member) in raw.all_of.iter().enumerate() {
+                validate_swagger_sor(member, &format!("{location} allOf[{i}]"), definitions, d);
+            }
+            if let Some(SwaggerAdditionalProperties::Schema(inner)) = &raw.additional_properties {
+                validate_swagger_sor(
+                    inner,
+                    &format!("{location}[additionalProperties]"),
+                    definitions,
+                    d,
+                );
+            }
+        }
+    }
+}
+
+// ── Lowering context ──────────────────────────────────────────────────────────
 
 struct LoweringContext<'a> {
     components: &'a RawComponents,
@@ -843,12 +710,48 @@ impl<'a> LoweringContext<'a> {
     }
 }
 
+// ── Deserializer helpers ──────────────────────────────────────────────────────
+
 use serde::de;
 
-use crate::swagger::{
-    SwaggerAdditionalProperties, SwaggerContext, SwaggerItems, SwaggerOperation, SwaggerParameter,
-    SwaggerPathItem, SwaggerSchema, SwaggerSchemaOrRef, SwaggerSecurityDefinition, SwaggerSpec,
-};
+fn deserialize_openapi_type<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    struct TypeVisitor;
+    impl<'de> de::Visitor<'de> for TypeVisitor {
+        type Value = Vec<String>;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or an array of strings")
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_string()])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                v.push(s);
+            }
+            Ok(v)
+        }
+    }
+    d.deserialize_any(TypeVisitor)
+}
+
+fn parse_schema_ref_pointer(reference: &str) -> Result<&str> {
+    let bare = reference
+        .strip_prefix("#/components/schemas/")
+        .ok_or_else(|| {
+            anyhow!(
+                "$ref `{reference}` is not a schema reference \
+                 (v0.1 supports only `#/components/schemas/*`)"
+            )
+        })?;
+    if bare.is_empty() || bare.contains('/') {
+        bail!("malformed $ref pointer `{reference}`");
+    }
+    Ok(bare)
+}
 
 fn build_allof_extension_map(
     schemas: &BTreeMap<String, RawSchemaOrRef>,
@@ -871,50 +774,7 @@ fn build_allof_extension_map(
     map
 }
 
-fn deserialize_openapi_type<'de, D>(d: D) -> Result<Vec<String>, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    struct TypeVisitor;
-    impl<'de> de::Visitor<'de> for TypeVisitor {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a string or an array of strings")
-        }
-
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            Ok(vec![value.to_string()])
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut v = Vec::new();
-            while let Some(s) = seq.next_element::<String>()? {
-                v.push(s);
-            }
-            Ok(v)
-        }
-    }
-
-    d.deserialize_any(TypeVisitor)
-}
-
-fn parse_schema_ref_pointer(reference: &str) -> Result<&str> {
-    let bare = reference
-        .strip_prefix("#/components/schemas/")
-        .ok_or_else(|| {
-            anyhow!(
-                "$ref `{reference}` is not a schema reference \
-                 (v0.1 supports only `#/components/schemas/*`)"
-            )
-        })?;
-    if bare.is_empty() || bare.contains('/') {
-        bail!("malformed $ref pointer `{reference}`");
-    }
-    Ok(bare)
-}
-
-// ── 1. lower_enum_values ──────────────────────────────────────────────────────
+// ── Enum values ───────────────────────────────────────────────────────────────
 
 fn lower_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<Vec<EnumValue>> {
     raw.iter()
@@ -923,7 +783,7 @@ fn lower_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<Vec<
             serde_yaml::Value::Number(n) => n.as_i64().map(EnumValue::Int).ok_or_else(|| {
                 anyhow!(
                     "enum value `{n}` in `{field_name}` is not a 64-bit integer — \
-                         only string and integer enum values are supported"
+                     only string and integer enum values are supported"
                 )
             }),
             other => Err(anyhow!(
@@ -933,28 +793,8 @@ fn lower_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<Vec<
         .collect()
 }
 
-// ── Lowering pass (Raw* → IR) ─────────────────────────────────────────────────
+// ── Default values ────────────────────────────────────────────────────────────
 
-fn lower(raw: RawSpec) -> Result<Api> {
-    let title = raw.info.title;
-    let base_urls: Vec<String> = raw.servers.into_iter().map(|s| s.url).collect();
-    let extension_map = build_allof_extension_map(&raw.components.schemas);
-    let mut ctx = LoweringContext::new(&raw.components, extension_map);
-    let operations = lower_operations(&raw.paths, &mut ctx)?;
-    let schemas = lower_schemas(&raw.components.schemas, &mut ctx)?;
-    let security_schemes = lower_security_schemes(&raw.components.security_schemes)?;
-    let security = flatten_security_requirements(&raw.security);
-    Ok(Api {
-        title,
-        base_urls,
-        operations,
-        schemas,
-        security_schemes,
-        security,
-    })
-}
-
-// New helper — placed near lower_type_ref:
 fn lower_default_value(
     raw: &Option<serde_yaml::Value>,
     type_ref: &TypeRef,
@@ -990,12 +830,35 @@ fn lower_default_value(
                 None
             }
         }
-        // Arrays, objects, enums: cannot be expressed as Dart const literals.
         _ => None,
     }
 }
 
-// ── Security lowering ────────────────────────────────────────────────────────
+// ── Top-level lowering ────────────────────────────────────────────────────────
+
+fn lower(raw: RawSpec) -> Result<Api> {
+    validate_raw_spec(&raw)?;
+    let extensions = collect_extensions(&raw.extensions);
+    let title = raw.info.title;
+    let base_urls: Vec<String> = raw.servers.into_iter().map(|s| s.url).collect();
+    let extension_map = build_allof_extension_map(&raw.components.schemas);
+    let mut ctx = LoweringContext::new(&raw.components, extension_map);
+    let operations = lower_operations(&raw.paths, &mut ctx)?;
+    let schemas = lower_schemas(&raw.components.schemas, &mut ctx)?;
+    let security_schemes = lower_security_schemes(&raw.components.security_schemes)?;
+    let security = flatten_security_requirements(&raw.security);
+    Ok(Api {
+        title,
+        base_urls,
+        operations,
+        schemas,
+        security_schemes,
+        security,
+        extensions,
+    })
+}
+
+// ── Security ──────────────────────────────────────────────────────────────────
 
 fn lower_security_schemes(
     raw: &BTreeMap<String, RawSecurityScheme>,
@@ -1081,10 +944,7 @@ fn lower_oauth2_flows(scheme_name: &str, raw: &RawOAuth2Flows) -> Result<Vec<OAu
 
     if let Some(f) = &raw.implicit {
         let authorization_url = f.authorization_url.clone().ok_or_else(|| {
-            anyhow!(
-                "`implicit` flow in oauth2 scheme `{scheme_name}` \
-                 requires `authorizationUrl`"
-            )
+            anyhow!("`implicit` flow in oauth2 scheme `{scheme_name}` requires `authorizationUrl`")
         })?;
         flows.push(OAuth2Flow {
             flow_type: OAuth2FlowType::Implicit,
@@ -1093,13 +953,9 @@ fn lower_oauth2_flows(scheme_name: &str, raw: &RawOAuth2Flows) -> Result<Vec<OAu
             scopes: f.scopes.keys().cloned().collect(),
         });
     }
-
     if let Some(f) = &raw.password {
         let token_url = f.token_url.clone().ok_or_else(|| {
-            anyhow!(
-                "`password` flow in oauth2 scheme `{scheme_name}` \
-                 requires `tokenUrl`"
-            )
+            anyhow!("`password` flow in oauth2 scheme `{scheme_name}` requires `tokenUrl`")
         })?;
         flows.push(OAuth2Flow {
             flow_type: OAuth2FlowType::Password,
@@ -1108,13 +964,9 @@ fn lower_oauth2_flows(scheme_name: &str, raw: &RawOAuth2Flows) -> Result<Vec<OAu
             scopes: f.scopes.keys().cloned().collect(),
         });
     }
-
     if let Some(f) = &raw.client_credentials {
         let token_url = f.token_url.clone().ok_or_else(|| {
-            anyhow!(
-                "`clientCredentials` flow in oauth2 scheme `{scheme_name}` \
-                 requires `tokenUrl`"
-            )
+            anyhow!("`clientCredentials` flow in oauth2 scheme `{scheme_name}` requires `tokenUrl`")
         })?;
         flows.push(OAuth2Flow {
             flow_type: OAuth2FlowType::ClientCredentials,
@@ -1123,13 +975,9 @@ fn lower_oauth2_flows(scheme_name: &str, raw: &RawOAuth2Flows) -> Result<Vec<OAu
             scopes: f.scopes.keys().cloned().collect(),
         });
     }
-
     if let Some(f) = &raw.authorization_code {
         let token_url = f.token_url.clone().ok_or_else(|| {
-            anyhow!(
-                "`authorizationCode` flow in oauth2 scheme `{scheme_name}` \
-                 requires `tokenUrl`"
-            )
+            anyhow!("`authorizationCode` flow in oauth2 scheme `{scheme_name}` requires `tokenUrl`")
         })?;
         let authorization_url = f.authorization_url.clone().ok_or_else(|| {
             anyhow!(
@@ -1152,7 +1000,6 @@ fn lower_oauth2_flows(scheme_name: &str, raw: &RawOAuth2Flows) -> Result<Vec<OAu
              clientCredentials, authorizationCode)"
         );
     }
-
     Ok(flows)
 }
 
@@ -1169,7 +1016,7 @@ fn flatten_security_requirements(reqs: &[BTreeMap<String, Vec<String>>]) -> Vec<
     out
 }
 
-// ── Operation lowering ───────────────────────────────────────────────────────
+// ── Operation lowering ────────────────────────────────────────────────────────
 
 fn lower_operations(
     paths: &BTreeMap<String, RawPathItem>,
@@ -1224,6 +1071,7 @@ fn lower_operations(
                     request_body,
                     responses,
                     security,
+                    extensions: collect_extensions(&raw_op.extensions),
                 });
             }
         }
@@ -1247,8 +1095,7 @@ fn lower_parameter(path: &str, raw: &RawParameter, ctx: &mut LoweringContext) ->
 
     let schema = raw.schema.as_ref().ok_or_else(|| {
         anyhow!(
-            "parameter `{}` in {path} has no `schema` — \
-             cannot determine its type",
+            "parameter `{}` in {path} has no `schema` — cannot determine its type",
             raw.name
         )
     })?;
@@ -1261,6 +1108,7 @@ fn lower_parameter(path: &str, raw: &RawParameter, ctx: &mut LoweringContext) ->
         location,
         type_ref,
         required,
+        extensions: collect_extensions(&raw.extensions),
     })
 }
 
@@ -1286,10 +1134,7 @@ fn lower_request_body(
         .ok_or_else(|| anyhow!("requestBody of {method} {path} has no content entries"))?;
 
     let schema = media_type.schema.as_ref().ok_or_else(|| {
-        anyhow!(
-            "content type `{content_type}` in requestBody of {method} {path} \
-             has no schema"
-        )
+        anyhow!("content type `{content_type}` in requestBody of {method} {path} has no schema")
     })?;
 
     let schema_ref = lower_type_ref("<requestBody>", schema, ctx)?;
@@ -1299,10 +1144,11 @@ fn lower_request_body(
         schema_ref,
         required: raw.required,
         is_multipart,
+        extensions: collect_extensions(&raw.extensions),
     })
 }
 
-// ── Response lowering ────────────────────────────────────────────────────────
+// ── Response lowering ─────────────────────────────────────────────────────────
 
 fn lower_responses(
     path: &str,
@@ -1339,7 +1185,6 @@ fn lower_response(
     raw: &RawResponse,
     ctx: &mut LoweringContext,
 ) -> Result<Response> {
-    // ── Body schema (unchanged) ───────────────────────────────────────────────
     let schema_ref = if raw.content.is_empty() {
         None
     } else {
@@ -1348,7 +1193,6 @@ fn lower_response(
             .get("application/json")
             .or_else(|| raw.content.values().next())
             .ok_or_else(|| anyhow!("response `{status_code}` has empty content map"))?;
-
         match &media_type.schema {
             Some(sor) => Some(
                 lower_type_ref("<response>", sor, ctx)
@@ -1358,11 +1202,8 @@ fn lower_response(
         }
     };
 
-    // ── Response headers ──────────────────────────────────────────────────────
     let mut headers: Vec<flap_ir::ResponseHeader> = Vec::new();
     for (header_name, raw_header) in &raw.headers {
-        // The `Authorization` and `Content-*` family are consumed by the
-        // HTTP layer; emitting them as typed fields would be misleading.
         if header_name.eq_ignore_ascii_case("authorization")
             || header_name.to_lowercase().starts_with("content-")
         {
@@ -1377,13 +1218,9 @@ fn lower_response(
         })?;
 
         let type_ref = lower_type_ref(header_name, schema, ctx).with_context(|| {
-            format!(
-                "schema of response header `{header_name}` \
-                     of status `{status_code}`"
-            )
+            format!("schema of response header `{header_name}` of status `{status_code}`")
         })?;
 
-        // v0.1 only supports scalar and array-of-scalar headers.
         match &type_ref {
             TypeRef::Named(_) => bail!(
                 "response header `{header_name}` of status `{status_code}` \
@@ -1399,17 +1236,17 @@ fn lower_response(
             required: raw_header.required,
         });
     }
-    // Deterministic order so generated code is stable across runs.
     headers.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Response {
         status_code: status_code.to_string(),
         schema_ref,
         headers,
+        extensions: collect_extensions(&raw.extensions),
     })
 }
 
-// ── Schema lowering ──────────────────────────────────────────────────────────
+// ── Schema lowering ───────────────────────────────────────────────────────────
 
 fn lower_schemas(
     raw: &BTreeMap<String, RawSchemaOrRef>,
@@ -1423,7 +1260,6 @@ fn lower_schemas(
         ctx.visiting.remove(name);
         let kind = result?;
 
-        // Record allOf-inheritance so emitters understand the hierarchy.
         let extends = if let RawSchemaOrRef::Inline(raw_schema) = schema_or_ref {
             raw_schema.all_of.first().and_then(|first| {
                 if let RawSchemaOrRef::Ref { reference } = first {
@@ -1436,11 +1272,17 @@ fn lower_schemas(
             None
         };
 
+        let extensions = match schema_or_ref {
+            RawSchemaOrRef::Inline(raw) => collect_extensions(&raw.extensions),
+            RawSchemaOrRef::Ref { .. } => BTreeMap::new(),
+        };
+
         out.push(Schema {
             name: name.clone(),
             kind,
             internal: false,
             extends,
+            extensions,
         });
     }
     out.append(&mut ctx.synthetic_schemas);
@@ -1462,7 +1304,6 @@ fn lower_allof_union(
         );
     }
 
-    // Resolve explicit wire-tag overrides from the mapping block.
     let mut tag_by_schema: BTreeMap<String, String> = BTreeMap::new();
     for (wire_tag, schema_ref) in &discriminator.mapping {
         let bare = parse_mapping_target(schema_ref)
@@ -1473,7 +1314,6 @@ fn lower_allof_union(
     let mut variants = Vec::with_capacity(children.len());
     let mut variant_tags = Vec::with_capacity(children.len());
 
-    // children come from BTreeMap iteration order — deterministic.
     for child_name in children {
         if !ctx.components.schemas.contains_key(child_name) {
             bail!(
@@ -1541,9 +1381,6 @@ fn lower_inline_schema(
         return lower_one_of(name, raw, ctx);
     }
 
-    // allOf-based discriminated union: the discriminator lives on the parent
-    // schema and children self-register by extending via allOf. This is the
-    // OpenAPI 3.0 alternative to the explicit oneOf+discriminator form.
     if let Some(discriminator) = &raw.discriminator {
         if raw.one_of.is_empty() && raw.any_of.is_empty() {
             if let Some(children) = ctx.extension_map.get(name).cloned() {
@@ -1562,7 +1399,6 @@ fn lower_inline_schema(
             let fields = collect_object_fields(raw, ctx)?;
             Ok(SchemaKind::Object { fields })
         }
-
         Some("object") | None
             if raw.properties.is_empty()
                 && matches!(
@@ -1571,13 +1407,12 @@ fn lower_inline_schema(
                 ) =>
         {
             let Some(RawAdditionalProperties::Schema(inner)) = &raw.additional_properties else {
-                unreachable!("guarded by matches! above");
+                unreachable!()
             };
             let value = lower_type_ref("<additionalProperties>", inner, ctx)
                 .with_context(|| format!("in `{name}.additionalProperties`"))?;
             Ok(SchemaKind::Map { value })
         }
-
         Some("array") => {
             let items = raw
                 .items
@@ -1587,15 +1422,12 @@ fn lower_inline_schema(
                 .with_context(|| format!("in `{name}.items`"))?;
             Ok(SchemaKind::Array { item })
         }
-
         Some(other) => Err(anyhow!(
             "schema `{name}` has type `{other}` with no properties — \
              primitive root schemas are not yet supported in v0.1"
         )),
-
         None => Err(anyhow!(
-            "schema `{name}` has no `type` and no `properties` — \
-             cannot determine kind"
+            "schema `{name}` has no `type` and no `properties` — cannot determine kind"
         )),
     }
 }
@@ -1606,21 +1438,17 @@ fn lower_any_of(
     ctx: &mut LoweringContext,
 ) -> Result<SchemaKind> {
     let mut variants = Vec::with_capacity(raw.any_of.len());
-    let mut wrapper_schemas = Vec::new(); // to register synthetic schemas later
+    let mut wrapper_schemas = Vec::new();
 
     for (i, sor) in raw.any_of.iter().enumerate() {
         let type_ref = lower_type_ref(&format!("{parent_name}_variant_{i}"), sor, ctx)?;
         match type_ref {
-            // Named references are already valid union variants
             TypeRef::Named(n) => {
                 variants.push(TypeRef::Named(n));
             }
-            // Primitives (including enums, maps, arrays) need to be wrapped
-            // in a named schema so Freezed can generate a class for them.
             other => {
-                let wrapper_name = format!("{parent_name}Variant{i}"); // e.g., "MyFieldVariant0"
-                // Create a simple wrapper schema: a single field called "value"
-                let wrapper = Schema {
+                let wrapper_name = format!("{parent_name}Variant{i}");
+                wrapper_schemas.push(Schema {
                     name: wrapper_name.clone(),
                     kind: SchemaKind::Object {
                         fields: vec![Field {
@@ -1630,37 +1458,22 @@ fn lower_any_of(
                             nullable: false,
                             is_recursive: false,
                             default_value: None,
+                            extensions: BTreeMap::new(),
                         }],
                     },
                     internal: true,
                     extends: None,
-                };
-                wrapper_schemas.push(wrapper);
+                    extensions: BTreeMap::new(),
+                });
                 variants.push(TypeRef::Named(wrapper_name));
             }
         }
     }
 
-    // Register the wrapper schemas in the lowering context so they are
-    // included in the final Api.schemas list. We'll inject them into the
-    // final schemas vector after the main loop.
-    // For now, add them to a temporary list stored on the context:
     ctx.synthetic_schemas.extend(wrapper_schemas);
-
     Ok(SchemaKind::UntaggedUnion { variants })
 }
 
-/// Builds the merged field list for an object schema, honouring `allOf`
-/// and the schema's own `properties` in order.
-///
-/// Walk order:
-/// 1. Each `allOf` member is flattened first, in spec order.
-/// 2. The schema's own `properties` are appended next.
-/// 3. Duplicate field names are deduplicated — last occurrence wins on
-///    type, but `required`, `nullable`, and `is_recursive` OR across all
-///    occurrences. (For all three: any source declaring the wider
-///    semantics wins, because narrowing later would silently drop wire
-///    forms a base schema legitimately accepts.)
 fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<Vec<Field>> {
     let mut fields: Vec<Field> = Vec::new();
 
@@ -1676,25 +1489,23 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
             .with_context(|| format!("field `{field_name}`"))?;
         let is_required = own_required.contains(field_name.as_str());
 
-        // OpenAPI 3.0: `nullable` is only meaningful on inline schemas.
-        // A bare `$ref` cannot carry a `nullable` flag — that's a 3.0
-        // spec limitation, not ours; specs that need it use an `allOf`
-        // wrapper around the ref.
         let is_nullable = match sor {
-            RawSchemaOrRef::Inline(raw) => {
-                // 3.0: `nullable: true` keyword.
-                // 3.1: `type: ["string", "null"]` — is_nullable scans the array.
-                raw.nullable.unwrap_or(false) | is_nullable(&raw.ty)
-            }
+            RawSchemaOrRef::Inline(raw) => raw.nullable.unwrap_or(false) | is_nullable(&raw.ty),
             RawSchemaOrRef::Ref { .. } => false,
         };
 
         let is_recursive = type_ref_is_recursive(&type_ref, &ctx.visiting);
-        // Extract the spec-declared default, if any and if expressible.
+
         let default_value = match sor {
             RawSchemaOrRef::Inline(raw) => lower_default_value(&raw.default, &type_ref),
             RawSchemaOrRef::Ref { .. } => None,
         };
+
+        let field_extensions = match sor {
+            RawSchemaOrRef::Inline(raw) => collect_extensions(&raw.extensions),
+            RawSchemaOrRef::Ref { .. } => BTreeMap::new(),
+        };
+
         fields.push(Field {
             name: field_name.clone(),
             type_ref,
@@ -1702,6 +1513,7 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
             nullable: is_nullable,
             is_recursive,
             default_value,
+            extensions: field_extensions,
         });
     }
 
@@ -1716,11 +1528,17 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
                 .default_value
                 .clone()
                 .or_else(|| deduped[idx].default_value.clone());
+            let merged_extensions = {
+                let mut m = deduped[idx].extensions.clone();
+                m.extend(field.extensions.clone());
+                m
+            };
             deduped[idx] = Field {
                 required: merged_required,
                 nullable: merged_nullable,
                 is_recursive: merged_recursive,
                 default_value: merged_default,
+                extensions: merged_extensions,
                 ..field
             };
         } else {
@@ -1734,8 +1552,6 @@ fn collect_object_fields(raw: &RawSchema, ctx: &mut LoweringContext) -> Result<V
 
 fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Result<SchemaKind> {
     if raw.discriminator.is_none() {
-        // No discriminator: use untagged-union semantics, same as anyOf.
-        // The emitter tries each variant's fromJson in order.
         let mut variants = Vec::with_capacity(raw.one_of.len());
         let mut wrapper_schemas = Vec::new();
         for (i, sor) in raw.one_of.iter().enumerate() {
@@ -1754,10 +1570,12 @@ fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Resul
                                 nullable: false,
                                 is_recursive: false,
                                 default_value: None,
+                                extensions: BTreeMap::new(),
                             }],
                         },
                         internal: true,
                         extends: None,
+                        extensions: BTreeMap::new(),
                     });
                     variants.push(TypeRef::Named(wrapper_name));
                 }
@@ -1776,12 +1594,14 @@ fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Resul
              selects the variant."
         );
     }
+
     let mut tag_by_schema: BTreeMap<String, String> = BTreeMap::new();
     for (wire_tag, schema_ref) in &discriminator.mapping {
         let bare = parse_mapping_target(schema_ref)
             .with_context(|| format!("discriminator mapping entry `{wire_tag}` of `{name}`"))?;
         tag_by_schema.insert(bare.to_string(), wire_tag.clone());
     }
+
     let mut variants = Vec::with_capacity(raw.one_of.len());
     let mut variant_tags = Vec::with_capacity(raw.one_of.len());
     for (i, member) in raw.one_of.iter().enumerate() {
@@ -1807,6 +1627,7 @@ fn lower_one_of(name: &str, raw: &RawSchema, ctx: &mut LoweringContext) -> Resul
         variants.push(variant);
         variant_tags.push(wire_tag);
     }
+
     Ok(SchemaKind::Union {
         variants,
         discriminator: property_name.to_string(),
@@ -1844,8 +1665,6 @@ fn collect_member_fields(sor: &RawSchemaOrRef, ctx: &mut LoweringContext) -> Res
             let result = match target {
                 RawSchemaOrRef::Inline(target_raw) => collect_object_fields(target_raw, ctx)
                     .with_context(|| format!("flattening `{bare}` for allOf")),
-                // Follow the chain — A extends B extends C now works.
-                // `visiting` already contains `bare`, so cycles are caught next iteration.
                 RawSchemaOrRef::Ref { .. } => collect_member_fields(target, ctx)
                     .with_context(|| format!("following ref chain through `{bare}`")),
             };
@@ -1918,22 +1737,509 @@ fn lower_type_ref(
     }
 }
 
-fn stringify_enum_values(field_name: &str, raw: &[serde_yaml::Value]) -> Result<Vec<String>> {
-    raw.iter()
-        .map(|v| match v {
-            serde_yaml::Value::String(s) => Ok(s.clone()),
-            other => Err(anyhow!(
-                "enum value `{other:?}` in field `{field_name}` is not a string \
-                 — v0.1 only supports string enums"
-            )),
-        })
-        .collect()
-}
-
 fn type_ref_is_recursive(t: &TypeRef, visiting: &HashSet<String>) -> bool {
     match t {
         TypeRef::Named(n) => visiting.contains(n),
         TypeRef::Array(inner) | TypeRef::Map(inner) => type_ref_is_recursive(inner, visiting),
         _ => false,
+    }
+}
+
+// ── Swagger 2.0 lowering ──────────────────────────────────────────────────────
+
+use crate::swagger::{
+    SwaggerAdditionalProperties, SwaggerContext, SwaggerItems, SwaggerOperation, SwaggerParameter,
+    SwaggerPathItem, SwaggerSchema, SwaggerSchemaOrRef, SwaggerSecurityDefinition, SwaggerSpec,
+};
+
+pub fn load_swagger_str(text: &str) -> Result<Api> {
+    let raw: SwaggerSpec = serde_yaml::from_str(text).context("parsing Swagger 2.0 YAML")?;
+    lower_swagger(raw)
+}
+
+fn parse_swagger_ref(reference: &str) -> Result<&str> {
+    let bare = reference.strip_prefix("#/definitions/").ok_or_else(|| {
+        anyhow!(
+            "`$ref` `{reference}` is not a definition reference – \
+             Swagger 2.0 only supports `#/definitions/*`"
+        )
+    })?;
+    if bare.is_empty() || bare.contains('/') {
+        bail!("malformed $ref pointer `{reference}`");
+    }
+    Ok(bare)
+}
+
+fn lower_swagger(spec: SwaggerSpec) -> Result<Api> {
+    validate_swagger_spec(&spec)?;
+    let extensions = collect_extensions(&spec.extensions);
+    let title = spec.info.title;
+    let base_urls = build_swagger_base_url(&spec.host, &spec.base_path)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut ctx = SwaggerContext::new(&spec.definitions);
+    let operations = lower_swagger_operations(&spec.paths, &mut ctx)?;
+    let schemas = lower_swagger_schemas(&spec.definitions, &mut ctx)?;
+    let security_schemes = lower_swagger_security(&spec.security_definitions)?;
+    let security = flatten_security_requirements(&spec.security);
+    Ok(Api {
+        title,
+        base_urls,
+        operations,
+        schemas,
+        security_schemes,
+        security,
+        extensions,
+    })
+}
+
+fn build_swagger_base_url(host: &Option<String>, base_path: &Option<String>) -> Option<String> {
+    match (host.as_deref(), base_path.as_deref()) {
+        (Some(h), Some(bp)) => Some(format!("https://{h}{bp}")),
+        (Some(h), None) => Some(format!("https://{h}")),
+        (None, Some(bp)) => Some(bp.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn lower_swagger_security(
+    raw: &BTreeMap<String, SwaggerSecurityDefinition>,
+) -> Result<Vec<SecurityScheme>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (name, def) in raw {
+        out.push(lower_one_swagger_security(name, def)?);
+    }
+    Ok(out)
+}
+
+fn lower_one_swagger_security(
+    name: &str,
+    def: &SwaggerSecurityDefinition,
+) -> Result<SecurityScheme> {
+    match def.ty.as_str() {
+        "apiKey" => {
+            let parameter_name = def
+                .name
+                .clone()
+                .ok_or_else(|| anyhow!("apiKey missing `name`"))?;
+            let location = match def.location.as_deref() {
+                Some("header") => ApiKeyLocation::Header,
+                Some("query") => ApiKeyLocation::Query,
+                Some("cookie") => ApiKeyLocation::Cookie,
+                other => bail!("invalid apiKey location: {:?}", other),
+            };
+            Ok(SecurityScheme::ApiKey {
+                scheme_name: name.to_string(),
+                parameter_name,
+                location,
+            })
+        }
+        "basic" => Ok(SecurityScheme::HttpBasic {
+            scheme_name: name.to_string(),
+        }),
+        "oauth2" => {
+            let flow = def.flow.as_deref().unwrap_or("implicit");
+            let flow_type = match flow {
+                "implicit" => OAuth2FlowType::Implicit,
+                "password" => OAuth2FlowType::Password,
+                "application" => OAuth2FlowType::ClientCredentials,
+                "accessCode" => OAuth2FlowType::AuthorizationCode,
+                other => bail!("unsupported OAuth2 flow: {other}"),
+            };
+            let flows = vec![OAuth2Flow {
+                flow_type,
+                token_url: def.token_url.clone(),
+                authorization_url: def.authorization_url.clone(),
+                scopes: def.scopes.keys().cloned().collect(),
+            }];
+            Ok(SecurityScheme::OAuth2 {
+                scheme_name: name.to_string(),
+                flows,
+            })
+        }
+        other => bail!("unsupported security type: {other}"),
+    }
+}
+
+fn lower_swagger_schemas(
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    ctx: &mut SwaggerContext,
+) -> Result<Vec<Schema>> {
+    let mut out = Vec::with_capacity(definitions.len());
+    for (name, sor) in definitions {
+        ctx.visiting.insert(name.clone());
+        let kind = lower_swagger_schema_kind(name, sor, definitions, ctx)?;
+        ctx.visiting.remove(name);
+
+        let extends = if let SwaggerSchemaOrRef::Inline(raw) = sor {
+            raw.all_of.first().and_then(|first| {
+                if let SwaggerSchemaOrRef::Ref { reference } = first {
+                    parse_swagger_ref(reference).ok().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        let extensions = if let SwaggerSchemaOrRef::Inline(raw) = sor {
+            collect_extensions(&raw.extensions)
+        } else {
+            BTreeMap::new()
+        };
+
+        out.push(Schema {
+            name: name.clone(),
+            kind,
+            internal: false,
+            extends,
+            extensions,
+        });
+    }
+    Ok(out)
+}
+
+fn lower_swagger_schema_kind(
+    name: &str,
+    sor: &SwaggerSchemaOrRef,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    ctx: &SwaggerContext,
+) -> Result<SchemaKind> {
+    match sor {
+        SwaggerSchemaOrRef::Ref { .. } => {
+            bail!("top-level definition `{name}` is a bare $ref – not supported")
+        }
+        SwaggerSchemaOrRef::Inline(raw) => {
+            if !raw.all_of.is_empty() {
+                let fields = collect_swagger_object_fields(raw, definitions, ctx)?;
+                return Ok(SchemaKind::Object { fields });
+            }
+            match raw.ty.as_deref() {
+                Some("object") | None if !raw.properties.is_empty() => {
+                    let fields = collect_swagger_object_fields(raw, definitions, ctx)?;
+                    Ok(SchemaKind::Object { fields })
+                }
+                Some("object") | None
+                    if raw.properties.is_empty()
+                        && matches!(
+                            &raw.additional_properties,
+                            Some(SwaggerAdditionalProperties::Schema(_))
+                        ) =>
+                {
+                    let Some(SwaggerAdditionalProperties::Schema(inner)) =
+                        &raw.additional_properties
+                    else {
+                        unreachable!()
+                    };
+                    let value = lower_swagger_schema_or_ref(inner, definitions, &ctx.visiting)?;
+                    Ok(SchemaKind::Map { value })
+                }
+                Some("array") => {
+                    let items = raw
+                        .items
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("array schema missing items"))?;
+                    let item = lower_swagger_schema_or_ref(items, definitions, &ctx.visiting)?;
+                    Ok(SchemaKind::Array { item })
+                }
+                other => bail!("unsupported schema type {:?} for `{name}`", other),
+            }
+        }
+    }
+}
+
+fn collect_swagger_object_fields(
+    raw: &SwaggerSchema,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    ctx: &SwaggerContext,
+) -> Result<Vec<Field>> {
+    let mut fields = Vec::new();
+
+    for member in &raw.all_of {
+        fields.extend(collect_allof_fields_swagger(member, definitions, ctx)?);
+    }
+
+    let own_required: HashSet<&str> = raw.required.iter().map(String::as_str).collect();
+    for (field_name, sor) in &raw.properties {
+        let type_ref = lower_swagger_schema_or_ref(sor, definitions, &ctx.visiting)?;
+        let is_required = own_required.contains(field_name.as_str());
+        let is_recursive = type_ref_is_recursive(&type_ref, &ctx.visiting);
+        let extensions = if let SwaggerSchemaOrRef::Inline(s) = sor {
+            collect_extensions(&s.extensions)
+        } else {
+            BTreeMap::new()
+        };
+        fields.push(Field {
+            name: field_name.clone(),
+            type_ref,
+            required: is_required,
+            nullable: false,
+            is_recursive,
+            default_value: None,
+            extensions,
+        });
+    }
+
+    // Deduplication
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut deduped: Vec<Field> = Vec::with_capacity(fields.len());
+    for field in fields {
+        if let Some(&idx) = seen.get(&field.name) {
+            let merged_required = deduped[idx].required || field.required;
+            let merged_recursive = deduped[idx].is_recursive || field.is_recursive;
+            let merged_extensions = {
+                let mut m = deduped[idx].extensions.clone();
+                m.extend(field.extensions.clone());
+                m
+            };
+            deduped[idx] = Field {
+                name: field.name.clone(),
+                type_ref: field.type_ref.clone(),
+                required: merged_required,
+                nullable: false,
+                is_recursive: merged_recursive,
+                default_value: None,
+                extensions: merged_extensions,
+            };
+        } else {
+            seen.insert(field.name.clone(), deduped.len());
+            deduped.push(field);
+        }
+    }
+    Ok(deduped)
+}
+
+fn collect_allof_fields_swagger(
+    sor: &SwaggerSchemaOrRef,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    ctx: &SwaggerContext,
+) -> Result<Vec<Field>> {
+    match sor {
+        SwaggerSchemaOrRef::Ref { reference } => {
+            let name = parse_swagger_ref(reference)?;
+            let target = definitions
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown allOf ref {name}"))?;
+            if ctx.visiting.contains(name) {
+                bail!("cycle in allOf chain via `{name}`");
+            }
+            match target {
+                SwaggerSchemaOrRef::Inline(raw) => {
+                    let inner_ctx = ctx.with_visiting(name);
+                    collect_swagger_object_fields(raw, definitions, &inner_ctx)
+                }
+                SwaggerSchemaOrRef::Ref { .. } => bail!("chained $ref not supported"),
+            }
+        }
+        SwaggerSchemaOrRef::Inline(raw) => collect_swagger_object_fields(raw, definitions, ctx),
+    }
+}
+
+fn lower_swagger_operations(
+    paths: &BTreeMap<String, SwaggerPathItem>,
+    ctx: &mut SwaggerContext,
+) -> Result<Vec<Operation>> {
+    let mut ops = Vec::new();
+    for (path, item) in paths {
+        let pairs: [(HttpMethod, &Option<SwaggerOperation>); 7] = [
+            (HttpMethod::Delete, &item.delete),
+            (HttpMethod::Get, &item.get),
+            (HttpMethod::Head, &item.head),
+            (HttpMethod::Options, &item.options),
+            (HttpMethod::Patch, &item.patch),
+            (HttpMethod::Post, &item.post),
+            (HttpMethod::Put, &item.put),
+        ];
+        for (method, maybe_op) in pairs {
+            if let Some(raw_op) = maybe_op {
+                let mut merged_params: Vec<&SwaggerParameter> = item.parameters.iter().collect();
+                for op_param in &raw_op.parameters {
+                    if let Some(pos) = merged_params
+                        .iter()
+                        .position(|p| p.name == op_param.name && p.location == op_param.location)
+                    {
+                        merged_params.remove(pos);
+                    }
+                    merged_params.push(op_param);
+                }
+
+                let body_param = merged_params.iter().find(|p| p.location == "body").copied();
+                let non_body_params: Vec<&SwaggerParameter> = merged_params
+                    .iter()
+                    .filter(|p| p.location != "body")
+                    .copied()
+                    .collect();
+
+                let parameters = non_body_params
+                    .iter()
+                    .map(|p| lower_swagger_parameter(p, ctx.definitions, &ctx.visiting))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let request_body = body_param
+                    .map(|p| lower_swagger_body_param(p, ctx.definitions, &ctx.visiting))
+                    .transpose()?;
+
+                let responses = raw_op
+                    .responses
+                    .iter()
+                    .map(|(code, resp)| {
+                        Ok(Response {
+                            headers: vec![],
+                            status_code: code.clone(),
+                            schema_ref: resp
+                                .schema
+                                .as_ref()
+                                .map(|s| {
+                                    lower_swagger_schema_or_ref(s, ctx.definitions, &ctx.visiting)
+                                })
+                                .transpose()?,
+                            extensions: collect_extensions(&resp.extensions),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let security = raw_op
+                    .security
+                    .as_ref()
+                    .map(|reqs| flatten_security_requirements(reqs));
+
+                ops.push(Operation {
+                    method,
+                    path: path.clone(),
+                    operation_id: raw_op.operation_id.clone(),
+                    summary: raw_op.summary.clone(),
+                    parameters,
+                    request_body,
+                    responses,
+                    security,
+                    extensions: collect_extensions(&raw_op.extensions),
+                });
+            }
+        }
+    }
+    Ok(ops)
+}
+
+fn lower_swagger_parameter(
+    param: &SwaggerParameter,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    visiting: &HashSet<String>,
+) -> Result<Parameter> {
+    let location = match param.location.as_str() {
+        "query" => ParameterLocation::Query,
+        "path" => ParameterLocation::Path,
+        "header" => ParameterLocation::Header,
+        "cookie" => ParameterLocation::Cookie,
+        "body" => bail!(
+            "body parameter `{}` reached lower_swagger_parameter — \
+             this is a bug in the caller; body params must be extracted first",
+            param.name
+        ),
+        "formData" => ParameterLocation::Query,
+        other => bail!("unsupported parameter location `{other}`"),
+    };
+
+    let required = param.required || location == ParameterLocation::Path;
+    let type_ref = if let Some(schema) = &param.schema {
+        lower_swagger_schema_or_ref(schema, definitions, visiting)?
+    } else {
+        lower_swagger_inline_type(
+            param.ty.as_deref(),
+            param.format.as_deref(),
+            param.items.as_deref(),
+            &param.enum_values,
+        )?
+    };
+
+    Ok(Parameter {
+        name: param.name.clone(),
+        location,
+        type_ref,
+        required,
+        extensions: collect_extensions(&param.extensions),
+    })
+}
+
+fn lower_swagger_body_param(
+    param: &SwaggerParameter,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    visiting: &HashSet<String>,
+) -> Result<RequestBody> {
+    let schema = param
+        .schema
+        .as_ref()
+        .ok_or_else(|| anyhow!("body param `{}` has no schema", param.name))?;
+    let schema_ref = lower_swagger_schema_or_ref(schema, definitions, visiting)?;
+    Ok(RequestBody {
+        content_type: "application/json".to_string(),
+        schema_ref,
+        required: param.required,
+        is_multipart: false,
+        extensions: collect_extensions(&param.extensions),
+    })
+}
+
+fn lower_swagger_inline_type(
+    ty: Option<&str>,
+    format: Option<&str>,
+    items: Option<&SwaggerItems>,
+    enum_values: &[serde_yaml::Value],
+) -> Result<TypeRef> {
+    if !enum_values.is_empty() {
+        let values = lower_enum_values("anonymous_enum", enum_values)
+            .with_context(|| "invalid enum value")?;
+        return Ok(TypeRef::Enum(values));
+    }
+    match ty {
+        Some("string") => {
+            if format == Some("date-time") {
+                Ok(TypeRef::DateTime)
+            } else {
+                Ok(TypeRef::String)
+            }
+        }
+        Some("integer") => Ok(TypeRef::Integer {
+            format: format.map(|s| s.to_string()),
+        }),
+        Some("number") => Ok(TypeRef::Number {
+            format: format.map(|s| s.to_string()),
+        }),
+        Some("boolean") => Ok(TypeRef::Boolean),
+        Some("array") => {
+            let items = items.ok_or_else(|| anyhow!("array type missing items"))?;
+            let inner =
+                lower_swagger_inline_type(Some(&items.ty), items.format.as_deref(), None, &[])?;
+            Ok(TypeRef::Array(Box::new(inner)))
+        }
+        Some("file") => bail!("file parameters are not supported"),
+        _ => bail!("unsupported inline type {:?}", ty),
+    }
+}
+
+fn lower_swagger_schema_or_ref(
+    sor: &SwaggerSchemaOrRef,
+    definitions: &BTreeMap<String, SwaggerSchemaOrRef>,
+    visiting: &HashSet<String>,
+) -> Result<TypeRef> {
+    match sor {
+        SwaggerSchemaOrRef::Ref { reference } => {
+            let name = parse_swagger_ref(reference)?;
+            if !definitions.contains_key(name) {
+                bail!("unknown definition {name}");
+            }
+            Ok(TypeRef::Named(name.to_string()))
+        }
+        SwaggerSchemaOrRef::Inline(raw) => {
+            if let Some(ty) = &raw.ty {
+                return lower_swagger_inline_type(
+                    Some(ty),
+                    raw.format.as_deref(),
+                    None,
+                    &raw.enum_values,
+                );
+            }
+            bail!("inline schema without type not supported")
+        }
     }
 }

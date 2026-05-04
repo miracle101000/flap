@@ -4,7 +4,7 @@
 //! crates consume them to produce language-specific output. Nothing in here
 //! knows about YAML or Dart — it is the contract between the two halves.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 #[derive(Debug, Clone)]
 pub enum DefaultValue {
@@ -13,6 +13,25 @@ pub enum DefaultValue {
     Number(f64),
     Boolean(bool),
 }
+
+// ── Vendor extensions ─────────────────────────────────────────────────────────
+
+/// A single value inside an `x-*` vendor-extension field.
+/// Mirrors the YAML value space without pulling in a YAML crate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtensionValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Sequence(Vec<ExtensionValue>),
+    Mapping(BTreeMap<String, ExtensionValue>),
+}
+
+/// All `x-*` keys declared on a single spec node.
+/// Keys retain the `x-` prefix so callers can pattern-match on them.
+pub type Extensions = BTreeMap<String, ExtensionValue>;
 
 /// A single enum value. OpenAPI allows both string and integer enum values.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +75,7 @@ pub struct Api {
     /// credentials and sending whichever ones are non-null. Each entry
     /// is expected to reference an entry in `security_schemes`.
     pub security: Vec<String>,
+    pub extensions: Extensions,
 }
 
 // ── Operations ───────────────────────────────────────────────────────────────
@@ -106,6 +126,7 @@ pub struct Operation {
     pub responses: Vec<Response>,
     /// Per-operation security override.
     pub security: Option<Vec<String>>,
+    pub extensions: Extensions,
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
@@ -135,6 +156,7 @@ pub struct Parameter {
     pub location: ParameterLocation,
     pub type_ref: TypeRef,
     pub required: bool,
+    pub extensions: Extensions,
 }
 
 // ── Request body ─────────────────────────────────────────────────────────────
@@ -145,6 +167,7 @@ pub struct RequestBody {
     pub schema_ref: TypeRef,
     pub required: bool,
     pub is_multipart: bool,
+    pub extensions: Extensions,
 }
 
 // ── Response headers ──────────────────────────────────────────────────────────
@@ -172,6 +195,7 @@ pub struct Response {
     /// Empty when no `headers:` block is present — the emitter then
     /// returns the body type directly rather than wrapping in a record.
     pub headers: Vec<ResponseHeader>,
+    pub extensions: Extensions,
 }
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
@@ -188,6 +212,7 @@ pub struct Schema {
     /// i.e. classical OOP-style inheritance. Emitters can use this to
     /// generate proper subtype relationships rather than flat objects.
     pub extends: Option<String>,
+    pub extensions: Extensions,
 }
 
 #[derive(Debug)]
@@ -249,6 +274,7 @@ pub struct Field {
     /// as a Dart compile-time constant. `None` when the spec has no `default:`,
     /// or when the type is too complex (array, object) to inline.
     pub default_value: Option<DefaultValue>,
+    pub extensions: Extensions,
 }
 
 impl Field {
@@ -265,6 +291,7 @@ impl Field {
             nullable: false,
             is_recursive: false,
             default_value: None,
+            extensions: BTreeMap::new(),
         }
     }
 }
